@@ -161,31 +161,10 @@ void main() {
     });
   });
 
-  group('LampDetector: формулы и baseline', () {
-    test('whiteScore = 0 при насыщенности выше порога', () {
-      const LampConfig config = LampConfig();
-      final LampDetector detector = LampDetector(config);
-      expect(detector.whiteScore(const FrameFeatures(meanY: 150, brightFrac: 0.3, sat: 0.55, redDom: 70, coreEdgeDiff: 20, sampleCount: 1)), 0);
-      expect(detector.whiteScore(const FrameFeatures(meanY: 200, brightFrac: 0.3, sat: 0.06, redDom: 4, coreEdgeDiff: 30, sampleCount: 1)), 0.3);
-    });
-
-    test('redScore = рост яркости / 30 + 0.5 за выросшее ядро', () {
-      const LampConfig config = LampConfig();
-      final LampDetector detector = LampDetector(config);
-      const LampBaseline baseline = LampBaseline(
-        white: FrameFeatures(meanY: 60, brightFrac: 0, sat: 0, redDom: 0, coreEdgeDiff: 0, sampleCount: 1),
-        red: FrameFeatures(meanY: 50, brightFrac: 0, sat: 0, redDom: 40, coreEdgeDiff: 3, sampleCount: 1),
-        frameCount: 30,
-      );
-
-      // +40 яркости = 1.33, ядро выросло на 25 (>20) -> +0.5.
-      expect(detector.redScore(const FrameFeatures(meanY: 90, brightFrac: 0, sat: 0, redDom: 95, coreEdgeDiff: 28, sampleCount: 1), baseline), closeTo(1.833, 0.001));
-      // Ядро не выросло -> только яркость.
-      expect(detector.redScore(const FrameFeatures(meanY: 90, brightFrac: 0, sat: 0, redDom: 95, coreEdgeDiff: 5, sampleCount: 1), baseline), closeTo(1.333, 0.001));
-      // Нет роста яркости и нет ядра -> 0.
-      expect(detector.redScore(baseline.red, baseline), 0);
-    });
-
+  group('LampDetector: baseline и пороги', () {
+    // Формулы whiteScore/redScore переехали в lamp_detector_test.dart: теперь
+    // обе лампы оцениваются как прирост доли пикселей (whiteFrac/redFrac) над
+    // фоном калибровки, а не по sat/brightFrac/яркости.
     test('baseline обновляется скользящим средним только когда обе лампы OFF', () {
       final Harness h = Harness();
       final LampBaseline before = h.detector.baseline!;

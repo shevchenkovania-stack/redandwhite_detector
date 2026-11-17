@@ -38,20 +38,31 @@ class HitStateMachine {
   void startSession(String newSessionId) {
     sessionId = newSessionId;
     _state = LampSessionState.idle;
+    _whiteLit = false;
+    _redLit = false;
     _sequence = 0;
   }
 
   /// Сброс состояния автомата без смены сессии (кнопка Reset в демо).
   void reset() {
     _state = LampSessionState.idle;
+    _whiteLit = false;
+    _redLit = false;
     _sequence = 0;
   }
 
-  /// Скармливаем один кадр, получаем 0 или 1 событие.
+  // Состояние каждой лампы ведётся отдельно: раньше общий `_state` терял
+  /// «белая погасла», если между её включением и выключением успевала
+  /// включиться красная.
+  bool _whiteLit = false;
+  bool _redLit = false;
+  LampSessionState _lastOn = LampSessionState.idle;
+
+  /// Скармливаем один кадр, получаем 0–2 события (по одному на лампу).
   List<HitEvent> onEvaluation(LampEvaluation evaluation) {
     final List<HitEvent> events = <HitEvent>[];
 
-    if (evaluation.whiteOn && _state != LampSessionState.whiteOn) {
+    if (evaluation.whiteOn) {
       events.add(
         _emit(
           lampId: HitEvent.whiteLampId,
@@ -59,10 +70,10 @@ class HitStateMachine {
           detectedAt: evaluation.whiteOnCandidateAt ?? evaluation.timestamp,
         ),
       );
-      _state = LampSessionState.whiteOn;
+      _whiteLit = true;
+      _lastOn = LampSessionState.whiteOn;
     }
-
-    if (evaluation.redOn && _state != LampSessionState.redOn) {
+    if (evaluation.redOn) {
       events.add(
         _emit(
           lampId: HitEvent.redLampId,
@@ -70,16 +81,30 @@ class HitStateMachine {
           detectedAt: evaluation.redOnCandidateAt ?? evaluation.timestamp,
         ),
       );
-      _state = LampSessionState.redOn;
+      _redLit = true;
+      _lastOn = LampSessionState.redOn;
     }
-
-    if (_state == LampSessionState.whiteOn && evaluation.whiteOff) {
-      _state = LampSessionState.idle;
-    } else if (_state == LampSessionState.redOn && evaluation.redOff) {
-      _state = LampSessionState.idle;
+    if (evaluation.whiteOff) {
+      _whiteLit = false;
     }
-
+    if (evaluation.redOff) {
+      _redLit = false;
+    }
+    _state = _derive();
     return events;
+  }
+
+  LampSessionState _derive() {
+    if (_whiteLit && _redLit) {
+      return _lastOn;
+    }
+    if (_whiteLit) {
+      return LampSessionState.whiteOn;
+    }
+    if (_redLit) {
+      return LampSessionState.redOn;
+    }
+    return LampSessionState.idle;
   }
 
   HitEvent _emit({required String lampId, required HitColor color, required DateTime detectedAt}) {

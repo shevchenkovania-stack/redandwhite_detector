@@ -145,10 +145,14 @@ class FeatureExtractor {
     final int right = (roi.right * frame.width).round();
     final int bottom = (roi.bottom * frame.height).round();
 
-    final int coreLeft = (roi.left + roi.width * (1 - config.coreSideRatio) / 2).round();
-    final int coreRight = (roi.left + roi.width * (1 + config.coreSideRatio) / 2).round();
-    final int coreTop = (roi.top + roi.height * (1 - config.coreSideRatio) / 2).round();
-    final int coreBottom = (roi.top + roi.height * (1 + config.coreSideRatio) / 2).round();
+    // Ядро — центральная часть ROI в ПИКСЕЛЯХ кадра (раньше здесь по ошибке
+    // стояли нормализованные 0..1, и ядро вырождалось в 0–1 пиксель).
+    final int roiW = right - left;
+    final int roiH = bottom - top;
+    final int coreLeft = left + (roiW * (1 - config.coreSideRatio) / 2).round();
+    final int coreRight = left + (roiW * (1 + config.coreSideRatio) / 2).round();
+    final int coreTop = top + (roiH * (1 - config.coreSideRatio) / 2).round();
+    final int coreBottom = top + (roiH * (1 + config.coreSideRatio) / 2).round();
 
     final _Sample sample = _Sample();
     final int step = config.subsampleStep;
@@ -162,6 +166,8 @@ class FeatureExtractor {
     double sumRingY = 0;
     int count = 0;
     int brightCount = 0;
+    int whiteCount = 0;
+    int redCount = 0;
     int coreCount = 0;
     int ringCount = 0;
 
@@ -195,6 +201,13 @@ class FeatureExtractor {
         final double minChannel = sample.r < sample.g
             ? (sample.r < sample.b ? sample.r : sample.b)
             : (sample.g < sample.b ? sample.g : sample.b);
+        if (minChannel >= config.whiteMinChannel) {
+          whiteCount++;
+        }
+        if (sample.r >= config.redMinValue &&
+            sample.r - (sample.g > sample.b ? sample.g : sample.b) >= config.redMargin) {
+          redCount++;
+        }
         sumSat += maxChannel < _minChannelForSat
             ? 0
             : (maxChannel - minChannel) / maxChannel;
@@ -220,6 +233,8 @@ class FeatureExtractor {
       redDom: sumR / count - (sumG + sumB) / 2 / count,
       coreEdgeDiff: (coreCount == 0 || ringCount == 0) ? 0 : sumCoreY / coreCount - sumRingY / ringCount,
       sampleCount: count,
+      whiteFrac: whiteCount / count,
+      redFrac: redCount / count,
     );
   }
 }

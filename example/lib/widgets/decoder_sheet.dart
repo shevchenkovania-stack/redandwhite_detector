@@ -16,12 +16,12 @@ class _DecoderSheetState extends State<DecoderSheet> {
   @override
   void initState() {
     super.initState();
-    widget.session.addListener(_onTick);
+    widget.session.frameTick.addListener(_onTick);
   }
 
   @override
   void dispose() {
-    widget.session.removeListener(_onTick);
+    widget.session.frameTick.removeListener(_onTick);
     super.dispose();
   }
 
@@ -56,12 +56,12 @@ class _DecoderSheetState extends State<DecoderSheet> {
             lit: eval?.whiteLit ?? false,
             color: Colors.white,
             score: eval?.whiteScore,
-            scoreFormula: 'whiteScore = brightFrac (если sat ≤ ${_f(cfg.whiteSatMax, 2)})',
+            scoreFormula: 'whiteScore = whiteFrac − фон  (пиксель белый, если min(R,G,B) ≥ ${_f(cfg.whiteMinChannel, 0)})',
             onThreshold: cfg.whiteOnThreshold,
             offThreshold: cfg.whiteOffThreshold,
             now: features.white,
             background: base?.white,
-            driving: 'brightFrac',
+            driving: 'whiteFrac',
           ),
           const SizedBox(height: 12),
           _lampBlock(
@@ -70,12 +70,12 @@ class _DecoderSheetState extends State<DecoderSheet> {
             color: Colors.redAccent,
             score: eval?.redScore,
             scoreFormula:
-                'redScore = (redDom − фон) / ${_f(cfg.redDeltaDivisor)}',
+                'redScore = (redFrac − фон) / ${_f(cfg.redFracDivisor, 3)}  (R − max(G,B) ≥ ${_f(cfg.redMargin, 0)})',
             onThreshold: cfg.redOnThreshold,
             offThreshold: cfg.redOffThreshold,
             now: features.red,
             background: base?.red,
-            driving: 'redDom',
+            driving: 'redFrac',
           ),
           if (eval != null && eval.ambiguous)
             Padding(
@@ -89,10 +89,13 @@ class _DecoderSheetState extends State<DecoderSheet> {
           _paramsHeader(),
           const SizedBox(height: 6),
           _paramRow('brightY (порог «яркий»)', cfg.brightY, def.brightY),
-          _paramRow('whiteSatMax', cfg.whiteSatMax, def.whiteSatMax),
+          _paramRow('whiteMinChannel', cfg.whiteMinChannel, def.whiteMinChannel),
+          _paramRow('redMargin', cfg.redMargin, def.redMargin),
+          _paramRow('redMinValue', cfg.redMinValue, def.redMinValue),
+          _paramRow('redFracDivisor', cfg.redFracDivisor, def.redFracDivisor),
+          _paramRow('noiseSigmas', cfg.noiseSigmas, def.noiseSigmas),
           _paramRow('whiteOnThreshold', cfg.whiteOnThreshold, def.whiteOnThreshold),
           _paramRow('redOnThreshold', cfg.redOnThreshold, def.redOnThreshold),
-          _paramRow('redDeltaDivisor', cfg.redDeltaDivisor, def.redDeltaDivisor),
           _paramRow('offRatio (гистерезис)', cfg.offRatio, def.offRatio),
           _paramRow('onConfirmFrames', cfg.onConfirmFrames, def.onConfirmFrames),
           _paramRow('offConfirmFrames', cfg.offConfirmFrames, def.offConfirmFrames),
@@ -101,7 +104,7 @@ class _DecoderSheetState extends State<DecoderSheet> {
           if (base == null)
             const Padding(
               padding: EdgeInsets.only(top: 10),
-              child: Text('Калибровки нет — «фон» пуст, красная считает от нуля.',
+              child: Text('Калибровки нет — детектор не работает до калибровки.',
                   style: TextStyle(fontSize: 12, color: Colors.grey)),
             ),
         ],
@@ -157,6 +160,8 @@ class _DecoderSheetState extends State<DecoderSheet> {
           ),
           const SizedBox(height: 6),
           _featureHeader(),
+          _featureRow('whiteFrac', now.whiteFrac, background?.whiteFrac, 3, driving),
+          _featureRow('redFrac', now.redFrac, background?.redFrac, 3, driving),
           _featureRow('meanY', now.meanY, background?.meanY, 1, driving),
           _featureRow('brightFrac', now.brightFrac, background?.brightFrac, 2, driving),
           _featureRow('sat', now.sat, background?.sat, 2, driving),

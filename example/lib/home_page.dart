@@ -161,8 +161,8 @@ class _HomePageState extends State<HomePage> {
     try {
       final LampBaseline baseline = await session.calibrate();
       setState(() => _message = 'Калибровка ${baseline.frameCount} кадров: '
-          'white Y=${baseline.white.meanY.toStringAsFixed(1)}, '
-          'red redDom=${baseline.red.redDom.toStringAsFixed(1)}');
+          'σ white=${baseline.whiteNoise.toStringAsFixed(3)}, '
+          'σ red=${baseline.redNoise.toStringAsFixed(3)}');
     } on Object catch (e) {
       setState(() => _message = 'Калибровка не удалась: $e');
     }
@@ -224,11 +224,11 @@ class _HomePageState extends State<HomePage> {
     final LampBaseline? b = s.baseline;
     debugPrint(
       'LAMPDBG '
-      'W bf=${f.white.brightFrac.toStringAsFixed(2)} '
-      'sat=${f.white.sat.toStringAsFixed(2)} '
+      'W wf=${f.white.whiteFrac.toStringAsFixed(3)} '
+      'base=${(b?.white.whiteFrac ?? 0).toStringAsFixed(3)} '
       'ws=${(e?.whiteScore ?? 0).toStringAsFixed(2)} '
-      '| R rd=${f.red.redDom.toStringAsFixed(1)} '
-      'base=${(b?.red.redDom ?? 0).toStringAsFixed(1)} '
+      '| R rf=${f.red.redFrac.toStringAsFixed(3)} '
+      'base=${(b?.red.redFrac ?? 0).toStringAsFixed(3)} '
       'rs=${(e?.redScore ?? 0).toStringAsFixed(2)} '
       '| lit W=${e?.whiteLit ?? false} R=${e?.redLit ?? false} '
       '| hits W=${s.whiteHits} R=${s.redHits}',
@@ -292,19 +292,22 @@ class _HomePageState extends State<HomePage> {
                       padding: const EdgeInsets.all(8),
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(8),
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: <Widget>[
-                            session.source.buildPreview(),
-                            RoiEditor(
-                              layout: session.roi,
-                              onChanged: (RoiLayout layout) => session.updateRoi(layout),
-                              onCommit: () {
-                                unawaited(session.saveRoi());
-                                setState(() => _message = 'ROI сохранены');
-                              },
-                            ),
-                          ],
+                        child: _AspectStage(
+                          previewSize: session.source.previewSize,
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: <Widget>[
+                              session.source.buildPreview(),
+                              RoiEditor(
+                                layout: session.roi,
+                                onChanged: (RoiLayout layout) => session.updateRoi(layout),
+                                onCommit: () {
+                                  unawaited(session.saveRoi());
+                                  setState(() => _message = 'ROI сохранены');
+                                },
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
@@ -463,4 +466,28 @@ class _StatusRow extends StatelessWidget {
           Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
         ],
       );
+}
+
+/// Держит превью и ROI в реальном соотношении сторон кадра. Без этого
+/// `CameraPreview` внутри `StackFit.expand` растягивается на всю область, и
+/// ROI настраиваются по искажённой картинке.
+class _AspectStage extends StatelessWidget {
+  const _AspectStage({required this.previewSize, required this.child});
+
+  final Size? previewSize;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final Size? size = previewSize;
+    if (size == null || size.width <= 0 || size.height <= 0) {
+      return child;
+    }
+    // previewSize камеры всегда «ландшафтный» (w > h); в портрете меняем стороны.
+    final bool portrait = MediaQuery.orientationOf(context) == Orientation.portrait;
+    final double longSide = size.width >= size.height ? size.width : size.height;
+    final double shortSide = size.width >= size.height ? size.height : size.width;
+    final double aspect = portrait ? shortSide / longSide : longSide / shortSide;
+    return Center(child: AspectRatio(aspectRatio: aspect, child: child));
+  }
 }

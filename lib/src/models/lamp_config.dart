@@ -14,12 +14,19 @@ class LampConfig {
     this.offConfirmFrames = 3,
     this.baselineAlpha = 0.01,
     this.calibrationFrames = LampConfig.defaultCalibrationFrames,
-    this.subsampleStep = 4,
+    this.subsampleStep = 2,
     this.coreSideRatio = 0.5,
     this.analysisIsolateThresholdMs = 8,
     this.yuvFullRange = true,
     this.scoreHistoryPoints = 240,
     this.csvFlushLines = 30,
+    this.whiteMinChannel = 170,
+    this.redMargin = 60,
+    this.redMinValue = 110,
+    this.redFracDivisor = 0.05,
+    this.noiseSigmas = 6,
+    this.calibrationMaxNoise = 0.03,
+    this.baselineMaxAgeMinutes = 180,
   });
 
   /// Порог «яркий пиксель» для [FrameFeatures.brightFrac], 0..255.
@@ -76,6 +83,29 @@ class LampConfig {
   /// Сколько строк CSV буферизовать перед записью на диск.
   final int csvFlushLines;
 
+  /// Пиксель «настоящий белый», если min(R,G,B) ≥ этого значения (0..255).
+  final double whiteMinChannel;
+
+  /// Пиксель «красный», если R − max(G,B) ≥ этого значения…
+  final double redMargin;
+
+  /// …и R ≥ этого значения (отсекает тёмно-бордовые тени).
+  final double redMinValue;
+
+  /// redScore = (redFrac − фон) / redFracDivisor. 0.05 = лампа должна занять
+  /// ≥ 5 % пикселей ROI, чтобы score дошёл до 1.0 (порог ON по умолчанию).
+  final double redFracDivisor;
+
+  /// Порог ON не может быть ниже noiseSigmas × σ фона из калибровки.
+  final double noiseSigmas;
+
+  /// Калибровка отвергается, если σ whiteFrac/redFrac за её кадры выше этого
+  /// (в кадре что-то мигало или двигалось: baseline был бы мусорным).
+  final double calibrationMaxNoise;
+
+  /// Калибровка старше этого возраста при запуске не загружается.
+  final int baselineMaxAgeMinutes;
+
   double get whiteOffThreshold => whiteOnThreshold * offRatio;
   double get redOffThreshold => redOnThreshold * offRatio;
 
@@ -106,6 +136,13 @@ class LampConfig {
     yuvFullRange: yuvFullRange ?? this.yuvFullRange,
     scoreHistoryPoints: scoreHistoryPoints,
     csvFlushLines: csvFlushLines,
+    whiteMinChannel: whiteMinChannel,
+    redMargin: redMargin,
+    redMinValue: redMinValue,
+    redFracDivisor: redFracDivisor,
+    noiseSigmas: noiseSigmas,
+    calibrationMaxNoise: calibrationMaxNoise,
+    baselineMaxAgeMinutes: baselineMaxAgeMinutes,
   );
 
   Map<String, Object?> toJson() => <String, Object?>{
@@ -125,6 +162,13 @@ class LampConfig {
     'yuvFullRange': yuvFullRange,
     'scoreHistoryPoints': scoreHistoryPoints,
     'csvFlushLines': csvFlushLines,
+    'whiteMinChannel': whiteMinChannel,
+    'redMargin': redMargin,
+    'redMinValue': redMinValue,
+    'redFracDivisor': redFracDivisor,
+    'noiseSigmas': noiseSigmas,
+    'calibrationMaxNoise': calibrationMaxNoise,
+    'baselineMaxAgeMinutes': baselineMaxAgeMinutes,
   };
 
   factory LampConfig.fromJson(Map<String, Object?> json) {
@@ -150,6 +194,13 @@ class LampConfig {
       yuvFullRange: b('yuvFullRange', def.yuvFullRange),
       scoreHistoryPoints: i('scoreHistoryPoints', def.scoreHistoryPoints),
       csvFlushLines: i('csvFlushLines', def.csvFlushLines),
+      whiteMinChannel: d('whiteMinChannel', def.whiteMinChannel),
+      redMargin: d('redMargin', def.redMargin),
+      redMinValue: d('redMinValue', def.redMinValue),
+      redFracDivisor: d('redFracDivisor', def.redFracDivisor),
+      noiseSigmas: d('noiseSigmas', def.noiseSigmas),
+      calibrationMaxNoise: d('calibrationMaxNoise', def.calibrationMaxNoise),
+      baselineMaxAgeMinutes: i('baselineMaxAgeMinutes', def.baselineMaxAgeMinutes),
     );
   }
 }

@@ -6,9 +6,9 @@ import '../models/frame_features.dart';
 /// Одна строка CSV диагностики.
 ///
 /// Формат: `timestamp_ms, white_meanY, white_brightFrac, white_sat, red_meanY,
-/// red_redDom, red_coreEdgeDiff, state`. Белая часть не содержит redDom и
-/// coreEdgeDiff, красная — brightFrac и sat: эти величины не участвуют в
-/// формулах whiteScore/redScore, поэтому при воспроизведении они равны 0.
+/// red_redDom, red_coreEdgeDiff, state, white_whiteFrac, red_redFrac`.
+/// Последние два столбца — признаки, по которым считаются whiteScore/redScore.
+/// Старые файлы (8 столбцов) читаются, но без них красная не воспроизводится.
 class FeatureCsvRow {
   const FeatureCsvRow({
     required this.timestampMs,
@@ -18,7 +18,8 @@ class FeatureCsvRow {
   });
 
   static const String header =
-      'timestamp_ms,white_meanY,white_brightFrac,white_sat,red_meanY,red_redDom,red_coreEdgeDiff,state';
+      'timestamp_ms,white_meanY,white_brightFrac,white_sat,red_meanY,red_redDom,red_coreEdgeDiff,state,'
+      'white_whiteFrac,red_redFrac';
 
   final int timestampMs;
   final FrameFeatures white;
@@ -36,6 +37,8 @@ class FeatureCsvRow {
     red.redDom.toStringAsFixed(3),
     red.coreEdgeDiff.toStringAsFixed(3),
     state,
+    white.whiteFrac.toStringAsFixed(5),
+    red.redFrac.toStringAsFixed(5),
   ].join(',');
 
   /// Кадр для прогона детектора без камеры.
@@ -60,6 +63,8 @@ class FeatureCsvRow {
         redDom: 0,
         coreEdgeDiff: 0,
         sampleCount: 0,
+        // Старый файл без whiteFrac: brightFrac — грубая замена.
+        whiteFrac: c.length >= 10 ? d(8) : d(2),
       ),
       red: FrameFeatures(
         meanY: d(4),
@@ -68,6 +73,7 @@ class FeatureCsvRow {
         redDom: d(5),
         coreEdgeDiff: d(6),
         sampleCount: 0,
+        redFrac: c.length >= 10 ? d(9) : 0,
       ),
       state: c[7],
     );
@@ -80,7 +86,7 @@ class FeatureCsv {
   static List<FeatureCsvRow> decode(String content) {
     final List<FeatureCsvRow> rows = <FeatureCsvRow>[];
     for (final String line in const LineSplitter().convert(content)) {
-      if (line.trim().isEmpty || line == FeatureCsvRow.header) {
+      if (line.trim().isEmpty || line.startsWith('timestamp_ms')) {
         continue;
       }
       rows.add(FeatureCsvRow.parse(line));

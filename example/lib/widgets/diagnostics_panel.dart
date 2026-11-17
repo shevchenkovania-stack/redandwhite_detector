@@ -61,8 +61,12 @@ class DiagnosticsPanel extends StatelessWidget {
         ),
         _section('Пороги'),
         _row(
-          'white: brightY / satMax',
-          '${c.brightY.toStringAsFixed(0)} / ${c.whiteSatMax}',
+          'white: minChannel',
+          c.whiteMinChannel.toStringAsFixed(0),
+        ),
+        _row(
+          'red: margin / minValue',
+          '${c.redMargin.toStringAsFixed(0)} / ${c.redMinValue.toStringAsFixed(0)}',
         ),
         _row(
           'white ON / OFF',
@@ -83,6 +87,10 @@ class DiagnosticsPanel extends StatelessWidget {
           'baseline белой Y',
           b == null ? 'нет' : b.white.meanY.toStringAsFixed(1),
         ),
+        _row('baseline белой whiteFrac / σ',
+            b == null ? 'нет' : '${b.white.whiteFrac.toStringAsFixed(3)} / ${b.whiteNoise.toStringAsFixed(3)}'),
+        _row('baseline красной redFrac / σ',
+            b == null ? 'нет' : '${b.red.redFrac.toStringAsFixed(3)} / ${b.redNoise.toStringAsFixed(3)}'),
         _row(
           'baseline красной Y',
           b == null ? 'нет' : b.red.meanY.toStringAsFixed(1),

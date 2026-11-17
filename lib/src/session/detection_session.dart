@@ -129,6 +129,11 @@ class DetectionSession extends ChangeNotifier {
   LampEvaluation? _lastEvaluation;
 
   /// События, созданные детектором. Подписываться до [start].
+  /// Увеличивается после каждого обработанного кадра. `notifyListeners` сессии
+  /// фильтруется по сигнатуре (чтобы не перерисовывать весь экран 30 раз/с),
+  /// поэтому живые экраны (расшифровка чисел) слушают этот счётчик.
+  final ValueNotifier<int> frameTick = ValueNotifier<int>(0);
+
   Stream<HitEvent> get hits => _hits.stream;
 
   /// Ошибки камеры и обработки: приложение не падает, всё сюда.
@@ -182,7 +187,15 @@ class DetectionSession extends ChangeNotifier {
     }
     final LampBaseline? baseline = settings.readBaseline();
     if (baseline != null) {
-      _detector.setBaseline(baseline);
+      final int? at = baseline.capturedAtMs;
+      final int ageMin = at == null
+          ? 1 << 30
+          : DateTime.now().difference(DateTime.fromMillisecondsSinceEpoch(at)).inMinutes;
+      if (ageMin <= _config.baselineMaxAgeMinutes) {
+        _detector.setBaseline(baseline);
+      } else {
+        _report('Старая калибровка отброшена (возраст $ageMin мин): освещение могло смениться.', isError: false);
+      }
     }
     final String? storedSession = settings.readSessionId();
     if (storedSession != null) {
@@ -266,24 +279,10 @@ class DetectionSession extends ChangeNotifier {
         ? rows.length
         : _config.calibrationFrames;
     final List<FeatureCsvRow> head = rows.take(take).toList();
-    return LampBaseline(
-      white: _mean(head.map((FeatureCsvRow r) => r.white)),
-      red: _mean(head.map((FeatureCsvRow r) => r.red)),
-      frameCount: head.length,
-    );
-  }
-
-  static FrameFeatures _mean(Iterable<FrameFeatures> list) {
-    final List<FrameFeatures> items = list.toList();
-    double sum(double Function(FrameFeatures f) pick) =>
-        items.fold<double>(0, (double acc, FrameFeatures f) => acc + pick(f)) / items.length;
-    return FrameFeatures(
-      meanY: sum((FrameFeatures f) => f.meanY),
-      brightFrac: sum((FrameFeatures f) => f.brightFrac),
-      sat: sum((FrameFeatures f) => f.sat),
-      redDom: sum((FrameFeatures f) => f.redDom),
-      coreEdgeDiff: sum((FrameFeatures f) => f.coreEdgeDiff),
-      sampleCount: 0,
+    return LampDetector.baselineFrom(
+      head.map((FeatureCsvRow r) => r.white).toList(),
+      head.map((FeatureCsvRow r) => r.red).toList(),
+      _config,
     );
   }
 
@@ -380,8 +379,26 @@ class DetectionSession extends ChangeNotifier {
   }
 
   /// Защита от очереди кадров: если обработка идёт, кадр пропускается.
+  DateTime? _prevFrameAt;
+  double _avgGapMs = 0;
+
   void _onFrame(RawLampFrame frame) {
     diagnostics.onCameraFrame(frame.receivedAt);
+    // _busy в синхронной обработке всегда false, поэтому реальные потери кадров
+    // ловим по разрывам во времени между кадрами.
+    final DateTime? prev = _prevFrameAt;
+    _prevFrameAt = frame.receivedAt;
+    if (prev != null) {
+      final double gap = frame.receivedAt.difference(prev).inMicroseconds / 1000.0;
+      if (_avgGapMs > 0 && gap > _avgGapMs * 2.2) {
+        final int lost = (gap / _avgGapMs).round() - 1;
+        for (int i = 0; i < lost; i++) {
+          diagnostics.onFrameDropped();
+        }
+      } else {
+        _avgGapMs = _avgGapMs == 0 ? gap : _avgGapMs * 0.95 + gap * 0.05;
+      }
+    }
     _lastFrame = frame;
     if (_busy) {
       diagnostics.onFrameDropped();
@@ -405,7 +422,17 @@ class DetectionSession extends ChangeNotifier {
     List<HitEvent> events = const <HitEvent>[];
 
     if (_calibrating) {
-      final LampBaseline? done = _detector.addCalibrationFrame(lampFrame);
+      LampBaseline? done;
+      try {
+        done = _detector.addCalibrationFrame(lampFrame);
+      } on CalibrationException catch (e) {
+        // Раньше исключение терялось в _onFrame, а _calibrating оставался true
+        // навсегда: кнопка «Калибровка» зависала на 30/30.
+        _calibrating = false;
+        _calibrationCompleter?.completeError(e);
+        _calibrationCompleter = null;
+        _report('$e');
+      }
       if (done != null) {
         _calibrating = false;
         unawaited(saveCalibration());
@@ -451,6 +478,7 @@ class DetectionSession extends ChangeNotifier {
     if (events.isNotEmpty) {
       unawaited(_handleEvents(events));
     }
+    frameTick.value++;
     _notify();
   }
 
@@ -580,6 +608,7 @@ class DetectionSession extends ChangeNotifier {
     diagnostics.dispose();
     await _hits.close();
     await _errors.close();
+    frameTick.dispose();
     super.dispose();
   }
 }

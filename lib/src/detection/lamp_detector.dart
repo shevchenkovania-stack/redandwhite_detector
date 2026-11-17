@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import '../models/frame_features.dart';
 import '../models/hit_event.dart';
 import '../models/lamp_config.dart';
@@ -155,15 +157,58 @@ class LampDetector {
     if (_calibrationWhite.length < config.calibrationFrames) {
       return null;
     }
-    final LampBaseline baseline = LampBaseline(
-      white: _average(_calibrationWhite),
-      red: _average(_calibrationRed),
-      frameCount: _calibrationWhite.length,
-    );
+    final List<FrameFeatures> whites = List<FrameFeatures>.of(_calibrationWhite);
+    final List<FrameFeatures> reds = List<FrameFeatures>.of(_calibrationRed);
     clearCalibration();
+    // Бросает CalibrationException, если фон нестабилен.
+    final LampBaseline baseline = baselineFrom(whites, reds, config);
     _baseline = baseline;
     resetTracking();
     return baseline;
+  }
+
+  /// Собирает baseline из кадров «обе выключены» и проверяет, что фон
+  /// стабилен. Используется и живой калибровкой, и прогоном CSV.
+  static LampBaseline baselineFrom(
+    List<FrameFeatures> white,
+    List<FrameFeatures> red,
+    LampConfig config, {
+    DateTime? now,
+  }) {
+    if (white.isEmpty || red.isEmpty) {
+      throw const CalibrationException('нет кадров для калибровки');
+    }
+    final double whiteNoise = _std(white.map((FrameFeatures f) => f.whiteFrac));
+    final double redNoise = _std(red.map((FrameFeatures f) => f.redFrac));
+    if (whiteNoise > config.calibrationMaxNoise || redNoise > config.calibrationMaxNoise) {
+      throw CalibrationException(
+        'фон нестабилен (σ white=${whiteNoise.toStringAsFixed(3)}, '
+        'red=${redNoise.toStringAsFixed(3)}, допустимо ≤ '
+        '${config.calibrationMaxNoise.toStringAsFixed(3)}): лампа мигала, '
+        'камера двигалась или менялся свет. Повтори калибровку.',
+      );
+    }
+    return LampBaseline(
+      white: _average(white),
+      red: _average(red),
+      frameCount: white.length,
+      whiteNoise: whiteNoise,
+      redNoise: redNoise,
+      capturedAtMs: (now ?? DateTime.now()).millisecondsSinceEpoch,
+    );
+  }
+
+  static double _std(Iterable<double> values) {
+    final List<double> list = values.toList();
+    if (list.length < 2) {
+      return 0;
+    }
+    final double mean = list.reduce((double a, double b) => a + b) / list.length;
+    double sq = 0;
+    for (final double v in list) {
+      sq += (v - mean) * (v - mean);
+    }
+    return math.sqrt(sq / (list.length - 1));
   }
 
   static FrameFeatures _average(List<FrameFeatures> features) {
@@ -172,6 +217,8 @@ class LampDetector {
     double sat = 0;
     double redDom = 0;
     double coreEdgeDiff = 0;
+    double whiteFrac = 0;
+    double redFrac = 0;
     int samples = 0;
     for (final FrameFeatures f in features) {
       meanY += f.meanY;
@@ -179,6 +226,8 @@ class LampDetector {
       sat += f.sat;
       redDom += f.redDom;
       coreEdgeDiff += f.coreEdgeDiff;
+      whiteFrac += f.whiteFrac;
+      redFrac += f.redFrac;
       samples += f.sampleCount;
     }
     final int n = features.length;
@@ -189,22 +238,35 @@ class LampDetector {
       redDom: redDom / n,
       coreEdgeDiff: coreEdgeDiff / n,
       sampleCount: n == 0 ? 0 : (samples / n).round(),
+      whiteFrac: whiteFrac / n,
+      redFrac: redFrac / n,
     );
   }
 
-  /// whiteScore = brightFrac, но 0, если насыщенность выше порога: красная
-  /// подсветка сцены не должна считаться белой лампой.
-  double whiteScore(FrameFeatures white) =>
-      white.sat <= config.whiteSatMax ? white.brightFrac : 0;
+  /// Белая: прирост доли «настоящих белых» пикселей над фоном калибровки.
+  /// Раньше baseline белой не использовался вовсе.
+  double whiteScore(FrameFeatures white, LampBaseline baseline) {
+    final double delta = white.whiteFrac - baseline.white.whiteFrac;
+    return delta > 0 ? delta : 0;
+  }
 
-  /// redScore = рост **красноты** (`redDom`) относительно baseline. Красная
-  /// вспышка почти не меняет общую яркость (красный даёт мало в BT.601), но резко
-  /// поднимает `redDom = mean(R) − mean((G+B)/2)`. Белая вспышка, наоборот,
-  /// выравнивает каналы → `redDom` не растёт, поэтому красная рамка на белую
-  /// вспышку не срабатывает. Ядро/кольцо (`coreEdgeDiff`) намеренно НЕ участвует:
-  /// при ходу камеры центр рамки всегда разный, и это лишь шумит.
-  double redScore(FrameFeatures red, LampBaseline baseline) =>
-      (red.redDom - baseline.red.redDom) / config.redDeltaDivisor;
+  /// Красная: прирост доли красных пикселей над фоном, в единицах порога
+  /// (1.0 = redOnThreshold при redOnThreshold = 1).
+  double redScore(FrameFeatures red, LampBaseline baseline) {
+    final double delta = red.redFrac - baseline.red.redFrac;
+    return delta > 0 ? delta / config.redFracDivisor : 0;
+  }
+
+  /// Порог ON с учётом шума фона: не ниже noiseSigmas × σ калибровки.
+  double whiteOnFor(LampBaseline b) {
+    final double floor = config.noiseSigmas * b.whiteNoise;
+    return floor > config.whiteOnThreshold ? floor : config.whiteOnThreshold;
+  }
+
+  double redOnFor(LampBaseline b) {
+    final double floor = config.noiseSigmas * b.redNoise / config.redFracDivisor;
+    return floor > config.redOnThreshold ? floor : config.redOnThreshold;
+  }
 
   LampEvaluation evaluate(LampFrame frame) {
     final LampBaseline? baseline = _baseline;
@@ -214,13 +276,15 @@ class LampDetector {
       );
     }
 
-    final double white = whiteScore(frame.white);
+    final double white = whiteScore(frame.white, baseline);
     final double red = redScore(frame.red, baseline);
 
-    bool whiteAboveOn = white >= config.whiteOnThreshold;
-    bool redAboveOn = red >= config.redOnThreshold;
-    final bool whiteBelowOff = white < config.whiteOffThreshold;
-    final bool redBelowOff = red < config.redOffThreshold;
+    final double whiteOn = whiteOnFor(baseline);
+    final double redOn = redOnFor(baseline);
+    bool whiteAboveOn = white >= whiteOn;
+    bool redAboveOn = red >= redOn;
+    final bool whiteBelowOff = white < whiteOn * config.offRatio;
+    final bool redBelowOff = red < redOn * config.offRatio;
 
     // Обе лампы выше ON-порога в одном кадре: побеждает бо́льший score/порог,
     // проигравший в этом кадре не считается ни ON, ни OFF (нейтральная зона),
@@ -231,7 +295,7 @@ class LampDetector {
       ambiguous = true;
       _ambiguousFrames++;
       final bool whiteWins =
-          white / config.whiteOnThreshold >= red / config.redOnThreshold;
+          white / whiteOn >= red / redOn;
       winner = whiteWins ? HitColor.white : HitColor.red;
       if (whiteWins) {
         redAboveOn = false;
@@ -255,14 +319,14 @@ class LampDetector {
       offConfirmFrames: config.offConfirmFrames,
     );
 
-    // Скользящее среднее baseline — только когда обе лампы погаснуты: ни одна
-    // не подтверждена как горящая и ни одна не превысила ON-порог (иначе кадр
-    // со включением лампы успел бы сдвинуть baseline до подтверждения).
+    // Скользящее среднее baseline — только когда обе лампы однозначно погашены:
+    // обе ниже OFF-порога (а не просто «ниже ON»), иначе слабо горящая лампа
+    // в нейтральной зоне постепенно «впитывается» в фон и пропадает.
     final bool bothDark =
         !_white.lit &&
         !_red.lit &&
-        !whiteAboveOn &&
-        !redAboveOn &&
+        whiteBelowOff &&
+        redBelowOff &&
         _white.onCandidate == null &&
         _red.onCandidate == null;
     if (bothDark) {
@@ -288,10 +352,9 @@ class LampDetector {
 
   LampBaseline _blend(LampBaseline baseline, LampFrame frame) {
     final double alpha = config.baselineAlpha;
-    return LampBaseline(
+    return baseline.copyWithFeatures(
       white: _blendFeatures(baseline.white, frame.white, alpha),
       red: _blendFeatures(baseline.red, frame.red, alpha),
-      frameCount: baseline.frameCount,
     );
   }
 
@@ -307,10 +370,21 @@ class LampDetector {
     coreEdgeDiff:
         base.coreEdgeDiff + (now.coreEdgeDiff - base.coreEdgeDiff) * alpha,
     sampleCount: now.sampleCount,
+    whiteFrac: base.whiteFrac + (now.whiteFrac - base.whiteFrac) * alpha,
+    redFrac: base.redFrac + (now.redFrac - base.redFrac) * alpha,
   );
 }
 
-/// Прогресс набора кадров для калибровки.
+/// Калибровка не удалась (нестабильный фон и т. п.).
+class CalibrationException implements Exception {
+  const CalibrationException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'Калибровка отвергнута: $message';
+}
+
 class CalibrationProgress {
   const CalibrationProgress({required this.collected, required this.needed});
 
