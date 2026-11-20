@@ -14,8 +14,8 @@ enum LampSessionState { idle, whiteOn, redOn }
 /// * WHITE_ON -> IDLE: подтверждённое выключение, события нет;
 /// * WHITE_ON -> RED_ON без паузы: второе событие (первое уже создано при
 ///   включении белой), порядок сохраняется;
-/// * неоднозначный кадр разрешается детектором в одного победителя, поэтому
-///   здесь за кадр максимум одно событие.
+/// * обе лампы выше ON-порога в одном кадре: каналы независимы, автомат
+///   выдаёт **два** события — по одному на каждую лампу.
 class HitStateMachine {
   HitStateMachine({required this.sessionId, String Function()? idGenerator})
     : _nextId = idGenerator ?? _uuidV4;

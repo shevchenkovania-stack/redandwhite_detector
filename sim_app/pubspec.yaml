@@ -43,6 +43,8 @@ dependencies:
   sqflite_common_ffi: ^2.4.0+3
 
   path: ^1.9.1
+  opencv_dart: 2.2.2
+  ffi: ^2.2.0
 
 dev_dependencies:
   flutter_test:
@@ -70,6 +72,9 @@ flutter:
     - assets/off.png
     - assets/white.png
     - assets/red.png
+    - assets/both.png
+    # Второй набор: те же круги, но свет измерен с фото (см. SimStyle).
+    - assets/photo/
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

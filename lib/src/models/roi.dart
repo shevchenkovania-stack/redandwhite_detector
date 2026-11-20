@@ -30,6 +30,21 @@ class LampRoi {
   LampRoi resized(double width, double height) =>
       LampRoi(left: left, top: top, width: width, height: height).normalized();
 
+  /// Изменяет размер вокруг центра (центр остаётся на месте) — удобно для
+  /// точной подгонки зоны под колпак без перетаскивания уголка пальцем.
+  LampRoi scaledAboutCenter(double factor) {
+    final double k = factor <= 0 ? 1.0 : factor;
+    final double w = (width * k).clamp(minSize, 1.0);
+    final double h = (height * k).clamp(minSize, 1.0);
+    final Offset c = center;
+    return LampRoi(
+      left: c.dx - w / 2,
+      top: c.dy - h / 2,
+      width: w,
+      height: h,
+    ).normalized();
+  }
+
   /// Минимальный размер зоны, чтобы подвыборка каждый N-й пиксель давала
   /// осмысленное число отсчётов.
   static const double minSize = 0.02;

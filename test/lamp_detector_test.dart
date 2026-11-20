@@ -1,100 +1,251 @@
-// Положить в test/ пакета lamp_detection. Пути импортов — для layout lib/src/...
-// (если у вас другие, поправьте).
+// Детектор в режиме эталонов. Прежде здесь были «формулы score»; сейчас —
+// проверки измеренных эталонов.
+//
+// Каждый тест прогоняется ДВАЖДЫ: по яркостному пространственному вектору (он
+// решает по умолчанию) и по прежнему цветовому. Так видно, что старая
+// реализация цела и что новое решение проверяется теми же физическими
+// картинами, а не собственным набором фикстур.
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lamp_detection/src/detection/hit_state_machine.dart';
+import 'package:lamp_detection/src/detection/lamp_calibration.dart';
 import 'package:lamp_detection/src/detection/lamp_detector.dart';
 import 'package:lamp_detection/src/models/frame_features.dart';
+import 'package:lamp_detection/src/models/hit_event.dart';
 import 'package:lamp_detection/src/models/lamp_config.dart';
+import 'package:lamp_detection/src/detection/response_model.dart';
 
-FrameFeatures _f({double white = 0, double red = 0}) => FrameFeatures(
-  meanY: 0,
-  brightFrac: 0,
-  sat: 0,
-  redDom: 0,
-  coreEdgeDiff: 0,
-  sampleCount: 100,
-  whiteFrac: white,
-  redFrac: red,
+/// Тёмный фон измеряемой области: 60 уровней в среднем, 100 на верху
+/// распределения, ореол — 40 и 70.
+const double _bgMean = 60;
+const double _bgP90 = 100;
+
+/// Во сколько раз ореол слабее колпака в тех же единицах яркости.
+const double _haloFactor = 0.6;
+
+/// Кадр одной рамки в двух единицах сразу.
+///
+/// Доля «своих» пикселей (прежний способ) и яркость области (пространственный
+/// способ) описывают ОДИН И ТОТ ЖЕ свет, поэтому числа согласованы: свой свет
+/// поднимает и долю, и яркость. `red` в белой рамке — это чужие пиксели, они
+/// меняют только цвет и нужны проверке прежнего вектора.
+FrameFeatures _f({double white = 0, double red = 0}) {
+  final double own = (white + red).clamp(0.0, 1.0);
+  return FrameFeatures(
+    meanY: _bgMean + 140 * own,
+    p90Luma: _bgP90 + 135 * own,
+    sampleCount: 100,
+    whiteFrac: white,
+    redFrac: red,
+  );
+}
+
+/// Ореол своей лампы: тот же свет, но расплывшийся — в полтора раза слабее
+/// колпака. Кольца здесь обязательны: без них пространственный вектор
+/// собирается из двух колпаков, и калибровка отвергается как «нет колец».
+FrameFeatures _halo(FrameFeatures core) => FrameFeatures(
+  meanY: 40 + (core.meanY - _bgMean) * _haloFactor,
+  p90Luma: 70 + (core.meanY - _bgMean) * _haloFactor,
+  sampleCount: 900,
+  whiteFrac: core.whiteFrac * 0.5,
+  redFrac: core.redFrac * 0.5,
+);
+
+/// Ореол, который потемнел ровно на ту же долю, на которую поднялось ядро.
+/// Лампа так не умеет: её свет всегда расплывается за колпак. Это и есть
+/// пространственный «чужак» — картина, которую ни один эталон не ждёт.
+FrameFeatures _inverseHalo(double own) => FrameFeatures(
+  meanY: 40 - 140 * _haloFactor * own,
+  p90Luma: 70 - 140 * _haloFactor * own,
+  sampleCount: 900,
 );
 
 DateTime _t = DateTime(2026, 1, 1);
 LampFrame _frame({double white = 0, double red = 0}) {
   _t = _t.add(const Duration(milliseconds: 33));
-  return LampFrame(timestamp: _t, white: _f(white: white), red: _f(red: red));
+  final FrameFeatures w = _f(white: white);
+  final FrameFeatures r = _f(red: red);
+  return LampFrame(
+    timestamp: _t,
+    white: w,
+    red: r,
+    whiteRing: _halo(w),
+    redRing: _halo(r),
+  );
 }
 
-LampDetector _calibrated([LampConfig config = const LampConfig()]) {
-  final LampDetector d = LampDetector(config);
-  for (int i = 0; i < config.calibrationFrames; i++) {
-    d.addCalibrationFrame(_frame());
+/// Кормит детектор одним состоянием столько кадров, сколько он ждёт на шаг.
+void _state(LampDetector d, LampFrame Function() frame) {
+  for (int i = 0; i < d.config.calibrationFrames; i++) {
+    d.addCalibrationFrame(frame());
   }
+}
+
+/// Полная калибровка: фон нулевой, белая даёт 0.4 в своей рамке, красная —
+/// 0.3 в своей. Отдельно от «перетекания» — картины изменения не пересекаются.
+///
+/// Режим эталонов включён явно: эти тесты проверяют разложение отклика на
+/// измеренные эталоны, а не живой отсчёт.
+LampDetector _calibrated({
+  double whiteOn = 0.4,
+  double redOn = 0.3,
+  double backgroundWhite = 0,
+  double backgroundRed = 0,
+  bool spatial = true,
+}) {
+  final LampConfig config = LampConfig(liveReference: false, spatialVectors: spatial);
+  final LampDetector d = LampDetector(config);
+  _state(d, () => _frame(white: backgroundWhite, red: backgroundRed));
+  _state(d, () => _frame(white: whiteOn, red: backgroundRed));
+  _state(d, () => _frame(white: backgroundWhite, red: redOn));
   expect(d.isCalibrated, isTrue);
   return d;
 }
 
 void main() {
-  test('белая вспышка даёт ровно одно событие, а гашение снимает lit', () {
-    final LampDetector d = _calibrated();
-    final HitStateMachine m = HitStateMachine(sessionId: 's');
-    int hits = 0;
-    for (int i = 0; i < 6; i++) {
-      hits += m.onEvaluation(d.evaluate(_frame(white: 0.4))).length;
-    }
-    expect(hits, 1);
-    for (int i = 0; i < 6; i++) {
-      m.onEvaluation(d.evaluate(_frame()));
-    }
-    expect(m.state, LampSessionState.idle);
-  });
+  for (final bool spatial in <bool>[true, false]) {
+    group(
+      spatial
+          ? 'яркостное пространственное решение (по умолчанию)'
+          : 'прежнее цветовое решение',
+      () {
+        test('три состояния дают два разных измеряемых эталона', () {
+          final LampDetector d = _calibrated(spatial: spatial);
+          final LampResponseModel m = d.model!;
+          expect(m.vector.length, spatial ? LampVector.spatialLength : LampVector.legacyLength);
+          expect(m.whiteResponse, greaterThan(0));
+          expect(m.redResponse, greaterThan(0));
+          expect(m.crosstalk, closeTo(0, 1e-12));
+          expect(m.isValid, isTrue);
 
-  test('красная: 10 % красных пикселей = score 2.0, событие одно', () {
-    final LampDetector d = _calibrated();
-    final HitStateMachine m = HitStateMachine(sessionId: 's');
-    int hits = 0;
-    for (int i = 0; i < 6; i++) {
-      final LampEvaluation e = d.evaluate(_frame(red: 0.10));
-      expect(e.redScore, closeTo(2.0, 1e-9));
-      hits += m.onEvaluation(e).length;
-    }
-    expect(hits, 1);
-  });
+          if (spatial) {
+            // Своя лампа изменила СВОИ области и не тронула чужие: ни одного
+            // числа, которого в калибровке не измеряли.
+            expect(m.whiteTemplate[LampVector.whiteCoreMean], greaterThan(0));
+            expect(m.whiteTemplate[LampVector.whiteRingMean], greaterThan(0));
+            expect(m.whiteTemplate[LampVector.redCoreMean], closeTo(0, 1e-12));
+            expect(m.redTemplate[LampVector.redCoreMean], greaterThan(0));
+            expect(m.redTemplate[LampVector.redRingMean], greaterThan(0));
+            expect(m.redTemplate[LampVector.whiteCoreMean], closeTo(0, 1e-12));
+          } else {
+            // Прежний вектор: отклик белой — ровно её измеренная доля.
+            expect(m.whiteTemplate[LampVector.whiteWhiteFrac], closeTo(0.4, 1e-12));
+            expect(m.redTemplate[LampVector.redRedFrac], closeTo(0.3, 1e-12));
+          }
+        });
 
-  test('нестабильный фон при калибровке отвергается', () {
-    final LampDetector d = LampDetector(const LampConfig());
-    expect(() {
-      for (int i = 0; i < 30; i++) {
-        d.addCalibrationFrame(_frame(white: i.isEven ? 0.0 : 0.5));
-      }
-    }, throwsA(isA<CalibrationException>()));
-    expect(d.isCalibrated, isFalse);
-  });
+        test('лампа, которая горела уже на шаге «фон», отвергается с именем шага', () {
+          final LampDetector d = LampDetector(
+            LampConfig(liveReference: false, spatialVectors: spatial),
+          );
+          // Красная горит всё время: её «отклик относительно фона» равен нулю, и
+          // именно это раньше убивало канал молча — детектор считал её фоном.
+          expect(
+            () {
+              _state(d, () => _frame(red: 0.3));
+              _state(d, () => _frame(white: 0.4, red: 0.3));
+              _state(d, () => _frame(red: 0.3));
+            },
+            throwsA(
+              isA<CalibrationException>().having(
+                (CalibrationException e) => e.message,
+                'message',
+                contains('красная'),
+              ),
+            ),
+          );
+          expect(d.isCalibrated, isFalse);
+        });
 
-  test('слабо горящая красная в нейтральной зоне не «впитывается» в baseline', () {
-    final LampDetector d = _calibrated();
-    final double before = d.baseline!.red.redFrac;
-    // score 0.8: выше OFF (0.6), ниже ON (1.0) — раньше baseline полз вверх.
-    for (int i = 0; i < 600; i++) {
-      d.evaluate(_frame(red: 0.04));
-    }
-    expect(d.baseline!.red.redFrac, closeTo(before, 1e-12));
-  });
+        test('одно включение — ровно одно событие, гашение снимает lit', () {
+          final LampDetector d = _calibrated(spatial: spatial);
+          final HitStateMachine m = HitStateMachine(sessionId: 's');
+          int hits = 0;
+          for (int i = 0; i < 6; i++) {
+            hits += m.onEvaluation(d.evaluate(_frame(white: 0.4))).length;
+          }
+          expect(hits, 1);
+          expect(d.evaluate(_frame(white: 0.4)).whiteAmplitude, closeTo(1, 1e-9));
+          for (int i = 0; i < 6; i++) {
+            m.onEvaluation(d.evaluate(_frame()));
+          }
+          expect(m.state, LampSessionState.idle);
+        });
 
-  test('белая погасла, пока горит красная: автомат это не теряет', () {
-    final LampDetector d = _calibrated();
-    final HitStateMachine m = HitStateMachine(sessionId: 's');
-    for (int i = 0; i < 5; i++) {
-      m.onEvaluation(d.evaluate(_frame(white: 0.4)));
-    }
-    for (int i = 0; i < 5; i++) {
-      m.onEvaluation(d.evaluate(_frame(white: 0.4, red: 0.10)));
-    }
-    for (int i = 0; i < 6; i++) {
-      m.onEvaluation(d.evaluate(_frame(red: 0.10)));
-    }
-    expect(m.state, LampSessionState.redOn);
-    for (int i = 0; i < 6; i++) {
-      m.onEvaluation(d.evaluate(_frame()));
-    }
-    expect(m.state, LampSessionState.idle);
-  });
+        test('затекание красной в белую рамку не даёт белого события', () {
+          final LampDetector d = _calibrated(spatial: spatial);
+          final HitStateMachine m = HitStateMachine(sessionId: 's');
+          int white = 0;
+          int red = 0;
+          for (int i = 0; i < 6; i++) {
+            // Красная лампа подсветила белую рамку: 0.05 из 0.4 её отклика.
+            for (final HitEvent e in m.onEvaluation(d.evaluate(_frame(white: 0.05, red: 0.3)))) {
+              if (e.color == HitColor.white) {
+                white++;
+              } else {
+                red++;
+              }
+            }
+          }
+          expect(red, 1);
+          expect(white, 0);
+        });
+
+        test('белая погасла, пока красная горит: автомат это не теряет', () {
+          final LampDetector d = _calibrated(spatial: spatial);
+          final HitStateMachine m = HitStateMachine(sessionId: 's');
+          for (int i = 0; i < 5; i++) {
+            m.onEvaluation(d.evaluate(_frame(white: 0.4)));
+          }
+          for (int i = 0; i < 5; i++) {
+            m.onEvaluation(d.evaluate(_frame(white: 0.4, red: 0.3)));
+          }
+          for (int i = 0; i < 6; i++) {
+            m.onEvaluation(d.evaluate(_frame(red: 0.3)));
+          }
+          expect(m.state, LampSessionState.redOn);
+          for (int i = 0; i < 6; i++) {
+            m.onEvaluation(d.evaluate(_frame()));
+          }
+          expect(m.state, LampSessionState.idle);
+        });
+
+        test('кадр, не похожий ни на один эталон, не даёт событий вообще', () {
+          final LampDetector d = _calibrated(spatial: spatial);
+          final HitStateMachine m = HitStateMachine(sessionId: 's');
+          // Чужак свой у каждого способа. Цветовой: в белой рамке выросла доля
+          // КРАСНЫХ пикселей (рука, засветка) — ни один эталон так не меняется.
+          // Пространственный: ядро яркое, а ореол вокруг него потемнел — так не
+          // умеет ни одна лампа, потому что её свет всегда расплывается.
+          final LampFrame raw = spatial
+              ? LampFrame(
+                  timestamp: _t.add(const Duration(milliseconds: 33)),
+                  white: _f(white: 0.4),
+                  red: _f(),
+                  whiteRing: _inverseHalo(0.4),
+                  redRing: _halo(_f()),
+                )
+              : LampFrame(
+                  timestamp: _t.add(const Duration(milliseconds: 33)),
+                  white: _f(red: 0.5),
+                  red: _f(),
+                );
+          final LampEvaluation foreign = d.evaluate(raw);
+          final LampEvaluation e = d.evaluate(_frame());
+          expect(foreign.unexplained, isTrue);
+          expect(m.onEvaluation(foreign), isEmpty);
+          expect(m.onEvaluation(e), isEmpty);
+        });
+
+        test('baseline после калибровки не меняется никогда', () {
+          final LampDetector d = _calibrated(spatial: spatial);
+          final double before = d.baseline!.background.red.redFrac;
+          for (int i = 0; i < 600; i++) {
+            d.evaluate(_frame(white: 0.4, red: 0.3));
+          }
+          expect(d.baseline!.background.red.redFrac, closeTo(before, 1e-12));
+          expect(d.baseline!.background.white.whiteFrac, closeTo(0, 1e-12));
+        });
+      },
+    );
+  }
 }

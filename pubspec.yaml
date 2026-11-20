@@ -1,6 +1,6 @@
 name: lamp_detection
 description: "Счёт попаданий по двум сигнальным лампам (белая и красная) через камеру: извлечение признаков, гистерезисный детектор, offline-first SQLite-очередь доставки."
-version: 0.0.1
+version: 0.1.0
 homepage:
 
 environment:

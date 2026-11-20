@@ -13,6 +13,7 @@ class DiagnosticsSnapshot {
     required this.framesProcessed,
     required this.eventCount,
     required this.ambiguousFrames,
+    required this.unexplainedFrames,
     required this.avgSaveLatencyMs,
     required this.maxSaveLatencyMs,
     required this.exposureTimeNs,
@@ -29,6 +30,7 @@ class DiagnosticsSnapshot {
     framesProcessed: 0,
     eventCount: 0,
     ambiguousFrames: 0,
+    unexplainedFrames: 0,
     avgSaveLatencyMs: 0,
     maxSaveLatencyMs: 0,
     exposureTimeNs: null,
@@ -44,6 +46,10 @@ class DiagnosticsSnapshot {
   final int framesProcessed;
   final int eventCount;
   final int ambiguousFrames;
+
+  /// Кадры, которые не похожи ни на одну из откалиброванных ламп: рука,
+  /// тряска, засветка, «не похоже ни на одну». Событий по ним не выдаётся.
+  final int unexplainedFrames;
   final double avgSaveLatencyMs;
   final double maxSaveLatencyMs;
 
@@ -59,19 +65,31 @@ class DiagnosticsSnapshot {
   String toString() =>
       'camera=${cameraFps.toStringAsFixed(1)}fps analysis=${analysisFps.toStringAsFixed(1)}fps '
       'avg=${avgAnalysisMs.toStringAsFixed(2)}ms max=${maxAnalysisMs.toStringAsFixed(2)}ms '
-      'dropped=$droppedFrames events=$eventCount ambiguous=$ambiguousFrames';
+      'dropped=$droppedFrames events=$eventCount ambiguous=$ambiguousFrames '
+      'unexplained=$unexplainedFrames';
 }
 
-/// Одна точка графика score (режим «повторное попадание»).
+/// Одна точка графика амплитуд (режим «повторное попадание»).
 class ScorePoint {
-  const ScorePoint({required this.at, required this.white, required this.red});
+  const ScorePoint({
+    required this.at,
+    required this.white,
+    required this.red,
+    this.residual = 0,
+  });
 
   final DateTime at;
+
+  /// Амплитуды в долях измеренного отклика: 1.0 = лампа горит так же, как на
+  /// калибровке, поэтому линия y = 1 на графике сохраняет смысл.
   final double white;
   final double red;
+
+  /// Необъяснённая часть изменения кадра в единицах вектора.
+  final double residual;
 }
 
-/// Сбор метрик и истории score. Отдаёт данные через ChangeNotifier, чтобы демо
+/// Сбор метрик и истории амплитуд. Отдаёт данные через ChangeNotifier, чтобы демо
 /// перерисовывало панель диагностики без bloc/riverpod.
 class DiagnosticsCollector extends ChangeNotifier {
   DiagnosticsCollector({this.windowSize = 60, this.historySize = 240, this.notifyInterval = const Duration(milliseconds: 200)});
@@ -95,6 +113,7 @@ class DiagnosticsCollector extends ChangeNotifier {
   int _framesProcessed = 0;
   int _eventCount = 0;
   int _ambiguousFrames = 0;
+  int _unexplainedFrames = 0;
   int? _exposureTimeNs;
   double? _sensorSensitivity;
   DateTime _lastNotify = DateTime.fromMillisecondsSinceEpoch(0);
@@ -119,6 +138,7 @@ class DiagnosticsCollector extends ChangeNotifier {
       framesProcessed: n,
       eventCount: _eventCount,
       ambiguousFrames: _ambiguousFrames,
+      unexplainedFrames: _unexplainedFrames,
       avgSaveLatencyMs: n == 0 ? 0 : _totalSaveMs / n,
       maxSaveLatencyMs: _maxSaveMs,
       exposureTimeNs: _exposureTimeNs,
@@ -165,17 +185,27 @@ class DiagnosticsCollector extends ChangeNotifier {
     _isolatedFlag = _analysisSamples > 0 && _totalAnalysisMs / _analysisSamples > _isolateThresholdMs;
   }
 
-  /// Вызывается после полной обработки кадра.
+  /// Вызывается после полной обработки кадра. [whiteAmplitude] и
+  /// [redAmplitude] — доли измеренного отклика, [residual] — необъяснённая часть
+  /// изменения кадра.
   void onFrameProcessed({
     required DateTime timestamp,
-    required double whiteScore,
-    required double redScore,
+    required double whiteAmplitude,
+    required double redAmplitude,
+    double residual = 0,
     int? exposureTimeNs,
     double? sensorSensitivity,
   }) {
     _framesProcessed++;
     _push(_analysisStamps, timestamp, windowSize);
-    _scores.add(ScorePoint(at: timestamp, white: whiteScore, red: redScore));
+    _scores.add(
+      ScorePoint(
+        at: timestamp,
+        white: whiteAmplitude,
+        red: redAmplitude,
+        residual: residual,
+      ),
+    );
     if (_scores.length > historySize) {
       _scores.removeRange(0, _scores.length - historySize);
     }
@@ -201,7 +231,10 @@ class DiagnosticsCollector extends ChangeNotifier {
 
   void onAmbiguousFrame() => _ambiguousFrames++;
 
-  /// Сброс счётчиков (Reset в демо). Кадровые FPS и история score обнуляются.
+  /// Кадр, который не объясняется ни одной откалиброванной лампой.
+  void onUnexplainedFrame() => _unexplainedFrames++;
+
+  /// Сброс счётчиков (Reset в демо). Кадровые FPS и история амплитуд обнуляются.
   void resetCounters() {
     _cameraStamps.clear();
     _analysisStamps.clear();
@@ -215,6 +248,7 @@ class DiagnosticsCollector extends ChangeNotifier {
     _framesProcessed = 0;
     _eventCount = 0;
     _ambiguousFrames = 0;
+    _unexplainedFrames = 0;
     _isolatedFlag = false;
     notifyListeners();
   }

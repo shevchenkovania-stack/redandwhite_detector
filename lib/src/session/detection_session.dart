@@ -5,18 +5,64 @@ import 'package:uuid/uuid.dart';
 
 import '../camera/frame_source.dart';
 import '../delivery/hit_event_sender.dart';
+import '../detection/exposure_guard.dart';
 import '../detection/feature_extractor.dart';
 import '../detection/hit_state_machine.dart';
+import '../detection/lamp_calibration.dart';
 import '../detection/lamp_detector.dart';
-import '../detection/lamp_locator.dart';
+import '../detection/response_model.dart';
 import '../diagnostics/diagnostics_collector.dart';
 import '../diagnostics/feature_csv_recorder.dart';
+import '../diagnostics/mode_comparator.dart';
 import '../models/frame_features.dart';
 import '../models/hit_event.dart';
 import '../models/lamp_config.dart';
 import '../models/roi.dart';
 import '../storage/event_repository.dart';
 import 'settings_store.dart';
+
+/// Что именно получает теневой измеритель.
+///
+/// Смысл класса в одном: второй способ обязан мерить **тот же кадр, что и
+/// основной конвейер**, а не пересказывать его результат. Поэтому сюда
+/// кладётся и сырая картинка с камеры ([raw]), и геометрия зон ([roi],
+/// [mapping]), чем основной конвейер их превращает в пиксели, и уже готовые
+/// признаки ([frame]) с решением ([evaluation]) — чтобы было с чем сравнивать.
+/// Без сырых пикселей «второй измеритель» не мог бы измерить ничего: [frame]
+/// — это числа, которые посчитал рабочий экстрактор.
+class ShadowInput {
+  const ShadowInput({
+    required this.raw,
+    required this.roi,
+    required this.mapping,
+    required this.frame,
+    this.evaluation,
+  });
+
+  /// Сырой кадр с источника: плоскость Y (YUV420) или упакованные BGRA.
+  final RawLampFrame raw;
+
+  /// Зоны ламп в координатах превью — те же, чем решал основной конвейер.
+  final RoiLayout roi;
+
+  /// Перенос этих же зон в координаты кадра.
+  final FrameMapping mapping;
+
+  /// Признаки этого кадра, посчитанные рабочим [FeatureExtractor].
+  final LampFrame frame;
+
+  /// Решение по этому кадру; нет — если кадр был калибровочным или сброшен.
+  final LampEvaluation? evaluation;
+}
+
+/// Теневой измеритель света: получает тот же кадр и то же решение, что основной
+/// конвейер, и обязан остаться наблюдателем.
+///
+/// Так второй способ измерения (например, OpenCV) сравнивается с рабочим на
+/// живых кадрах, не имея шанса повлиять на автомат: результат — `void`, вызов
+/// идёт после того, как события уже приняты, а его собственная ошибка
+/// ловится. Ничего из принесённого тенем детектор не читает.
+typedef ShadowProbe = void Function(ShadowInput input);
 
 /// Всё, что нужно UI про состояние сессии.
 class LampStatus {
@@ -33,6 +79,14 @@ class LampStatus {
     required this.recordingCsv,
     required this.state,
     this.csvPath,
+    this.stepResult = '',
+    this.completedSteps = const <CalibrationStep>[],
+    this.phaseSeconds = 0,
+    this.calibrationHint = '',
+    this.calibrationError = '',
+    this.settling = false,
+    this.exposureLocked = true,
+    this.overexposed = false,
   });
 
   static const LampStatus initial = LampStatus(
@@ -51,6 +105,9 @@ class LampStatus {
 
   final bool running;
   final bool calibrating;
+
+  /// Прогресс текущего шага, включая [CalibrationProgress.step] с подсказкой
+  /// оператору.
   final CalibrationProgress calibration;
   final bool isCalibrated;
   final bool whiteLit;
@@ -61,6 +118,40 @@ class LampStatus {
   final bool recordingCsv;
   final LampSessionState state;
   final String? csvPath;
+
+  /// Чем кончился только что завершённый шаг калибровки — измеренные числа
+  /// (отклик, шум, перетекание), а не слово «готово». Пусто, пока шаг набирается.
+  final String stepResult;
+
+  /// Какие шаги уже набраны в текущей калибровке (для «шаг 2 из 3»).
+  final List<CalibrationStep> completedSteps;
+
+  /// Сколько секунд оператор уже набирает текущий шаг. Это счётчик вверх, а не
+  /// обратный отсчёт: включить лампу человек быстрее не успеет от того, что
+  /// таймер тикает к нулю, а вот понять, что набор завис, по нему можно.
+  final int phaseSeconds;
+
+  /// Одна короткая строка «что делать» для экрана калибровки. Рождается здесь,
+  /// а не в UI, потому что зависит от того, увидна ли лампа детектором.
+  final String calibrationHint;
+
+  /// Чем закончился только что отвергнутый шаг калибровки — одна короткая
+  /// строка прямо над подсказкой. Прежний вариант упал в серую строчку внизу
+  /// экрана, оператор её не видел и жал «Калибровка» заново, теряя два
+  /// набранных шага. Пусто, пока отказы не случались.
+  final String calibrationError;
+
+  /// Идёт набор шага, но первые кадры ещё выбрасываются (стабилизация лампы и
+  /// автоэкспозиции). Экран обязан показать это, а не «застывший» счётчик.
+  final bool settling;
+
+  /// Заперта ли экспозиция камерой. `false` — автоэкспозиция до сих пор
+  /// пересчитывает кадр, и любой её шаг детектор примет за вспышку лампы.
+  final bool exposureLocked;
+
+  /// Последняя рамка стоит на клиппинге (Y ≥ [DetectionSession.clipLuma]):
+  /// цвета и яркости в таких пикселях нет, канал слепой.
+  final bool overexposed;
 
   String get whiteStatus => whiteLit ? 'ON' : 'OFF';
   String get redStatus => redLit ? 'ON' : 'OFF';
@@ -91,6 +182,29 @@ class DetectionSession extends ChangeNotifier {
   /// Сколько сообщений об ошибках держать для панели.
   static const int maxStoredErrors = 50;
 
+  /// Сколько кадров текущего шага выбрасывается перед набором. Лампа и
+  /// автоэкспозиция камеры приходят в равновесие не в момент нажатия,
+  /// переходные кадры исказили бы эталон и шум шага.
+  static const int calibrationSettleFrames = 10;
+
+  /// Сколько времени после старта шага кадры считаются переходными. Нужен
+  /// вместе с [calibrationSettleFrames]: запись кадра идёт 24–100 мс, и одних
+  /// только «10 кадров» хватило бы на четверть секунды, тогда как
+  /// перелоксировка экспозиции камеры (её пауза на сходимость + кадры
+  /// стабилизации) длится дольше. Шаг набирается, только когда прошли ОБА
+  /// условия.
+  static const Duration calibrationSettleTime = Duration(milliseconds: 1200);
+
+  /// Яркость, с которой рамка считается стоящей на клиппинге (0..255). Среднее
+  /// по рамке выше этого значения означает, что почти все её пиксели упёрлись
+  /// в потолок: ни цвета, ни запаса яркости там уже нет.
+  static const double clipLuma = 248;
+
+  /// Сколько раз за шаг «фон» разрешено убавить экспозицию из-за пересвета.
+  /// Больше одного шага вниз оператор уже не поймёт, что происходит, а на
+  /// последующих шагах экспозицию менять поздно — фон набран при другой.
+  static const int maxClipCorrections = 2;
+
   final FrameSource source;
   final EventRepository repository;
   final HitEventSender sender;
@@ -111,7 +225,40 @@ class DetectionSession extends ChangeNotifier {
 
   StreamSubscription<RawLampFrame>? _framesSub;
   StreamSubscription<FrameSourceStatus>? _statusSub;
-  Completer<LampBaseline>? _calibrationCompleter;
+  Completer<CalibrationReport>? _calibrationCompleter;
+
+  /// Начало набора текущего шага: по нему считается и конец стабилизации, и
+  /// счётчик секунд на экране.
+  DateTime? _phaseStartedAt;
+  int _settleLeft = 0;
+  bool _overexposed = false;
+  int _clipCorrectionsLeft = maxClipCorrections;
+  bool _clipWarned = false;
+
+  /// Свет, при котором набраны текущие измерения: по его смене сессия
+  /// сбрасывает калибровку (см. [_onExposureBasisLost]).
+  final ExposureGuard _exposure = ExposureGuard();
+
+  /// Теневой измеритель (см. [ShadowProbe]): второй способ мерить свет на тех
+  /// же живых кадрах. Null = тени нет, и прогон идёт ровно тем же кодом, что и
+  /// без этой возможности.
+  ShadowProbe? get shadowProbe => _shadowProbe;
+
+  set shadowProbe(ShadowProbe? value) {
+    // Новой тени — новая жалоба: иначе второй подключённый измеритель молчал
+    // бы, уже будучи отключённым первым.
+    if (!identical(value, _shadowProbe)) {
+      _shadowWarned = false;
+    }
+    _shadowProbe = value;
+  }
+
+  ShadowProbe? _shadowProbe;
+
+  /// Нужен, чтобы падающий теневой измеритель не засыпал приложение ошибками
+  /// на каждый кадр: показывается только первая.
+  bool _shadowWarned = false;
+
   Future<void>? _delivery;
 
   bool _busy = false;
@@ -124,6 +271,8 @@ class DetectionSession extends ChangeNotifier {
   int _whiteHits = 0;
   int _redHits = 0;
   String _lastSignature = '';
+  String _stepResult = '';
+  String _stepError = '';
   RawLampFrame? _lastFrame;
   LampFrame? _lastLampFrame;
   LampEvaluation? _lastEvaluation;
@@ -145,6 +294,9 @@ class DetectionSession extends ChangeNotifier {
   LampConfig get config => _config;
   bool get isRunning => _running;
   bool get isCalibrated => _detector.isCalibrated;
+
+  /// Считаются ли события: в режиме живого отсчёта калибровка не обязательна.
+  bool get canEvaluate => _detector.canEvaluate;
   String get sessionId => _machine.sessionId;
   int get whiteHits => _whiteHits;
   int get redHits => _redHits;
@@ -153,9 +305,164 @@ class DetectionSession extends ChangeNotifier {
   /// Признаки последнего обработанного кадра по обеим рамкам — для «Расшифровки».
   LampFrame? get lastFeatures => _lastLampFrame;
 
+  /// Измеренная модель отклика (эталоны, шумы, перетекание). Null до калибровки.
+  LampResponseModel? get model => _detector.model;
+
+  /// Шаг пошаговой калибровки, который набирается сейчас.
+  CalibrationStep get calibrationStep => _detector.calibrationStep;
+
+  /// Короткая причина последнего отвергнутого шага (пусто, если отказов не
+  /// было). Мастер калибровки показывает её на экране — в лог она тоже идёт,
+  /// но у лампы лог никто не читает.
+  String get calibrationError => _stepError;
+
+  /// Сколько секунд оператор набирает текущий шаг. Обратно отсчёт не идёт
+  /// намеренно: дедлайн на включение лампы не работал — он только выглядел как
+  /// время, а набор по его истечении всё равно начинался по не включённой
+  /// лампе.
+  int get phaseSeconds {
+    final DateTime? started = _phaseStartedAt;
+    if (started == null || !_calibrating) {
+      return 0;
+    }
+    return DateTime.now().difference(started).inSeconds;
+  }
+
+  /// Набор текущего шага ещё только стабилизируется (см.
+  /// [calibrationSettleFrames] и [calibrationSettleTime]).
+  bool get settling => _calibrating && !_settleFinished;
+
+  bool get _settleFinished {
+    final DateTime? started = _phaseStartedAt;
+    if (started == null) {
+      return _settleLeft <= 0;
+    }
+    return _settleLeft <= 0 &&
+        DateTime.now().difference(started) >= calibrationSettleTime;
+  }
+
+  /// Источник, умеющий управлять экспозицией, или null, если не умеет (файл,
+  /// тест, симулятор).
+  ExposureControl? get _light {
+    final FrameSource target = source;
+    // Явный `as`: для `abstract interface class` анализатор сужение типа не
+    // делает (так же, как с FrameMappingControl в setFrameMapping).
+    return target is ExposureControl ? target as ExposureControl : null;
+  }
+
+  /// Заперта ли экспозиция. Источник, который управлять ею не умеет, считается
+  /// запертым: у него свет не плывёт.
+  bool get exposureLocked {
+    final ExposureControl? light = _light;
+    return light == null || light.exposureLocked;
+  }
+
+  /// Одна строка «что делать» для мастера калибровки. Пока шаг набирается —
+  /// что должно быть в кадре; пока стоит — какую из трёх кнопок нажать следующей.
+  /// Рождается здесь, а не в UI, потому что зависит от того, увидна ли лампа
+  /// детектором.
+  String get calibrationHint {
+    final CalibrationStep step = _detector.calibrationStep;
+    if (_calibrating) {
+      return switch (step) {
+        CalibrationStep.background => 'Держи обе лампы погашенными',
+        CalibrationStep.whiteOn => 'Держи белую горящей',
+        CalibrationStep.redOn => 'Держи красную горящей',
+      };
+    }
+    if (_isFullyShot) {
+      return 'Калибровка есть. Переснять шаг — жми его кнопку';
+    }
+    return switch (step) {
+      CalibrationStep.background => _referenceLit
+          ? 'В кадре светло — гаси лампы и жми «1 ФОН»'
+          : 'Погаси обе лампы и жми «1 ФОН»',
+      CalibrationStep.whiteOn => 'Включи белую и жми «2 БЕЛАЯ»',
+      CalibrationStep.redOn => _whiteStillLit
+          ? 'Гаси белую — потом жми «3 КРАСНАЯ»'
+          : 'Гаси белую, включай красную и жми «3 КРАСНАЯ»',
+    };
+  }
+
+  /// Все три состояния набраны и модель принята. Отдельное поле для этого не
+  /// хранится: после `_validate()` состояния сознательно стёрты, а рабочая
+  /// модель осталась — значит «готово» выглядит как рабочий baseline без
+  /// недобранных шагов.
+  bool get _isFullyShot =>
+      _detector.isCalibrated && _detector.completedCalibrationSteps.isEmpty;
+
+  /// Белая всё ещё горит (красную нельзя набирать, пока в кадре белая).
+  bool get _whiteStillLit {
+    final LampFrame? current = _lastLampFrame;
+    if (current == null) {
+      return false;
+    }
+    return _detector.lampAppeared(current, CalibrationStep.whiteOn);
+  }
+
+  /// Горит ли хоть одна лампа по ПРЕЖНЕЙ калибровке — подсказка кнопки «1 ФОН»,
+  /// у которой своего фона ещё нет. На набор она не влияет: старый эталон может
+  /// относиться к другой сцене, поэтому решение всегда за оператором. Именно
+  /// этот промах и убивал канал молча: фон набирался при горящей лампе.
+  bool get _referenceLit {
+    final LampFrame? current = _lastLampFrame;
+    if (current == null) {
+      return false;
+    }
+    return _detector.lampLikelyLit(current, CalibrationStep.whiteOn) ||
+        _detector.lampLikelyLit(current, CalibrationStep.redOn);
+  }
+
+  /// Самая светлая рамка кадра — то, чем объясняется пересвет.
+  static double _clipY(LampFrame frame) =>
+      frame.white.meanY > frame.red.meanY ? frame.white.meanY : frame.red.meanY;
+
+  /// Уровень срабатывания каждой лампы. Экраны обязаны показывать именно его,
+  /// а не [LampConfig.hitFraction]: при шумной калибровке (и при шумной сцене
+  /// в живом отсчёте) реальный порог выше. В режиме эталонов — доли
+  /// измеренного отклика, null до калибровки; в живом отсчёте — минимальный
+  /// подъём над «полом», null до первого кадра.
+  double? get whiteOnLevel => _detector.whiteOnLevel;
+  double? get redOnLevel => _detector.redOnLevel;
+
+  /// Можно ли считать удар прямо сейчас и если нет — чего не хватает. Рождается
+  /// здесь, а не в UI: половина причин сидит внутри сессии, а оператор у лампы
+  /// обязан видеть не «жива ли программа», а «можно ли жать».
+  ({bool ready, String why}) get readiness {
+    if (!_running) {
+      return (ready: false, why: 'Камера остановлена — жми «Пуск»');
+    }
+    if (_lastLampFrame == null) {
+      return (ready: false, why: 'Камера ещё не дала ни одного кадра');
+    }
+    if (_calibrating) {
+      return (
+        ready: false,
+        why: 'Идёт набор «${_detector.calibrationStep.label}»',
+      );
+    }
+    if (!_detector.canEvaluate) {
+      return (ready: false, why: 'Нет калибровки — начни с «1 ФОН»');
+    }
+    // Живому отсчёту нужно окно темноты: до него решения просто нет.
+    final int warmup = _config.liveReference ? _detector.liveWarmupLeft : 0;
+    if (warmup > 0) {
+      return (ready: false, why: 'Свет стабилизируется, осталось кадров: $warmup');
+    }
+    return (ready: true, why: 'ГОТОВ К РАБОТЕ — считаю удары');
+  }
+
   /// Оценка последнего кадра (score/состояние/неоднозначность). Null, пока
-  /// детектор не откалиброван и кадр считается вхолостую.
+  /// кадры не оцениваются: в режиме эталонов — до калибровки, в живом
+  /// отсчёте — до первого кадра.
   LampEvaluation? get lastEvaluation => _lastEvaluation;
+
+  /// Последний сырой кадр (для отладочного дампа ориентации). Null до первой
+  /// капли с камеры.
+  RawLampFrame? get rawFrame => _lastFrame;
+
+  /// Экстрактор признаков этого кадра — нужен демо, чтобы сохранить кадр в RGB.
+  FeatureExtractor get extractor => _extractor;
 
   /// История score по времени — для графика «повторное попадание».
   List<ScorePoint> get scoreHistory => diagnostics.scores;
@@ -173,6 +480,14 @@ class DetectionSession extends ChangeNotifier {
     recordingCsv: _recordingCsv,
     state: _machine.state,
     csvPath: csvRecorder.filePath,
+    stepResult: _stepResult,
+    completedSteps: _detector.completedCalibrationSteps,
+    phaseSeconds: phaseSeconds,
+    calibrationHint: calibrationHint,
+    calibrationError: _stepError,
+    settling: settling,
+    exposureLocked: exposureLocked,
+    overexposed: _overexposed,
   );
 
   /// Загружает сохранённые ROI, baseline и пороги. Вызывать до [start].
@@ -186,13 +501,30 @@ class DetectionSession extends ChangeNotifier {
       diagnostics.isolateThresholdMs = storedConfig.analysisIsolateThresholdMs;
     }
     final LampBaseline? baseline = settings.readBaseline();
-    if (baseline != null) {
-      final int? at = baseline.capturedAtMs;
-      final int ageMin = at == null
-          ? 1 << 30
-          : DateTime.now().difference(DateTime.fromMillisecondsSinceEpoch(at)).inMinutes;
+    if (baseline != null && !baseline.isCalibrated) {
+      // Калибровка v1 (одно состояние «фон») не содержит эталонов лампы, а v2 с
+      // недобранными шагами не решает. Совместимости нет: это одна потерянная
+      // калибровка при переходе формата, как после правки ориентации кадра.
+      await settings.clearBaseline();
+      _report(
+        'Сохранённая калибровка отвергнута (формат v${baseline.version}, '
+        'нужен v${LampBaseline.currentVersion}): пересними три шага кнопками.',
+        isError: false,
+      );
+    } else if (baseline != null) {
+      final int ageMin = DateTime.now()
+          .difference(DateTime.fromMillisecondsSinceEpoch(baseline.capturedAtMs))
+          .inMinutes;
       if (ageMin <= _config.baselineMaxAgeMinutes) {
         _detector.setBaseline(baseline);
+        // База измерений — та, при которой калибровка снималась, а не та, которую
+        // задаст первый попавшийся кадр: иначе смена света между прогонами
+        // прошла бы незамеченной ровно в том случае, ради которого проверка и
+        // написана.
+        _exposure.remember(
+          ns: baseline.exposureTimeNs,
+          gain: baseline.sensorSensitivity,
+        );
       } else {
         _report('Старая калибровка отброшена (возраст $ageMin мин): освещение могло смениться.', isError: false);
       }
@@ -208,6 +540,15 @@ class DetectionSession extends ChangeNotifier {
   Future<void> start() async {
     if (_running || _disposed) {
       return;
+    }
+    // Живой отсчёт не должен тянуть «ноль» из прошлого прогона: между стопом и
+    // стартом могли сменить сцену (другие картинки, свет, положение телефона).
+    _detector.resetTracking();
+    // База по экспозиции остаётся только у реальной калибровки: без неё её
+    // всё равно не с чем сверять, а первый кадр нового прогона задаст условия
+    // сам.
+    if (!_detector.isCalibrated) {
+      _exposure.clear();
     }
     _statusSub ??= source.status.listen(_onSourceStatus);
     _framesSub ??= source.frames.listen(_onFrame);
@@ -235,37 +576,161 @@ class DetectionSession extends ChangeNotifier {
       await csvRecorder.stop();
       _recordingCsv = false;
     }
+    // Кадров больше не будет, поэтому незавершённый набор закрывается ошибкой,
+    // а не остаётся висеть навсегда.
+    if (_calibrating) {
+      final StateError e = StateError(
+        'Сессия остановлена: набор «${_detector.calibrationStep.label}» прерван',
+      );
+      _calibrating = false;
+      _settleLeft = 0;
+      _stepResult = '';
+      _calibrationCompleter?.completeError(e);
+      _calibrationCompleter = null;
+    }
     _notify(force: true);
   }
 
-  /// Калибровка «обе выключены»: набирает [LampConfig.calibrationFrames]
-  /// кадров и усредняет признаки каждой ROI.
-  Future<LampBaseline> calibrate() {
+  /// Снять один шаг калибровки — по его собственной кнопке.
+  ///
+  /// Ни автоматики, ни набора «по времени», ни ожидания лампы: сцену приводит
+  /// в нужное состояние человек и в тот же момент жмёт кнопку шага. Шагу всё
+  /// равно, что было до него и что будет после, — поэтому порядок не обязателен
+  /// и переснять можно что-то одно: недостающие состояния подставляются из
+  /// рабочей калибровки ([LampDetector.seedCalibration]), а стираются лишь
+  /// переснимаемый шаг и всё, что было снято позже него
+  /// ([LampDetector.goToCalibrationStep]).
+  ///
+  /// Первые [calibrationSettleFrames] кадров и первые [calibrationSettleTime]
+  /// выбрасываются: переходные кадры руки и автоэкспозиции после
+  /// перелоксировки в эталон не попадают.
+  ///
+  /// Бросает [CalibrationException], если шаг шумел, а на «красной» — если
+  /// лампа вообще не увидна: повторять тогда нужно ровно этот шаг, а не всю
+  /// калибровку. Прежняя модель остаётся рабочей, пока не набран последний
+  /// шаг, — до него события считаются по ней.
+  Future<CalibrationReport> calibrateStep(CalibrationStep step) {
     if (!_running) {
-      return Future<LampBaseline>.error(StateError('Сессия не запущена: сначала Start'));
+      return Future<CalibrationReport>.error(
+        StateError('Сессия не запущена: сначала «Пуск»'),
+      );
     }
     if (_calibrating) {
-      return _calibrationCompleter!.future;
+      if (step == _detector.calibrationStep && _calibrationCompleter != null) {
+        // Та же кнопка во время набора: второго набора не запускаем, ждём этот.
+        return _calibrationCompleter!.future;
+      }
+      // Другая кнопка нажалась посреди набора: прерываем его, а не заставляем
+      // человека ждать тридцать кадров чужого шага.
+      _calibrating = false;
+      _settleLeft = 0;
+      _calibrationCompleter?.completeError(
+        StateError('Набор «${_detector.calibrationStep.label}» прерван'),
+      );
+      _calibrationCompleter = null;
     }
+    final LampBaseline? previous = _detector.baseline;
+    if (previous != null && previous.isCalibrated) {
+      _detector.seedCalibration(previous);
+    }
+    if (step != CalibrationStep.background &&
+        !_detector.completedCalibrationSteps.contains(CalibrationStep.background)) {
+      // Сравнивать лампу пока не с чем: без фона шаг не измеряет отклик, а
+      // «готовая» калибровка из одного состояния была бы молча слепой.
+      // Проверка до goToStep — иначе отказ ещё и стёр бы снятые состояния.
+      return Future<CalibrationReport>.error(
+        StateError('Фон ещё не снят: начни с кнопки «1 ФОН»'),
+      );
+    }
+    _detector.goToCalibrationStep(step);
     _calibrating = true;
-    _detector.clearCalibration();
-    _calibrationCompleter = Completer<LampBaseline>();
+    _settleLeft = calibrationSettleFrames;
+    _phaseStartedAt = DateTime.now();
+    _clipWarned = false;
+    if (step == CalibrationStep.background) {
+      // Убавить свет из-за пересвета можно только на фоне: на последующих
+      // шагах экспозиция обязана стоять там же, где её заперли при «1 ФОН».
+      _clipCorrectionsLeft = maxClipCorrections;
+    }
+    _stepResult = '';
+    _stepError = '';
+    // Свет перед набором обязательно ставится на место: шаг, собранный на
+    // уплывающей автоэкспозиции, — это будущие двойные срабатывания.
+    unawaited(_relockExposure());
+    _calibrationCompleter = Completer<CalibrationReport>();
     _notify(force: true);
     return _calibrationCompleter!.future;
   }
 
+  /// Отпустить и снова запереть экспозицию, если источник это умеет.
+  Future<void> _relockExposure() async {
+    final ExposureControl? light = _light;
+    if (light == null) {
+      return;
+    }
+    try {
+      await light.relockExposure();
+    } on Object catch (e) {
+      _report('Экспозиция: $e', isError: false);
+    }
+    _notify(force: true);
+  }
+
+  /// Шаг «фон» набран на пересвете: убираем экспозицию и переснимаем шаг.
+  Future<void> _reduceExposureAndRestart(CalibrationStep step) async {
+    final ExposureControl? light = _light;
+    if (light == null) {
+      return;
+    }
+    final bool done = await light.reduceExposure();
+    if (!done) {
+      return;
+    }
+    // Экспозиция сменилась — всё, что по этому шагу уже собрано, недействительно.
+    _detector.discardCalibrationStep();
+    _settleLeft = calibrationSettleFrames;
+    _phaseStartedAt = DateTime.now();
+    _report('Пересвет убран, «${step.label}» набирается заново', isError: false);
+    _notify(force: true);
+  }
+
+  /// Забыть недобранные состояния и вернуться к кнопке «1 ФОН». Рабочая
+  /// калибровка при этом остаётся: до нового полного набора события считаются
+  /// по ней, а не по половинкам. [dropBaseline] убирает и её — нужно, когда
+  /// прежние состояния уже не относятся к текущим рамкам.
+  void resetCalibration({bool dropBaseline = false}) {
+    _calibrating = false;
+    _settleLeft = 0;
+    final Completer<CalibrationReport>? pending = _calibrationCompleter;
+    _calibrationCompleter = null;
+    pending?.completeError(StateError('Калибровка сброшена'));
+    _detector.clearCalibration();
+    if (dropBaseline) {
+      _detector.startCalibration();
+      unawaited(settings.clearBaseline());
+    }
+    _stepResult = '';
+    _stepError = '';
+    _notify(force: true);
+  }
+
   /// Воспроизведение записанного CSV без камеры: те же детектор и автомат.
   ///
-  /// Если [baseline] не передан, калибровкой считаются первые
-  /// [LampConfig.calibrationFrames] строк (так запись и ведётся: сначала кадры
-  /// с выключенными лампами).
+  /// В режиме эталонов три состояния собираются из строк с меткой шага
+  /// калибровки (колонка `calibration_step`) — так запись и ведётся; можно
+  /// передать готовый [baseline]. В режиме живого отсчёта калибровка не нужна,
+  /// поэтому воспроизводится любой файл: «ноль» берётся из тех же строк.
   Future<List<HitEvent>> replayCsv(String csvContent, {LampBaseline? baseline}) async {
     final List<FeatureCsvRow> rows = FeatureCsv.decode(csvContent);
     if (rows.isEmpty) {
       return const <HitEvent>[];
     }
     final LampDetector detector = LampDetector(_config);
-    detector.setBaseline(baseline ?? _calibrateFrom(rows));
+    if (!_config.liveReference) {
+      detector.setBaseline(baseline ?? _calibrateFrom(rows));
+    } else if (baseline != null) {
+      detector.setBaseline(baseline);
+    }
     final HitStateMachine machine = HitStateMachine(sessionId: 'replay');
     final List<HitEvent> events = <HitEvent>[];
     for (final FeatureCsvRow row in rows) {
@@ -274,38 +739,132 @@ class DetectionSession extends ChangeNotifier {
     return events;
   }
 
+  /// Сравнение двух способов решения по ОДНОЙ записи: цветового и
+  /// пространственно-яркостного. Оба читают одни и те же строки CSV v3, поэтому
+  /// различаются ровно одним фактором, а не двумя прогонами стенда.
+  ///
+  /// Заодно по той же записи измеряются длительности провалов и пауз — те числа,
+  /// которыми задают [LampConfig.offConfirmMs]; без записи их придумывать
+  /// нечем (см. журнал §11).
+  ModeComparison compareModesCsv(String csvContent) =>
+      ModeComparator.compare(csvContent, base: _config);
+
+  /// Калибровка из CSV по меткам шагов: по три состояния, как на живом стенде.
   LampBaseline _calibrateFrom(List<FeatureCsvRow> rows) {
-    final int take = rows.length < _config.calibrationFrames
-        ? rows.length
-        : _config.calibrationFrames;
-    final List<FeatureCsvRow> head = rows.take(take).toList();
-    return LampDetector.baselineFrom(
-      head.map((FeatureCsvRow r) => r.white).toList(),
-      head.map((FeatureCsvRow r) => r.red).toList(),
-      _config,
+    final Map<CalibrationStep, List<LampFrame>> byStep =
+        <CalibrationStep, List<LampFrame>>{};
+    for (final FeatureCsvRow row in rows) {
+      final CalibrationStep? step = CalibrationStep.fromCsvTag(row.calibrationStep);
+      if (step == null) {
+        continue;
+      }
+      (byStep[step] ??= <LampFrame>[]).add(row.toLampFrame());
+    }
+    if (byStep.isEmpty) {
+      throw ArgumentError(
+        'в CSV нет меток шагов калибровки (колонка calibration_step): файл '
+        'записан старой сборкой либо это рабочий прогон. Передайте baseline в '
+        'replayCsv.',
+      );
+    }
+    final List<String> missing = CalibrationStep.values
+        .where((CalibrationStep s) => (byStep[s] ?? const <LampFrame>[]).isEmpty)
+        .map((CalibrationStep s) => '«${s.label}» (шаг ${s.number})')
+        .toList();
+    if (missing.isNotEmpty) {
+      throw ArgumentError('в CSV нет кадров ${missing.join(', ')} — калибровку '
+          'по такому файлу не восстановить');
+    }
+    return LampBaseline(
+      background: LampCalibration.stateFrom(byStep[CalibrationStep.background]!, _config,
+          step: CalibrationStep.background),
+      whiteOn: LampCalibration.stateFrom(byStep[CalibrationStep.whiteOn]!, _config,
+          step: CalibrationStep.whiteOn),
+      redOn: LampCalibration.stateFrom(byStep[CalibrationStep.redOn]!, _config,
+          step: CalibrationStep.redOn),
+      capturedAtMs: rows.last.timestampMs,
+      // Условия света восстановляются по первому кадру набора: рабочий прогон
+      // по этому baseline должен сброситься, если экспозиция ушла, а без метки
+      // он бы молча считал по чужой шкале.
+      exposureTimeNs: rows.first.exposureTimeNs,
+      sensorSensitivity: rows.first.sensorSensitivity,
     );
   }
 
   void updateRoi(RoiLayout layout, {bool persist = false}) {
+    final bool moved = !_sameRoi(_roi, layout);
     _roi = layout;
+    if (moved) {
+      _dropCalibrationOnRoiMove();
+    }
     if (persist) {
       unawaited(settings.writeRoi(layout));
     }
     _notify(force: true);
   }
 
-  /// Автоматический поиск зон ламп по последнему кадру и установка ROI.
-  /// Возвращает найденный [RoiLayout] или null, если кадр ещё не пришёл
-  /// (камера не запущена). Пороги/насычность берутся из текущего конфига.
-  RoiLayout? autoLocateLamps({bool persist = true}) {
-    final RawLampFrame? frame = _lastFrame;
-    if (frame == null) {
-      return null;
+  /// Рамки изменились — значит все собранные измерения считались по другим
+  /// пикселям: и фон, и эталон, и «пол» живого отсчёта. Оставлять их нельзя:
+  /// прогон продолжится по калибровке, снятой с чужого места в кадре (тот же
+  /// дефект, что §6.11 журнала), а кнопка пересъёма подставила бы её же числа
+  /// как ранее снятые. Сброс срабатывает один раз на перетаскивание — дальше
+  /// данных для сброса уже нет.
+  void _dropCalibrationOnRoiMove() {
+    final bool hasCalibration = _calibrating ||
+        _detector.completedCalibrationSteps.isNotEmpty ||
+        _detector.isCalibrated;
+    if (hasCalibration) {
+      resetCalibration(dropBaseline: true);
+      _report('Рамки сдвинулись — калибровка сброшена. Наведи и жми «1 ФОН»',
+          isError: false);
+      return;
     }
-    final RoiLayout layout =
-        const LampLocator().locate(frame, _extractor, source.mapping, _config);
-    updateRoi(layout, persist: persist);
-    return layout;
+    // Калибровки нет, сбрасывать нечего — но «пол» живого отсчёта всё равно
+    // набран по ПРЕЖНИМ пикселям. Это не мелочь: в живом режиме считать можно
+    // и без калибровки, поэтому оператор, наводящий рамки уже после «Пуск»,
+    // получал окно, снятое с фона и с чужого места кадра, и единственный способ
+    // это починить был «Стоп» → «Пуск» (ЖУРНАЛ §6.21).
+    if (_config.liveReference) {
+      relearnLight();
+    }
+  }
+
+  /// Экспозиция сменилась посреди прогона.
+  ///
+  /// Это тот же дефект, что и со сдвинутыми рамками, только замаскированный:
+  /// числа в кадре те же, а света под ними другое количество. Решение то же —
+  /// сброс, а не «пересчёт»: и эталоны, и «пол» живого отсчёта набраны при
+  /// прежней выдержке и новый свет не описывают. Кадр, на котором смена
+  /// поймана, не оценивается: скачок сенсора неотличим от вспышки, а одно
+  /// событие, рождённое автоэкспозицией, дороже потерянного кадра.
+  void _onExposureBasisLost(
+    ({int? ns, double? gain}) previous,
+    LampFrame frame,
+  ) {
+    final bool wasCalibrated = _detector.isCalibrated;
+    resetCalibration(dropBaseline: true);
+    final String shift = ExposureGuard.describe(
+      aNs: previous.ns,
+      aGain: previous.gain,
+      bNs: frame.exposureTimeNs,
+      bGain: frame.sensorSensitivity,
+    );
+    _report(
+      'Экспозиция сменилась ($shift)'
+      '${wasCalibrated ? ': калибровка сброшена' : ': набор начинается заново'} — '
+      'жми «${CalibrationStep.background.key}» и сними три шага при этом свете.',
+    );
+  }
+
+  static bool _sameRoi(RoiLayout a, RoiLayout b) {
+    return a.white.left == b.white.left &&
+        a.white.top == b.white.top &&
+        a.white.width == b.white.width &&
+        a.white.height == b.white.height &&
+        a.red.left == b.red.left &&
+        a.red.top == b.red.top &&
+        a.red.width == b.red.width &&
+        a.red.height == b.red.height;
   }
 
   Future<void> saveRoi() => settings.writeRoi(_roi);
@@ -359,6 +918,33 @@ class DetectionSession extends ChangeNotifier {
     _machine.reset();
     _detector.resetTracking();
     diagnostics.resetCounters();
+    _notify(force: true);
+  }
+
+  /// Перемерить свет заново, НЕ трогая счётчики.
+  ///
+  /// Единственное, что делает оператор после «Пуск» — наводит рамки на колпаки.
+  /// При этом «пол» живого отсчёта уже набран по другим пикселям и по другому
+  /// свету (засветка, горящая соседняя лампа, рука перед объективом), и
+  /// единственный известный способ это сбросить был — «Стоп» и «Пуск» снова.
+  /// Здесь ровно этот сброс, но без потери прогона: счётчики, id сессии и
+  /// номера событий остаются, уходят только окно «пола», гистерезис и состояние
+  /// «горит» (а с ним и залипший канал). Пока окно не наберётся, [readiness]
+  /// честно пишет сколько кадров осталось.
+  ///
+  /// Калибровку не трогает: она привязана к рамкам, а не к моменту нажатия.
+  void relearnLight() {
+    _detector.resetTracking();
+    // Локу экспозиции без калибровки держаться не за что: первый же кадр нового
+    // набора задаст условия, и прежняя база стала бы выдумкой.
+    if (!_detector.isCalibrated) {
+      _exposure.clear();
+    }
+    _report(
+      'Перемеряю свет. Держи лампы погашенными, '
+      'осталось кадров: ${_detector.liveWarmupLeft}',
+      isError: false,
+    );
     _notify(force: true);
   }
 
@@ -418,32 +1004,101 @@ class DetectionSession extends ChangeNotifier {
     diagnostics.beginAnalysis();
 
     final LampFrame lampFrame = _extractor.extract(frame, _roi, source.mapping);
+    // Шаг, к которому относится этот кадр: после завершения шага он уже
+    // указал на следующий, а в CSV метка обязана остаться на набранных кадрах.
+    final CalibrationStep stepAtStart = _detector.calibrationStep;
+    // Кадры стабилизации эталоном не становятся и в CSV с меткой шага не
+    // пишутся: иначе replayCsv восстановит состояние по переходным кадрам.
+    final bool settlingNow = settling;
+    final bool wasCalibrating = _calibrating && !settlingNow;
+    _overexposed = lampFrame.white.meanY >= clipLuma ||
+        lampFrame.red.meanY >= clipLuma;
+    // Свет — часть измерения, а не обстановка: и эталоны, и «пол» живого
+    // отсчёта сняты при конкретной экспозиции. Поймали смену — кадр не
+    // оценивается вовсе (скачок сенсора неотличим от вспышки лампы), а
+    // прежние измерения сбрасываются. Кадры стабилизации пропускаются: там
+    // экспозиция именно переставляется, и это не смена условий прогона.
+    if (!settlingNow) {
+      final ({int? ns, double? gain})? lost = _exposure.checkAndAdopt(
+        ns: lampFrame.exposureTimeNs,
+        gain: lampFrame.sensorSensitivity,
+      );
+      if (lost != null) {
+        _onExposureBasisLost(lost, lampFrame);
+        return;
+      }
+    }
     LampEvaluation? evaluation;
     List<HitEvent> events = const <HitEvent>[];
 
     if (_calibrating) {
-      LampBaseline? done;
-      try {
-        done = _detector.addCalibrationFrame(lampFrame);
-      } on CalibrationException catch (e) {
-        // Раньше исключение терялось в _onFrame, а _calibrating оставался true
-        // навсегда: кнопка «Калибровка» зависала на 30/30.
-        _calibrating = false;
-        _calibrationCompleter?.completeError(e);
-        _calibrationCompleter = null;
-        _report('$e');
+      if (settlingNow) {
+        // Первые кадры после старта шага: ещё могут быть переходными (рука на
+        // выключателе, автоэкспозиция после перелоксировки), в эталон не идут,
+        // но кадр остаётся живым для экрана и диагностики.
+        if (_settleLeft > 0) {
+          _settleLeft--;
+        }
+      } else if (stepAtStart == CalibrationStep.background &&
+          _overexposed &&
+          _clipCorrectionsLeft > 0) {
+        // Фон на клиппинге — это слепая калибровка целиком. Один раз за шаг
+        // убираем свет и переснимаем фон: пока это единственный шаг, после
+        // которого экспозицию менять не поздно.
+        _clipCorrectionsLeft--;
+        _report(
+          'Фон пересвечен (Y=${_clipY(lampFrame).toStringAsFixed(0)}): '
+          'убавляю экспозицию и переснимаю фон',
+          isError: false,
+        );
+        unawaited(_reduceExposureAndRestart(stepAtStart));
+      } else {
+        if (_overexposed && !_clipWarned) {
+          _clipWarned = true;
+          _report(
+            'Пересвет (Y=${_clipY(lampFrame).toStringAsFixed(0)}): в клиппинге нет '
+            'ни цвета, ни яркости — этот канал ничего не посчитает. '
+            'Закрой лампу плотнее или убавь свет и повтори калибровку.',
+            isError: false,
+          );
+        }
+        try {
+          final CalibrationReport? report = _detector.addCalibrationFrame(lampFrame);
+          if (report != null) {
+            _calibrating = false;
+            _settleLeft = 0;
+            _stepResult = report.describe();
+            // Шаг принят — строка отказа больше не нужна: по ней кнопка шага
+            // снова стала обычной, а не «пересними».
+            _stepError = '';
+            if (report.baseline != null) {
+              unawaited(saveCalibration());
+            }
+            _report(_stepResult, isError: false);
+            _calibrationCompleter?.complete(report);
+            _calibrationCompleter = null;
+          }
+        } on CalibrationException catch (e) {
+          // Раньше исключение терялось в _onFrame, а _calibrating оставался true
+          // навсегда: кнопка зависала на 30/30.
+          _calibrating = false;
+          _settleLeft = 0;
+          _stepResult = '';
+          _stepError = e.brief;
+          _report('$e');
+          final Completer<CalibrationReport>? pending = _calibrationCompleter;
+          _calibrationCompleter = null;
+          pending?.completeError(e);
+          _notify(force: true);
+        }
       }
-      if (done != null) {
-        _calibrating = false;
-        unawaited(saveCalibration());
-        _calibrationCompleter?.complete(done);
-        _calibrationCompleter = null;
-        _report('Калибровка завершена: ${done.frameCount} кадров', isError: false);
-      }
-    } else if (_detector.isCalibrated) {
+    } else if (_detector.canEvaluate) {
       evaluation = _detector.evaluate(lampFrame);
       if (evaluation.ambiguous) {
         diagnostics.onAmbiguousFrame();
+      }
+      if (evaluation.unexplained) {
+        diagnostics.onUnexplainedFrame();
       }
       events = _machine.onEvaluation(evaluation);
       _whiteLit = evaluation.whiteLit;
@@ -456,8 +1111,9 @@ class DetectionSession extends ChangeNotifier {
     diagnostics.endAnalysis();
     diagnostics.onFrameProcessed(
       timestamp: lampFrame.timestamp,
-      whiteScore: evaluation?.whiteScore ?? 0,
-      redScore: evaluation?.redScore ?? 0,
+      whiteAmplitude: evaluation?.whiteAmplitude ?? 0,
+      redAmplitude: evaluation?.redAmplitude ?? 0,
+      residual: evaluation?.residual ?? 0,
       exposureTimeNs: lampFrame.exposureTimeNs,
       sensorSensitivity: lampFrame.sensorSensitivity,
     );
@@ -470,6 +1126,26 @@ class DetectionSession extends ChangeNotifier {
             white: lampFrame.white,
             red: lampFrame.red,
             state: _machine.state.name,
+            // Всё, чем этот кадр был решён: кольцо, подъём, порог, переходы.
+            // Без этих колонок запись не воспроизводит решение детектора, а
+            // только его вход.
+            whiteRing: lampFrame.whiteRing,
+            redRing: lampFrame.redRing,
+            whiteRise: evaluation?.whiteAmplitude ?? 0,
+            redRise: evaluation?.redAmplitude ?? 0,
+            whiteLevel: _detector.whiteOnLevel ?? 0,
+            redLevel: _detector.redOnLevel ?? 0,
+            whiteLit: evaluation?.whiteLit ?? _whiteLit,
+            redLit: evaluation?.redLit ?? _redLit,
+            whiteOn: evaluation?.whiteOn ?? false,
+            redOn: evaluation?.redOn ?? false,
+            whiteOff: evaluation?.whiteOff ?? false,
+            redOff: evaluation?.redOff ?? false,
+            ambiguous: evaluation?.ambiguous ?? false,
+            unexplained: evaluation?.unexplained ?? false,
+            exposureTimeNs: lampFrame.exposureTimeNs,
+            sensorSensitivity: lampFrame.sensorSensitivity,
+            calibrationStep: wasCalibrating ? stepAtStart.csvTag : '',
           ),
         ),
       );
@@ -477,6 +1153,30 @@ class DetectionSession extends ChangeNotifier {
 
     if (events.isNotEmpty) {
       unawaited(_handleEvents(events));
+    }
+    // Теневой способ измерения — самый последний шаг: он вызывается, когда
+    // решение по кадру уже принято и события отправлены, поэтому повлиять на
+    // автомат у него нет никакого пути. Падение тени ронять прогон не имеет
+    // права: сравниваем способ, а не проверяем устойчивость к нему.
+    final ShadowProbe? probe = shadowProbe;
+    if (probe != null) {
+      try {
+        probe(
+          ShadowInput(
+            raw: frame,
+            roi: _roi,
+            mapping: source.mapping,
+            frame: lampFrame,
+            evaluation: evaluation,
+          ),
+        );
+      } on Object catch (e) {
+        if (!_shadowWarned) {
+          _shadowWarned = true;
+          _report('Теневой измеритель отключён: $e');
+        }
+        shadowProbe = null;
+      }
     }
     frameTick.value++;
     _notify();
@@ -589,8 +1289,10 @@ class DetectionSession extends ChangeNotifier {
   void _notify({bool force = false}) {
     final LampStatus s = status;
     final String signature =
-        '${s.running}|${s.calibrating}|${s.calibration.collected}|${s.isCalibrated}|'
-        '${s.whiteLit}|${s.redLit}|${s.whiteHits}|${s.redHits}|${s.sessionId}|${s.recordingCsv}';
+        '${s.running}|${s.calibrating}|${s.calibration}|${s.isCalibrated}|'
+        '${s.whiteLit}|${s.redLit}|${s.whiteHits}|${s.redHits}|${s.sessionId}|'
+        '${s.recordingCsv}|${s.stepResult}|${s.settling}|'
+        '${s.calibrationHint}|${s.calibrationError}|${s.exposureLocked}';
     if (!force && signature == _lastSignature) {
       return;
     }

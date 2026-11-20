@@ -3,13 +3,24 @@ import 'dart:math' as math;
 import '../models/frame_features.dart';
 import '../models/hit_event.dart';
 import '../models/lamp_config.dart';
+import 'lamp_calibration.dart';
+import 'live_reference.dart';
+import 'response_model.dart';
 
 /// Результат оценки одного кадра детектором.
+///
+/// [whiteAmplitude] и [redAmplitude] — доли измеренного отклика каждой лампы
+/// (1.0 = «рамки изменились так же, как на калибровке с горящей лампой»).
+/// [residual] — то, что ни одна лампа не объясняет.
 class LampEvaluation {
   const LampEvaluation({
     required this.timestamp,
-    required this.whiteScore,
-    required this.redScore,
+    required this.whiteAmplitude,
+    required this.redAmplitude,
+    required this.change,
+    required this.explained,
+    required this.residual,
+    required this.unexplained,
     required this.whiteOn,
     required this.redOn,
     required this.whiteOff,
@@ -20,17 +31,35 @@ class LampEvaluation {
     required this.ambiguousWinner,
     required this.whiteOnCandidateAt,
     required this.redOnCandidateAt,
+    this.whiteNet = 0,
+    this.redNet = 0,
+    this.whiteDarkMs = 0,
+    this.redDarkMs = 0,
   });
 
   final DateTime timestamp;
-  final double whiteScore;
-  final double redScore;
+  final double whiteAmplitude;
+  final double redAmplitude;
 
-  /// Подтверждённое включение (N подряд кадров выше ON-порога) этим кадром.
+  /// ||d||: насколько кадр ушёл от фона, сколько из этого объясняют две лампы,
+  /// а сколько остаётся необъяснённым.
+  final double change;
+
+  /// ||aW·tW + aR·tR||: измеренная «похожесть на лампы» в тех же единицах, что
+  /// и [change]. Отношение explained/change — доля ухода, объяснённой лампами.
+  final double explained;
+  final double residual;
+
+  /// Кадр «не похоже ни на одну лампу»: изменение большое, а раскладывается
+  /// хуже, чем остаётся необъяснённым. Это рука, тряска, засветка или смена
+  /// сцены — событие по такому кадру не выдаётся.
+  final bool unexplained;
+
+  /// Подтверждённое включение (N подряд кадров выше ON-уровня) этим кадром.
   final bool whiteOn;
   final bool redOn;
 
-  /// Подтверждённое выключение (M подряд кадров ниже OFF-порога) этим кадром.
+  /// Подтверждённое выключение (M подряд кадров ниже OFF-уровня) этим кадром.
   final bool whiteOff;
   final bool redOff;
 
@@ -38,7 +67,13 @@ class LampEvaluation {
   final bool whiteLit;
   final bool redLit;
 
-  /// Кадр, в котором обе лампы выше ON-порога одновременно.
+  /// Подъём своей рамки без общего для обеих рамок света — то, по чему
+  /// гистерезис решил о выключении. Только в режиме живого отсчёта (в режиме
+  /// эталонов общего не бывает: там вычитается измеренный фон).
+  final double whiteNet;
+  final double redNet;
+
+  /// Кадр, в котором обе амплитуды выше своего ON-уровня одновременно.
   final bool ambiguous;
   final HitColor? ambiguousWinner;
 
@@ -46,35 +81,78 @@ class LampEvaluation {
   /// Именно оно попадает в HitEvent.detectedAt.
   final DateTime? whiteOnCandidateAt;
   final DateTime? redOnCandidateAt;
+
+  /// Сколько миллисекунд длится текущий интервал «не выше ON-уровня» каждой
+  /// лампы — и гашение, и провал внутри горения. Единственное число, по которому
+  /// на стенде подбирают [LampConfig.offConfirmMs]: провалы внутри одного горения
+  /// должны быть короче него, паузы между ударами — длиннее.
+  final int whiteDarkMs;
+  final int redDarkMs;
 }
 
 /// Гистерезис одной лампы: подтверждение включения/выключения.
 class _LampTracker {
   bool lit = false;
   int _onRun = 0;
+
+  /// Сколько кадров ТЕКУЩЕГО провала ушли ниже OFF-уровня. Обнуляется только
+  /// когда лампа снова поднялась выше ON — см. [step].
   int _offRun = 0;
   DateTime? _onCandidateAt;
+
+  /// Начало текущего провала ниже OFF-уровня и его длительность в мс. Нужны
+  /// потому, что одно физическое горение — волна: амплитуда падает внутри
+  /// вспышки, и правило, меряющее выключение только числом кадров, закрывает
+  /// событие посреди удара, а следующий кадр открывает второй раз.
+  DateTime? _darkSince;
+  int _darkMs = 0;
+
+  /// Наименьший подъём над «полом» за текущий провал. Это то, чем провал
+  /// внутри горения отличается от настоящего гашения: выключенная лампа падает
+  /// к нулю (её совсем не видно), волна же проседает, но лампу не гасит.
+  double _darkMin = double.infinity;
 
   /// Возвращает [becameOn]/[becameOff] — подтверждённые переходы этим кадром.
   ({bool becameOn, bool becameOff}) step({
     required bool aboveOn,
     required bool belowOff,
+    required double amplitude,
     required DateTime timestamp,
     required int onConfirmFrames,
     required int offConfirmFrames,
+    required int offConfirmMs,
+    required double floorAmplitude,
   }) {
     if (aboveOn) {
       _onRun++;
       _offRun = 0;
+      _resetDark();
       _onCandidateAt ??= timestamp;
-    } else if (belowOff) {
-      _offRun++;
-      _onRun = 0;
-      _onCandidateAt = null;
     } else {
-      // Гистерезисная зона: neither ON nor OFF, серия сбрасывается.
+      // Кадр НЕ выше ON-уровня. Это и настоящее гашение, и провал внутри
+      // одного горения — интервал считается от первого такого кадра и не
+      // прерывается гистерезисной зоной, иначе волна вспышки дробилась бы на
+      // несколько коротких провалов и каждый мог бы закрыться отдельно.
+      // Отсчёт от первого обработанного кадра — НИЖНЯЯ граница настоящего
+      // провала: сигнал упал где-то между ним и прежним кадром. Занижать окно
+      // подтверждения нельзя, а завысить его означало бы съесть паузу между
+      // двумя ударами.
+      _darkSince ??= timestamp;
+      _darkMs = timestamp.difference(_darkSince!).inMilliseconds;
+      if (amplitude < _darkMin) {
+        _darkMin = amplitude;
+      }
+      // Кадры ниже OFF-уровня копятся с НАЧАЛА провала, а не идут строго
+      // подряд. Прежнее «подряд» было ловушкой: канал, который чужая лампа
+      // держит в гистерезисной зоне (между OFF и ON), сбрасывался в ноль каждой
+      // такой рамкой, гашение не подтверждалось никогда, и канал залипал в
+      // «горит» до перезапуска — а все события уходили в живую вторую корзину.
+      // Физическую длину провала по-прежнему меряют [offConfirmMs] и глубина
+      // [floorAmplitude], а не счётчик подряд.
+      if (belowOff) {
+        _offRun++;
+      }
       _onRun = 0;
-      _offRun = 0;
       _onCandidateAt = null;
     }
 
@@ -83,51 +161,120 @@ class _LampTracker {
     if (!lit && _onRun >= onConfirmFrames) {
       lit = true;
       becameOn = true;
-    } else if (lit && _offRun >= offConfirmFrames) {
+      _resetDark();
+    } else if (lit &&
+        _offRun >= offConfirmFrames &&
+        // Гашение подтверждается, только если провал либо УШЁЛ К ПОЛУ (лампу
+        // не стало видно — значит, её выключили), либо ТЯНЕТСЯ достаточно
+        // долго ([offConfirmMs]), чтобы быть паузой между ударами, а не
+        // просадкой внутри одного. Кадровое условие остаётся нижней границей:
+        // одному мусорному кадру не верим ни в каком случае.
+        (_darkMin <= floorAmplitude || _darkMs >= offConfirmMs)) {
       lit = false;
       becameOff = true;
+      // Провал НЕ обнуляется: он ещё длится, и именно его полная длительность
+      // нужна, чтобы по записи отличить паузу между ударами от внутриударной
+      // волны.
+      _offRun = 0;
     }
     return (becameOn: becameOn, becameOff: becameOff);
   }
 
   DateTime? get onCandidate => _onCandidateAt;
 
+  /// Сколько миллисекунд длится текущий интервал «не выше ON-уровня» (0, если
+  /// его нет). По этому числу на записи и разбирают, где провал внутри одного
+  /// горения, а где настоящая пауза между ударами.
+  int get darkMs => _darkMs;
+
+  void _resetDark() {
+    _darkSince = null;
+    _darkMs = 0;
+    _darkMin = double.infinity;
+  }
+
   void reset() {
     lit = false;
     _onRun = 0;
     _offRun = 0;
     _onCandidateAt = null;
+    _resetDark();
   }
 }
 
-/// Оценка «включена ли лампа» по признакам относительно baseline и автомат
-/// гистерезиса на обе лампы.
+/// Оценка «какая лампа горит» по изменению обеих рамок относительно измеренных
+/// эталонов, плюс автомат гистерезиса на обе лампы.
 ///
-/// Точность зависит от порогов, которые подбираются на реальных записях; здесь
-/// только детерминированная арифметика из [LampConfig].
+/// Порогов «как ярко» больше нет: кадр раскладывается на два эталона, набранные
+/// на калибровке, и сравнивается с [LampConfig.hitFraction] — долей того, что
+/// лампа показала, когда её держали зажжённой. Вся арифметика — в
+/// [LampResponseModel], отбор и проверка состояний — в [LampCalibration].
+///
+/// При `config.liveReference` тот же гистерезис работает от живого отсчёта
+/// ([LiveReference]): «ноль» берётся из последних кадров, а калибровка остаётся
+/// самопроверкой «рамка видит лампу».
 class LampDetector {
-  LampDetector(this.config);
+  LampDetector(this._config)
+    : _calibration = LampCalibration(_config),
+      _live = LiveReference(_config);
 
   /// Пороги можно менять на лету (подбор по записанным CSV).
-  LampConfig config;
+  LampConfig get config => _config;
+  set config(LampConfig value) {
+    // Смена вектора меняет и модель: те же эталоны в других координатах —
+    // другое раскладочное решение, поэтому пересобирать обязаны сразу, иначе
+    // детектор продолжал бы решать по старому вектору, даже когда конфиг уже
+    // просит новый.
+    final bool revector = value.spatialVectors != _config.spatialVectors;
+    _config = value;
+    _calibration.config = value;
+    _live.config = value;
+    final LampBaseline? baseline = _baseline;
+    if (revector && baseline != null) {
+      _model = LampResponseModel(baseline, config: value);
+    }
+  }
 
+  LampConfig _config;
+
+  final LampCalibration _calibration;
+  final LiveReference _live;
   final _LampTracker _white = _LampTracker();
   final _LampTracker _red = _LampTracker();
-  final List<FrameFeatures> _calibrationWhite = <FrameFeatures>[];
-  final List<FrameFeatures> _calibrationRed = <FrameFeatures>[];
 
   LampBaseline? _baseline;
+  LampResponseModel? _model;
   int _ambiguousFrames = 0;
+  int _unexplainedFrames = 0;
 
   LampBaseline? get baseline => _baseline;
-  bool get isCalibrated => _baseline?.isCalibrated ?? false;
 
-  /// Сколько кадров подряд были неоднозначными (обе лампы выше ON-порога).
+  /// Измеренная модель отклика. Null до завершённой калибровки.
+  LampResponseModel? get model => _model;
+
+  bool get isCalibrated => _model?.isValid ?? false;
+
+  /// Есть чем решать: живой отсчёт работает сразу, режим эталонов — только
+  /// после калибровки. Сессия спрашивает это вместо [isCalibrated].
+  bool get canEvaluate => _config.liveReference || isCalibrated;
+
+  /// Сколько кадров подряд были неоднозначными (обе амплитуды выше своего уровня).
   int get ambiguousFrames => _ambiguousFrames;
 
-  /// Восстановление baseline из настроек.
+  /// Сколько кадров не похожи ни на одну лампу: рука, тряска, засветка.
+  int get unexplainedFrames => _unexplainedFrames;
+
+  /// Восстановление калибровки из настроек.
   void setBaseline(LampBaseline baseline) {
     _baseline = baseline;
+    _model = LampResponseModel(baseline, config: _config);
+    resetTracking();
+  }
+
+  /// Калибровки нет — детекция стоит на нуле, а не работает «вслепую».
+  void clearBaseline() {
+    _baseline = null;
+    _model = null;
     resetTracking();
   }
 
@@ -135,208 +282,175 @@ class LampDetector {
   void resetTracking() {
     _white.reset();
     _red.reset();
+    _live.reset();
     _ambiguousFrames = 0;
+    _unexplainedFrames = 0;
   }
 
-  /// Прогресс калибровки «обе выключены».
-  CalibrationProgress get calibrationProgress => CalibrationProgress(
-    collected: _calibrationWhite.length,
-    needed: config.calibrationFrames,
-  );
+  /// Шаг, который калибровка набирает сейчас.
+  CalibrationStep get calibrationStep => _calibration.step;
 
-  void clearCalibration() {
-    _calibrationWhite.clear();
-    _calibrationRed.clear();
+  /// Шаги, состояния которых уже набраны с начала текущей калибровки.
+  List<CalibrationStep> get completedCalibrationSteps =>
+      _calibration.completedSteps;
+
+  /// Прогресс текущего шага калибровки.
+  CalibrationProgress get calibrationProgress => _calibration.progress;
+
+  /// Начать пошаговую калибровку с нуля: фон → белая → красная. Прежняя
+  /// калибровка при этом сбрасывается, и до третьего шага детектор не считает
+  /// события — иначе он решал бы по эталонам другой сцены.
+  void startCalibration() {
+    _calibration.reset();
+    clearBaseline();
   }
 
-  /// Добавляет кадр в калибровку. Возвращает готовый baseline, когда набрано
-  /// [LampConfig.calibrationFrames] кадров, иначе null.
-  LampBaseline? addCalibrationFrame(LampFrame frame) {
-    _calibrationWhite.add(frame.white);
-    _calibrationRed.add(frame.red);
-    if (_calibrationWhite.length < config.calibrationFrames) {
-      return null;
+  void clearCalibration() => _calibration.reset();
+
+  /// Забыть недобранный текущий шаг калибровки, сохранив принятые состояния.
+  void discardCalibrationStep() => _calibration.discardCurrentStep();
+
+  /// Встать на шаг `step`, чтобы снять его заново: его собственное состояние и
+  /// всё, что снято позже, стирается. Без этого калибровка была бы только
+  /// «всё набором с первого шага», а кнопки «1 ФОН / 2 БЕЛАЯ / 3 КРАСНАЯ»
+  /// требуют, чтобы любой шаг снимался сам по себе.
+  void goToCalibrationStep(CalibrationStep step) => _calibration.goToStep(step);
+
+  /// Подать калибровке уже измеренные состояния, чтобы переснять по кнопке
+  /// ровно один шаг: фон и белая остаются прежними, новой пишется только
+  /// переснимаемая ячейка.
+  void seedCalibration(LampBaseline baseline) =>
+      _calibration.adoptStates(baseline);
+
+  /// Зажглась ли лампа шага `step` на этом кадре — по «своей» доле пикселей
+  /// относительно набранного фона. Нужен пошаговой калибровке, чтобы не собрать
+  /// кадры лампы раньше, чем её включили.
+  bool lampAppeared(LampFrame frame, CalibrationStep step) =>
+      _calibration.lampAppeared(frame, step);
+
+  /// То же для подсказки: пока фон текущего прогона не набран, сравнивается с
+  /// ПРЕЖНИМ фоном ([setCalibrationReference]). Решения о наборе кадров по
+  /// этому признаку не принимается — старый эталон может относиться к другой
+  /// сцене.
+  bool lampLikelyLit(LampFrame frame, CalibrationStep step) =>
+      _calibration.lampLikelyLit(frame, step);
+
+  /// Фон прежней калибровки, на который можно опереться подсказкой до конца
+  /// текущего прогона. Null — подсказка обязана молчать.
+  void setCalibrationReference(LampBaseline? baseline) =>
+      _calibration.backgroundReference = baseline?.background;
+
+  /// Кадр текущего шага калибровки. Возвращает отчёт о завершённом шаге (на
+  /// последнем — с готовым baseline, который детектор сразу принимает), иначе
+  /// null. Бросает [CalibrationException], если шаг не прошёл проверку.
+  CalibrationReport? addCalibrationFrame(LampFrame frame) {
+    final CalibrationReport? report = _calibration.addFrame(frame);
+    final LampBaseline? baseline = report?.baseline;
+    if (baseline != null) {
+      setBaseline(baseline);
     }
-    final List<FrameFeatures> whites = List<FrameFeatures>.of(_calibrationWhite);
-    final List<FrameFeatures> reds = List<FrameFeatures>.of(_calibrationRed);
-    clearCalibration();
-    // Бросает CalibrationException, если фон нестабилен.
-    final LampBaseline baseline = baselineFrom(whites, reds, config);
-    _baseline = baseline;
-    resetTracking();
-    return baseline;
+    return report;
   }
 
-  /// Собирает baseline из кадров «обе выключены» и проверяет, что фон
-  /// стабилен. Используется и живой калибровкой, и прогоном CSV.
-  static LampBaseline baselineFrom(
-    List<FrameFeatures> white,
-    List<FrameFeatures> red,
-    LampConfig config, {
-    DateTime? now,
-  }) {
-    if (white.isEmpty || red.isEmpty) {
-      throw const CalibrationException('нет кадров для калибровки');
-    }
-    final double whiteNoise = _std(white.map((FrameFeatures f) => f.whiteFrac));
-    final double redNoise = _std(red.map((FrameFeatures f) => f.redFrac));
-    if (whiteNoise > config.calibrationMaxNoise || redNoise > config.calibrationMaxNoise) {
-      throw CalibrationException(
-        'фон нестабилен (σ white=${whiteNoise.toStringAsFixed(3)}, '
-        'red=${redNoise.toStringAsFixed(3)}, допустимо ≤ '
-        '${config.calibrationMaxNoise.toStringAsFixed(3)}): лампа мигала, '
-        'камера двигалась или менялся свет. Повтори калибровку.',
-      );
-    }
-    return LampBaseline(
-      white: _average(white),
-      red: _average(red),
-      frameCount: white.length,
-      whiteNoise: whiteNoise,
-      redNoise: redNoise,
-      capturedAtMs: (now ?? DateTime.now()).millisecondsSinceEpoch,
-    );
-  }
+  /// ON-уровень каждой лампы в долях измеренного отклика. Null до калибровки —
+  /// экраны обязаны показывать именно их, а не [LampConfig.hitFraction]:
+  /// при шумной калибровке порог выше. В режиме живого отсчёта — порог из шума
+  /// последних кадров, в тех же единицах, что и амплитуда.
+  double? get whiteOnLevel => _config.liveReference
+      ? (_live.hasReading ? _live.last.whiteLevel : null)
+      : _model?.whiteOnLevel(config.hitFraction);
+  double? get redOnLevel => _config.liveReference
+      ? (_live.hasReading ? _live.last.redLevel : null)
+      : _model?.redOnLevel(config.hitFraction);
 
-  static double _std(Iterable<double> values) {
-    final List<double> list = values.toList();
-    if (list.length < 2) {
-      return 0;
-    }
-    final double mean = list.reduce((double a, double b) => a + b) / list.length;
-    double sq = 0;
-    for (final double v in list) {
-      sq += (v - mean) * (v - mean);
-    }
-    return math.sqrt(sq / (list.length - 1));
-  }
-
-  static FrameFeatures _average(List<FrameFeatures> features) {
-    double meanY = 0;
-    double brightFrac = 0;
-    double sat = 0;
-    double redDom = 0;
-    double coreEdgeDiff = 0;
-    double whiteFrac = 0;
-    double redFrac = 0;
-    int samples = 0;
-    for (final FrameFeatures f in features) {
-      meanY += f.meanY;
-      brightFrac += f.brightFrac;
-      sat += f.sat;
-      redDom += f.redDom;
-      coreEdgeDiff += f.coreEdgeDiff;
-      whiteFrac += f.whiteFrac;
-      redFrac += f.redFrac;
-      samples += f.sampleCount;
-    }
-    final int n = features.length;
-    return FrameFeatures(
-      meanY: meanY / n,
-      brightFrac: brightFrac / n,
-      sat: sat / n,
-      redDom: redDom / n,
-      coreEdgeDiff: coreEdgeDiff / n,
-      sampleCount: n == 0 ? 0 : (samples / n).round(),
-      whiteFrac: whiteFrac / n,
-      redFrac: redFrac / n,
-    );
-  }
-
-  /// Белая: прирост доли «настоящих белых» пикселей над фоном калибровки.
-  /// Раньше baseline белой не использовался вовсе.
-  double whiteScore(FrameFeatures white, LampBaseline baseline) {
-    final double delta = white.whiteFrac - baseline.white.whiteFrac;
-    return delta > 0 ? delta : 0;
-  }
-
-  /// Красная: прирост доли красных пикселей над фоном, в единицах порога
-  /// (1.0 = redOnThreshold при redOnThreshold = 1).
-  double redScore(FrameFeatures red, LampBaseline baseline) {
-    final double delta = red.redFrac - baseline.red.redFrac;
-    return delta > 0 ? delta / config.redFracDivisor : 0;
-  }
-
-  /// Порог ON с учётом шума фона: не ниже noiseSigmas × σ калибровки.
-  double whiteOnFor(LampBaseline b) {
-    final double floor = config.noiseSigmas * b.whiteNoise;
-    return floor > config.whiteOnThreshold ? floor : config.whiteOnThreshold;
-  }
-
-  double redOnFor(LampBaseline b) {
-    final double floor = config.noiseSigmas * b.redNoise / config.redFracDivisor;
-    return floor > config.redOnThreshold ? floor : config.redOnThreshold;
-  }
+  /// Сколько кадров ещё нужно, чтобы окно живого отсчёта набралось. Ноль —
+  /// решения уже принимаются.
+  int get liveWarmupLeft => _live.warmupLeft;
 
   LampEvaluation evaluate(LampFrame frame) {
-    final LampBaseline? baseline = _baseline;
-    if (baseline == null || !baseline.isCalibrated) {
+    if (_config.liveReference) {
+      return _evaluateLive(frame);
+    }
+
+    final LampResponseModel? model = _model;
+    if (model == null || !model.isValid) {
       throw StateError(
-        'Детектор не откалиброван: сначала калибровка «обе выключены»',
+        'Детектор не откалиброван: нужна калибровка в три шага '
+        '(фон → белая горит → красная горит)',
       );
     }
 
-    final double white = whiteScore(frame.white, baseline);
-    final double red = redScore(frame.red, baseline);
+    final LampResponse response = model.unmix(frame);
+    final double whiteOn = model.whiteOnLevel(config.hitFraction);
+    final double redOn = model.redOnLevel(config.hitFraction);
 
-    final double whiteOn = whiteOnFor(baseline);
-    final double redOn = redOnFor(baseline);
-    bool whiteAboveOn = white >= whiteOn;
-    bool redAboveOn = red >= redOn;
-    final bool whiteBelowOff = white < whiteOn * config.offRatio;
-    final bool redBelowOff = red < redOn * config.offRatio;
+    // Кадр «не похоже ни на одну лампу»: остаток больше объяснённой части И
+    // больше шума фона. Такие кадры не двигают ни один канал (ни ON, ни OFF —
+    // гистерезисная зона), но видны отдельным числом в диагностике.
+    final bool lampLike = response.looksLikeLamps;
+    final bool unexplained = !lampLike && response.residual > model.noiseNorm;
+    if (unexplained) {
+      _unexplainedFrames++;
+    }
 
-    // Обе лампы выше ON-порога в одном кадре: побеждает бо́льший score/порог,
-    // проигравший в этом кадре не считается ни ON, ни OFF (нейтральная зона),
-    // чтобы не подтвердить событие по неоднозначному кадру.
-    bool ambiguous = false;
+    final bool whiteAboveOn = lampLike && response.white >= whiteOn;
+    final bool redAboveOn = lampLike && response.red >= redOn;
+    final bool whiteBelowOff =
+        lampLike && response.white < whiteOn * config.offRatio;
+    final bool redBelowOff = lampLike && response.red < redOn * config.offRatio;
+
+    // Обе амплитуды выше своего уровня в одном кадре. По спецификации стенда
+    // лампы одновременно НЕ загораются, значит такой кадр — симптом: переход
+    // «одна погасла, другая включилась» попал в один кадр экспозиции, либо
+    // засветка/наводка. Гасить проигравший канал («winner takes all») всё
+    // равно нельзя: он съедает реальное второе событие на быстром
+    // переключении, а отличить «съесть» от «оставить» по одному кадру нельзя.
+    // Поэтому каналы подтверждаются каждый своим гистерезисом, а `ambiguous`
+    // остался только диагностикой — много таких кадров = плохая геометрия или
+    // медленная смена сцен, а не «две вспышки».
+    final bool ambiguous = whiteAboveOn && redAboveOn;
     HitColor? winner;
-    if (whiteAboveOn && redAboveOn) {
-      ambiguous = true;
+    if (ambiguous) {
       _ambiguousFrames++;
-      final bool whiteWins =
-          white / whiteOn >= red / redOn;
-      winner = whiteWins ? HitColor.white : HitColor.red;
-      if (whiteWins) {
-        redAboveOn = false;
-      } else {
-        whiteAboveOn = false;
-      }
+      winner = response.white / whiteOn >= response.red / redOn
+          ? HitColor.white
+          : HitColor.red;
     }
 
     final ({bool becameOn, bool becameOff}) whiteStep = _white.step(
       aboveOn: whiteAboveOn,
       belowOff: whiteBelowOff,
+      amplitude: response.white,
       timestamp: frame.timestamp,
       onConfirmFrames: config.onConfirmFrames,
       offConfirmFrames: config.offConfirmFrames,
+      offConfirmMs: config.offConfirmMs,
+      floorAmplitude: config.referenceMinRise,
     );
     final ({bool becameOn, bool becameOff}) redStep = _red.step(
       aboveOn: redAboveOn,
       belowOff: redBelowOff,
+      amplitude: response.red,
       timestamp: frame.timestamp,
       onConfirmFrames: config.onConfirmFrames,
       offConfirmFrames: config.offConfirmFrames,
+      offConfirmMs: config.offConfirmMs,
+      floorAmplitude: config.referenceMinRise,
     );
 
-    // Скользящее среднее baseline — только когда обе лампы однозначно погашены:
-    // обе ниже OFF-порога (а не просто «ниже ON»), иначе слабо горящая лампа
-    // в нейтральной зоне постепенно «впитывается» в фон и пропадает.
-    final bool bothDark =
-        !_white.lit &&
-        !_red.lit &&
-        whiteBelowOff &&
-        redBelowOff &&
-        _white.onCandidate == null &&
-        _red.onCandidate == null;
-    if (bothDark) {
-      _baseline = _blend(baseline, frame);
-    }
-
+    // Эталоны и фон после калибровки НЕ меняются никогда. Адаптивное скользящее
+    // среднее (бывший baselineAlpha) было проверено живьём: фон переписывался
+    // за ~10 секунд и «впитывал» вспышки (base white 0.107 → 0.235), из-за чего
+    // пороги ездили вместе с ним, а на плохо наведённых рамках дрейф шёл
+    // непрерывно. Перестройка фона — только ручная «Калибровка».
     return LampEvaluation(
       timestamp: frame.timestamp,
-      whiteScore: white,
-      redScore: red,
+      whiteAmplitude: response.white,
+      redAmplitude: response.red,
+      change: response.change,
+      explained: response.explained,
+      residual: response.residual,
+      unexplained: unexplained,
       whiteOn: whiteStep.becameOn,
       redOn: redStep.becameOn,
       whiteOff: whiteStep.becameOff,
@@ -347,53 +461,92 @@ class LampDetector {
       ambiguousWinner: winner,
       whiteOnCandidateAt: _white.onCandidate,
       redOnCandidateAt: _red.onCandidate,
+      whiteDarkMs: _white.darkMs,
+      redDarkMs: _red.darkMs,
     );
   }
 
-  LampBaseline _blend(LampBaseline baseline, LampFrame frame) {
-    final double alpha = config.baselineAlpha;
-    return baseline.copyWithFeatures(
-      white: _blendFeatures(baseline.white, frame.white, alpha),
-      red: _blendFeatures(baseline.red, frame.red, alpha),
+  /// Живой отсчёт: амплитуда = подъём своей зоны над недавним «полом» (колпака
+  /// и, если он слышен, ореола), событие — подтверждённый гистерезисом переход.
+  /// Чем именно меряется зона — долей «своих» пикселей или яркостью области —
+  /// решает [LampConfig.spatialVectors]; в яркостном режиме кадр, не похожий ни
+  /// на одну лампу, здесь тоже не отбрасывается: если своя область поднялась
+  /// сильнее чужой — это вспышка СВОЕЙ лампы, а какого она цвета, спрашивать
+  /// не у кого.
+  ///
+  /// Наружу отдаётся измеренный подъём ([LampEvaluation.whiteAmplitude]), а
+  /// гистерезис работает по подъёму без общего для обеих рамок света
+  /// ([LampEvaluation.whiteNet]) — иначе засветка соседней лампы навсегда
+  /// держала бы канал в «горит» (см. [LiveReference.step]).
+  ///
+  /// `change`/`explained`/`residual` в этом режиме не имеют смысла разложения
+  /// на эталоны, поэтому `residual` = 0: необъяснённых кадров нет по
+  /// определению, а `change` = длина вектора подъёмов — та же величина.
+  LampEvaluation _evaluateLive(LampFrame frame) {
+    final LiveReading reading = _live.step(frame);
+
+    final bool ambiguous = reading.whiteAboveOn && reading.redAboveOn;
+    HitColor? winner;
+    if (ambiguous) {
+      _ambiguousFrames++;
+      winner =
+          reading.whiteRise / _positive(reading.whiteLevel) >=
+              reading.redRise / _positive(reading.redLevel)
+          ? HitColor.white
+          : HitColor.red;
+    }
+
+    final ({bool becameOn, bool becameOff}) whiteStep = _white.step(
+      aboveOn: reading.whiteAboveOn,
+      belowOff: reading.whiteBelowOff,
+      amplitude: reading.whiteNet,
+      timestamp: frame.timestamp,
+      onConfirmFrames: config.onConfirmFrames,
+      offConfirmFrames: config.offConfirmFrames,
+      offConfirmMs: config.offConfirmMs,
+      floorAmplitude: config.referenceMinRise,
+    );
+    final ({bool becameOn, bool becameOff}) redStep = _red.step(
+      aboveOn: reading.redAboveOn,
+      belowOff: reading.redBelowOff,
+      amplitude: reading.redNet,
+      timestamp: frame.timestamp,
+      onConfirmFrames: config.onConfirmFrames,
+      offConfirmFrames: config.offConfirmFrames,
+      offConfirmMs: config.offConfirmMs,
+      floorAmplitude: config.referenceMinRise,
+    );
+
+    final double change = math.sqrt(
+      reading.whiteRise * reading.whiteRise + reading.redRise * reading.redRise,
+    );
+
+    return LampEvaluation(
+      timestamp: frame.timestamp,
+      whiteAmplitude: reading.whiteRise,
+      redAmplitude: reading.redRise,
+      change: change,
+      explained: change,
+      residual: 0,
+      unexplained: false,
+      whiteOn: whiteStep.becameOn,
+      redOn: redStep.becameOn,
+      whiteOff: whiteStep.becameOff,
+      redOff: redStep.becameOff,
+      whiteLit: _white.lit,
+      redLit: _red.lit,
+      whiteNet: reading.whiteNet,
+      redNet: reading.redNet,
+      ambiguous: ambiguous,
+      ambiguousWinner: winner,
+      whiteOnCandidateAt: _white.onCandidate,
+      redOnCandidateAt: _red.onCandidate,
+      whiteDarkMs: _white.darkMs,
+      redDarkMs: _red.darkMs,
     );
   }
 
-  static FrameFeatures _blendFeatures(
-    FrameFeatures base,
-    FrameFeatures now,
-    double alpha,
-  ) => FrameFeatures(
-    meanY: base.meanY + (now.meanY - base.meanY) * alpha,
-    brightFrac: base.brightFrac + (now.brightFrac - base.brightFrac) * alpha,
-    sat: base.sat + (now.sat - base.sat) * alpha,
-    redDom: base.redDom + (now.redDom - base.redDom) * alpha,
-    coreEdgeDiff:
-        base.coreEdgeDiff + (now.coreEdgeDiff - base.coreEdgeDiff) * alpha,
-    sampleCount: now.sampleCount,
-    whiteFrac: base.whiteFrac + (now.whiteFrac - base.whiteFrac) * alpha,
-    redFrac: base.redFrac + (now.redFrac - base.redFrac) * alpha,
-  );
-}
-
-/// Калибровка не удалась (нестабильный фон и т. п.).
-class CalibrationException implements Exception {
-  const CalibrationException(this.message);
-
-  final String message;
-
-  @override
-  String toString() => 'Калибровка отвергнута: $message';
-}
-
-class CalibrationProgress {
-  const CalibrationProgress({required this.collected, required this.needed});
-
-  final int collected;
-  final int needed;
-
-  bool get isComplete => collected >= needed;
-  int get remaining => (needed - collected).clamp(0, needed);
-
-  @override
-  String toString() => 'Калибровка: $collected/$needed';
+  /// Уровень не бывает нулевым (минимум — [LampConfig.referenceMinRise]), но
+  /// делить на него всё равно не хочется: конфиг можно испортить в JSON.
+  static double _positive(double value) => value > 0 ? value : 1e-6;
 }

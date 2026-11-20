@@ -17,7 +17,7 @@ void main() {
       expect(events.single.sequenceNumber, 1);
       // detectedAt = время кадра, где лампа впервые стала кандидатом ON,
       // а не время подтверждения (подтверждение = onConfirmFrames кадров).
-      expect(events.single.detectedAt, scene.off(index: 30).timestamp);
+      expect(events.single.detectedAt, scene.off(index: 90).timestamp);
     });
 
     test('2. Красная один раз = 1 событие', () {
@@ -31,7 +31,7 @@ void main() {
 
     test('3. Белая 5 раз подряд с паузами = 5 событий', () {
       final Harness h = Harness();
-      int index = 30;
+      int index = 90;
       final List<HitEvent> events = <HitEvent>[];
       for (int n = 0; n < 5; n++) {
         events.addAll(h.whitePulse(startIndex: index));
@@ -45,7 +45,7 @@ void main() {
 
     test('4. Красная 5 раз = 5 событий', () {
       final Harness h = Harness();
-      int index = 30;
+      int index = 90;
       final List<HitEvent> events = <HitEvent>[];
       for (int n = 0; n < 5; n++) {
         events.addAll(h.redPulse(startIndex: index));
@@ -59,10 +59,10 @@ void main() {
     test('5. Белая, затем красная через короткую паузу = 2 события по порядку', () {
       final Harness h = Harness();
       final List<HitEvent> events = <HitEvent>[
-        ...h.feedAll(h.scene.sequence(3, white: scene.whiteOn, startIndex: 30)),
-        ...h.feedAll(h.scene.sequence(2, startIndex: 33)),
-        ...h.feedAll(h.scene.sequence(3, red: scene.redOn, startIndex: 35)),
-        ...h.feedAll(h.scene.sequence(5, startIndex: 38)),
+        ...h.feedAll(h.scene.sequence(3, white: scene.whiteOn, startIndex: 90)),
+        ...h.feedAll(h.scene.sequence(2, startIndex: 93)),
+        ...h.feedAll(h.scene.sequence(3, red: scene.redOn, startIndex: 95)),
+        ...h.feedAll(h.scene.sequence(5, startIndex: 98)),
       ];
 
       expect(events, hasLength(2));
@@ -76,9 +76,9 @@ void main() {
     test('6. Красная, затем белая без паузы = 2 события', () {
       final Harness h = Harness();
       final List<HitEvent> events = <HitEvent>[
-        ...h.feedAll(h.scene.sequence(3, red: scene.redOn, startIndex: 30)),
+        ...h.feedAll(h.scene.sequence(3, red: scene.redOn, startIndex: 90)),
         // Смена без паузы: в том же кадре красная гаснет, белая загорается.
-        ...h.feedAll(h.scene.sequence(3, white: scene.whiteOn, red: scene.redOff, startIndex: 33)),
+        ...h.feedAll(h.scene.sequence(3, white: scene.whiteOn, red: scene.redOff, startIndex: 93)),
       ];
 
       expect(events, hasLength(2));
@@ -89,24 +89,24 @@ void main() {
       expect(h.machine.state, LampSessionState.whiteOn);
 
       // Дальше обе погасли — новых событий нет, состояние возвращается в idle.
-      expect(h.feedAll(h.scene.sequence(5, startIndex: 36)), isEmpty);
+      expect(h.feedAll(h.scene.sequence(5, startIndex: 96)), isEmpty);
       expect(h.machine.state, LampSessionState.idle);
     });
 
     test('7. Лампа горит 3 секунды = 1 событие', () {
       final Harness h = Harness();
       // 30 fps * 3 с = 90 кадров подряд.
-      final List<HitEvent> events = h.feedAll(h.scene.sequence(90, white: scene.whiteOn, startIndex: 30));
+      final List<HitEvent> events = h.feedAll(h.scene.sequence(90, white: scene.whiteOn, startIndex: 90));
 
       expect(events, hasLength(1));
       expect(h.machine.state, LampSessionState.whiteOn);
     });
 
-    test('8. Шум яркости вокруг baseline = 0 событий', () {
+    test('8. Шум фона (доли пикселей ±0.01, яркость ±6) = 0 событий', () {
       final Harness h = Harness();
       final List<HitEvent> events = <HitEvent>[];
-      for (int i = 30; i < 330; i++) {
-        events.addAll(h.feed(scene.noisy(index: i, jitterY: 6, jitterBright: 0.02)));
+      for (int i = 90; i < 390; i++) {
+        events.addAll(h.feed(scene.noisy(index: i, jitterY: 6)));
       }
 
       expect(events, isEmpty);
@@ -116,20 +116,29 @@ void main() {
       final Harness h = Harness();
       final List<HitEvent> events = <HitEvent>[
         // Один кадр яркого пятна (палец закрыл лампу/блик) — меньше onConfirmFrames.
-        ...h.feedAll(h.scene.sequence(1, white: scene.whiteOn, startIndex: 30)),
-        ...h.feedAll(h.scene.sequence(4, startIndex: 31)),
-        ...h.feedAll(h.scene.sequence(1, red: scene.redOn, startIndex: 35)),
-        ...h.feedAll(h.scene.sequence(4, startIndex: 36)),
+        ...h.feedAll(h.scene.sequence(1, white: scene.whiteOn, startIndex: 90)),
+        ...h.feedAll(h.scene.sequence(4, startIndex: 91)),
+        ...h.feedAll(h.scene.sequence(1, red: scene.redOn, startIndex: 95)),
+        ...h.feedAll(h.scene.sequence(4, startIndex: 96)),
       ];
 
       expect(events, isEmpty);
       expect(h.machine.state, LampSessionState.idle);
     });
 
-    test('10. Красная подсветка белой ROI (высокая sat) не даёт события белой', () {
+    test('10. Чужая засветка белой ROI не даёт события белой', () {
+      // Красная лампа подсветила и белую рамку. Физически её собственный колпак
+      // при этом ярче, иначе свет в белой рамке и был бы белой лампой. Поэтому
+      // кадр строится из одного и того же поднятия: своя рамка — целиком,
+      // чужая — на четверть своего отклика.
       final Harness h = Harness();
       final List<HitEvent> events = h.feedAll(
-        h.scene.sequence(6, white: scene.whiteTintedByRed, red: scene.redOn, startIndex: 30),
+        h.scene.sequence(
+          6,
+          white: _blend(scene.whiteOff, scene.whiteOn, 0.25),
+          red: scene.redOn,
+          startIndex: 90,
+        ),
       );
 
       expect(events.where((HitEvent e) => e.color == HitColor.white), isEmpty);
@@ -137,77 +146,214 @@ void main() {
       expect(events.single.color, HitColor.red);
     });
 
-    test('11. Обе лампы выше ON-порога в одном кадре: максимум одно событие + счётчик', () {
-      final Harness h = Harness();
+    test('10b. Прежний способ: яркие, но НЕ белые пиксели белой не считаются', () {
+      // Кадр физически противоречивый: чужая рамка поднялась ЯРЧЕ своей, так
+      // что яркостью источник не назвать. Он проверяет именно цветовое
+      // решение (spatialVectors = false), где «белый» пиксель — это min(R,G,B)
+      // над порогом, а не просто светло.
+      final Harness h = Harness(
+        config: const LampConfig(liveReference: false, spatialVectors: false),
+      );
       final List<HitEvent> events = h.feedAll(
-        h.scene.sequence(5, white: scene.whiteOn, red: scene.redOn, startIndex: 30),
+        h.scene.sequence(6, white: scene.whiteTintedByRed, red: scene.redOn, startIndex: 90),
       );
 
-      // white ratio = 0.35/0.15 > red ratio = 1.83/1.0 -> побеждает белая.
-      expect(events.length, lessThanOrEqualTo(1));
+      expect(events.where((HitEvent e) => e.color == HitColor.white), isEmpty);
       expect(events, hasLength(1));
-      expect(events.single.color, HitColor.white);
+      expect(events.single.color, HitColor.red);
+    });
+
+    test('11. Обе лампы горят одновременно: ДВА независимых события', () {
+      final Harness h = Harness();
+      final List<HitEvent> events = h.feedAll(
+        h.scene.sequence(5, white: scene.whiteOn, red: scene.redOn, startIndex: 90),
+      );
+
+      // Белая и красная — независимые лампы: одновременная вспышка это две
+      // вспышки, а не одна «неоднозначная».
+      expect(events, hasLength(2));
+      expect(events.map((HitEvent e) => e.color).toSet(), <HitColor>{
+        HitColor.white,
+        HitColor.red,
+      });
+      // Флаг неоднозначности остался только как диагностика.
       expect(h.ambiguousFrames, 5);
     });
 
-    test('11b. Неоднозначный кадр не подтверждает проигравшую лампу', () {
+    test('11b. Обе одновременно погасли — новых событий нет', () {
       final Harness h = Harness();
-      h.feedAll(h.scene.sequence(5, white: scene.whiteOn, red: scene.redOn, startIndex: 30));
-      // Красная «горела» всё это время, но проиграла — события красной нет.
-      final List<HitEvent> after = h.feedAll(h.scene.sequence(5, startIndex: 35));
+      h.feedAll(h.scene.sequence(5, white: scene.whiteOn, red: scene.redOn, startIndex: 90));
+      final List<HitEvent> after = h.feedAll(h.scene.sequence(5, startIndex: 95));
 
       expect(after, isEmpty);
       expect(h.machine.state, LampSessionState.idle);
     });
-  });
 
-  group('LampDetector: baseline и пороги', () {
-    // Формулы whiteScore/redScore переехали в lamp_detector_test.dart: теперь
-    // обе лампы оцениваются как прирост доли пикселей (whiteFrac/redFrac) над
-    // фоном калибровки, а не по sat/brightFrac/яркости.
-    test('baseline обновляется скользящим средним только когда обе лампы OFF', () {
+    // Одно физическое горение — волна: амплитуда проседает внутри вспышки.
+    // Просадка не должна закрывать событие, а падение к «полу» — обязана.
+    // Различает их глубина (инструкция, п. 7): выключенную лампу не видно
+    // совсем, волна лампу не гасит.
+    test('12. Вспышка с двумя волнами внутри = 1 событие', () {
       final Harness h = Harness();
-      final LampBaseline before = h.detector.baseline!;
+      final FrameFeatures dip = _blend(scene.whiteOff, scene.whiteOn, 0.2);
+      final List<HitEvent> events = <HitEvent>[
+        ...h.feedAll(h.scene.sequence(3, white: scene.whiteOn, startIndex: 90)),
+        ...h.feedAll(h.scene.sequence(3, white: dip, startIndex: 93)),
+        ...h.feedAll(h.scene.sequence(3, white: scene.whiteOn, startIndex: 96)),
+        ...h.feedAll(h.scene.sequence(3, white: dip, startIndex: 99)),
+        ...h.feedAll(h.scene.sequence(3, white: scene.whiteOn, startIndex: 102)),
+      ];
 
-      // Белая горит — baseline не должен меняться.
-      h.feedAll(h.scene.sequence(10, white: scene.whiteOn, startIndex: 30));
-      expect(h.detector.baseline!.white.meanY, before.white.meanY);
-
-      // Обе погасли: 10 кадров с белой ROI ярче на 20 -> baseline подтянется,
-      // но не мгновенно (alpha = 0.01).
-      final List<LampFrame> brighter = h.scene
-          .sequence(10, startIndex: 40)
-          .map(
-            (LampFrame f) => LampFrame(
-              timestamp: f.timestamp,
-              white: FrameFeatures(
-                meanY: f.white.meanY + 20,
-                brightFrac: f.white.brightFrac,
-                sat: f.white.sat,
-                redDom: f.white.redDom,
-                coreEdgeDiff: f.white.coreEdgeDiff,
-                sampleCount: f.white.sampleCount,
-              ),
-              red: f.red,
-            ),
-          )
-          .toList();
-      h.feedAll(brighter);
-
-      final double after = h.detector.baseline!.white.meanY;
-      expect(after, greaterThan(before.white.meanY));
-      expect(after, lessThan(before.white.meanY + 20));
+      expect(events, hasLength(1));
+      expect(h.machine.state, LampSessionState.whiteOn);
     });
 
-    test('OFF-порог = 60% от ON-порога', () {
-      const LampConfig config = LampConfig();
-      expect(config.whiteOffThreshold, config.whiteOnThreshold * 0.6);
-      expect(config.redOffThreshold, config.redOnThreshold * 0.6);
-    });
+    test('13. Тот же провал: к полу — второе событие, к середине — нет', () {
+      final Harness h = Harness();
+      final List<HitEvent> deep = <HitEvent>[
+        ...h.feedAll(h.scene.sequence(3, white: scene.whiteOn, startIndex: 90)),
+        // Лампу выключили: амплитуда ушла к нулю — гашение подтверждено.
+        ...h.feedAll(h.scene.sequence(3, startIndex: 93)),
+        ...h.feedAll(h.scene.sequence(3, white: scene.whiteOn, startIndex: 96)),
+      ];
+      expect(deep, hasLength(2));
 
-    test('без калибровки evaluate бросает StateError', () {
-      final LampDetector detector = LampDetector(const LampConfig());
-      expect(() => detector.evaluate(scene.off(index: 0)), throwsStateError);
+      // Те же три кадра, но не до гашения, а до просадки — второй вспышки нет.
+      final Harness shallow = Harness();
+      shallow.feedAll(shallow.scene.sequence(3, white: scene.whiteOn, startIndex: 90));
+      final List<HitEvent> after = shallow.feedAll(
+        shallow.scene.sequence(
+          3,
+          white: _blend(shallow.scene.whiteOff, shallow.scene.whiteOn, 0.2),
+          startIndex: 93,
+        ),
+      );
+      expect(after, isEmpty);
+      expect(shallow.machine.state, LampSessionState.whiteOn);
     });
   });
+
+  group('LampDetector: эталоны и измеренный уровень срабатывания', () {
+    // Формул whiteScore/redScore больше нет: кадр раскладывается на два
+    // эталона, набранные на калибровке, поэтому и проверки — про эталоны,
+    // замороженный фон и уровень, а не про «долю пикселей над порогом».
+    test('baseline заморожен: кадры ярче фона его не сдвигают', () {
+      final Harness h = Harness();
+      final CalibrationState before = h.detector.baseline!.background;
+
+      h.feedAll(h.scene.sequence(20, startIndex: 90));
+      h.feedAll(h.scene.sequence(20, white: scene.whiteOn, startIndex: 110));
+
+      expect(h.detector.baseline!.background.white.meanY, before.white.meanY);
+      expect(h.detector.baseline!.background.white.whiteFrac, before.white.whiteFrac);
+      expect(h.detector.baseline!.background.red.redFrac, before.red.redFrac);
+    });
+
+    test('уровень срабатывания измеряется на калибровке и не зависит от кадров', () {
+      final Harness h = Harness();
+      final double whiteOn = h.detector.whiteOnLevel!;
+
+      // Постоянно горящая белая 120 кадров: фон не меняется, значит и уровень
+      // стоит на месте — прежний скользящий средний сдвигал его за 10 секунд.
+      h.feedAll(h.scene.sequence(120, white: scene.whiteOn, startIndex: 90));
+
+      expect(h.detector.whiteOnLevel, whiteOn);
+      expect(whiteOn, greaterThanOrEqualTo(h.config.hitFraction));
+      expect(h.detector.redOnLevel, greaterThanOrEqualTo(h.config.hitFraction));
+    });
+
+    test('между OFF и ON ничего не подтверждается, ниже OFF — гаснет', () {
+      final Harness h = Harness();
+      // Ровно половина измеренного отклика белой: 0.5 > OFF (0.6·0.6 = 0.36),
+      // но < ON (0.6) — гистерезисная зона.
+      final List<HitEvent> on = h.feedAll(
+        h.scene.sequence(6, white: scene.whiteOn, startIndex: 90),
+      );
+      expect(on, hasLength(1));
+      final List<HitEvent> zone = h.feedAll(
+        h.scene.sequence(
+          6,
+          white: _blend(scene.whiteOff, scene.whiteOn, 0.5),
+          startIndex: 96,
+        ),
+      );
+      expect(zone, isEmpty);
+      expect(h.machine.state, LampSessionState.whiteOn);
+      final List<HitEvent> off = h.feedAll(h.scene.sequence(6, startIndex: 102));
+      expect(off, isEmpty);
+      expect(h.machine.state, LampSessionState.idle);
+    });
+
+    test('новый фон даёт новый baseline только через калибровку', () {
+      final Harness h = Harness(scene: _BrightScene());
+
+      expect(h.detector.baseline!.background.white.whiteFrac, closeTo(0.40, 1e-12));
+      expect(h.detector.baseline!.whiteOn.white.whiteFrac, closeTo(0.70, 1e-12));
+    });
+
+    test('калибровка отвергает шаг, на котором лампа ничего не изменила', () {
+      // Фон = 0.40 белых пикселей, и «белая горит» даёт ровно те же признаки:
+      // эталон нулевой. Молча принять такое состояние — значит получить немой
+      // канал, поэтому шаг 2 бросается прямо здесь.
+      const Scene flat = Scene(
+        whiteOff: FrameFeatures(
+          meanY: 200,
+          p90Luma: 235,
+          sampleCount: 400,
+          whiteFrac: 0.40,
+          redFrac: 0.01,
+        ),
+      );
+      expect(
+        () => Harness(scene: flat),
+        throwsA(isA<CalibrationException>()),
+      );
+    });
+
+    test('без калибровки в три состояния evaluate бросает StateError', () {
+      // Режим эталонов: решать нечем, пока не набраны три состояния. Живой
+      // отсчёт калибровки не требует — это проверяет live_reference_test.
+      final LampDetector detector = LampDetector(const LampConfig(liveReference: false));
+      // Одно состояние (так было раньше) эталонов не даёт — решать нечем.
+      for (int i = 0; i < 30; i++) {
+        detector.addCalibrationFrame(scene.off(index: i));
+      }
+      expect(() => detector.evaluate(scene.off(index: 30)), throwsStateError);
+    });
+  });
+}
+
+/// Кадр между двумя состояниями одной рамки: `t = 0` — фон, `1` — лампа горит.
+/// Перемешиваются ОБА способа измерения: и доля «своих» пикселей, и яркость
+/// (средняя и верх распределения). Иначе промежуточный кадр физически
+/// несогласован: тёмный колпак с яркой верхушкой.
+FrameFeatures _blend(FrameFeatures from, FrameFeatures to, double t) => FrameFeatures(
+  meanY: from.meanY + (to.meanY - from.meanY) * t,
+  p90Luma: from.p90Luma + (to.p90Luma - from.p90Luma) * t,
+  sampleCount: from.sampleCount,
+  whiteFrac: from.whiteFrac + (to.whiteFrac - from.whiteFrac) * t,
+  redFrac: from.redFrac + (to.redFrac - from.redFrac) * t,
+);
+
+/// Светлая сцена: в фоне уже 40% белых пикселей, но лампа на нём видна —
+/// прирост есть, и калибровка обязана пройти.
+class _BrightScene extends Scene {
+  _BrightScene() : super(
+        whiteOff: FrameFeatures(
+          meanY: 200,
+          p90Luma: 225,
+          sampleCount: 400,
+          whiteFrac: 0.40,
+          redFrac: 0.01,
+        ),
+      );
+
+  @override
+  FrameFeatures get whiteOn => const FrameFeatures(
+    meanY: 240,
+    p90Luma: 252,
+    sampleCount: 400,
+    whiteFrac: 0.70,
+    redFrac: 0.01,
+  );
 }

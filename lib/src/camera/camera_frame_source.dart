@@ -34,10 +34,15 @@ class CameraSourceOptions {
 }
 
 /// Источник кадров на плагине `camera`.
-class CameraFrameSource extends ChangeNotifier implements FrameSource, FrameMappingControl {
+class CameraFrameSource extends ChangeNotifier
+    implements FrameSource, FrameMappingControl, ExposureControl {
   CameraFrameSource({this.options = const CameraSourceOptions()});
 
   final CameraSourceOptions options;
+
+  /// Сколько ждём блокировку фокуса/экспозиции. Внутри `_lockCamera` ещё и
+  /// `lockSettle` на сходимость, поэтому запас взят с ним в одном порядке.
+  static const Duration _lockBudget = Duration(seconds: 10);
 
   final StreamController<RawLampFrame> _frames = StreamController<RawLampFrame>.broadcast();
   final StreamController<FrameSourceStatus> _status = StreamController<FrameSourceStatus>.broadcast();
@@ -45,6 +50,10 @@ class CameraFrameSource extends ChangeNotifier implements FrameSource, FrameMapp
   CameraController? _controller;
   bool _running = false;
   bool _disposed = false;
+  bool _exposureLocked = false;
+
+  /// Текущее смещение экспозиции в EV. Плагин наружу его не отдаёт.
+  double _exposureOffsetEv = 0;
   FrameMapping? _mappingOverride;
   FrameMapping _computed = FrameMapping.identity;
   int _unsupportedFormatWarnings = 0;
@@ -101,11 +110,26 @@ class CameraFrameSource extends ChangeNotifier implements FrameSource, FrameMapp
       _controller = controller;
       await controller.initialize();
       _computed = _computeMapping(controller);
-      await _lockCamera(controller);
+      // Порядок важен: лок ставится ПОСЛЕ startImageStream. Плагин `camera` на
+      // Android при привязке повторного запроса к потоку перепривязывает
+      // CameraX, и зафиксированная заранее экспозиция возвращается в auto —
+      // детектор же этот возврат читает как вспышку лампы.
       await controller.startImageStream(_onImage);
       _running = true;
       notifyListeners();
-      _emit('Камера запущена: ${description.name}, ${controller.value.previewSize}, turns=${mapping.quarterTurns}', isError: false);
+      // Кадры уже идут, поэтому ждать фиксации света вечно нельзя: на части
+      // устройств `setExposureMode`/`setFocusMode` не отвечает никогда, и старт
+      // зависал навсегда при работающей камере (первый запуск 20.11.2026).
+      // Не запертый свет — ухудшение точности, а не отказ приложения.
+      await _lockCamera(controller).timeout(
+        _lockBudget,
+        onTimeout: () => _emit(
+          'Фиксация экспозиции не ответила за ${_lockBudget.inSeconds} с — '
+          'работаю с автоэкспозицией',
+          isError: false,
+        ),
+      );
+      _emit('Камера запущена: ${description.name}, ${controller.value.previewSize}, turns=${mapping.quarterTurns}, экспозиция ${_exposureLocked ? "зафиксирована" : "НЕ зафиксирована"}', isError: false);
     } on CameraException catch (e) {
       await _teardown();
       _emit('Камера: ${e.code} ${e.description}', isError: true);
@@ -142,6 +166,8 @@ class CameraFrameSource extends ChangeNotifier implements FrameSource, FrameMapp
     final CameraController? controller = _controller;
     _controller = null;
     _running = false;
+    _exposureLocked = false;
+    _exposureOffsetEv = 0;
     if (controller == null) {
       return;
     }
@@ -165,14 +191,14 @@ class CameraFrameSource extends ChangeNotifier implements FrameSource, FrameMapp
     await _try('экспозиция auto', () => controller.setExposureMode(ExposureMode.auto));
     await Future<void>.delayed(options.lockSettle);
     final bool focusLocked = await _try('фокус locked', () => controller.setFocusMode(FocusMode.locked));
-    final bool exposureLocked = await _try(
+    _exposureLocked = await _try(
       'экспозиция locked',
       () => controller.setExposureMode(ExposureMode.locked),
     );
-    if (!focusLocked || !exposureLocked) {
+    if (!focusLocked || !_exposureLocked) {
       final List<String> failed = <String>[
         if (!focusLocked) 'фокус',
-        if (!exposureLocked) 'экспозицию',
+        if (!_exposureLocked) 'экспозицию',
       ];
       _emit(
         'Плагин camera не дал зафиксировать ${failed.join(' и ')} — возможен дрейф baseline. '
@@ -180,6 +206,76 @@ class CameraFrameSource extends ChangeNotifier implements FrameSource, FrameMapp
         isError: false,
       );
     }
+  }
+
+  /// Отпускает автоэкспозицию, даёт сенсору сойтись и снова запирает её.
+  ///
+  /// Вызывается перед каждым шагом калибровки: лампу включают рукой, и
+  /// автоэкспозиция за этот момент успевает уехать на несколько стоп-экспозиций.
+  /// Если её не запереть, шаг «белая горит» набирается на одном свете, а
+  /// рабочее событие — на другом, и один и тот же удар лампы считается дважды.
+  @override
+  Future<void> relockExposure() async {
+    final CameraController? controller = _controller;
+    if (!_running || controller == null || !controller.value.isInitialized) {
+      return;
+    }
+    if (!await _try('экспозиция auto', () => controller.setExposureMode(ExposureMode.auto))) {
+      return;
+    }
+    await Future<void>.delayed(options.lockSettle);
+    if (!_running) {
+      // «Стоп» нажали, пока сенсор сходился: дальше дергать контроллер нельзя.
+      return;
+    }
+    _exposureLocked = await _try(
+      'экспозиция locked',
+      () => controller.setExposureMode(ExposureMode.locked),
+    );
+  }
+
+  @override
+  bool get exposureLocked => _exposureLocked;
+
+  /// Уводит экспозицию на шаг вниз (≈2× темнее) и запирает снова. Нужен при
+  /// пересвете: в клиппинге яркость и цвет теряются одновременно, и рамка
+  /// белой лампы становится слепой.
+  @override
+  Future<bool> reduceExposure() async {
+    final CameraController? controller = _controller;
+    if (!_running || controller == null || !controller.value.isInitialized) {
+      return false;
+    }
+    try {
+      await controller.setExposureMode(ExposureMode.auto);
+      final double min = await controller.getMinExposureOffset();
+      final double step = await controller.getExposureOffsetStepSize();
+      // `camera` 0.12 текущее смещение экспозиции наружу не отдаёт, поэтому он
+      // помнит его сам: без этого второй вызов уводил бы не «ещё на шаг», а
+      // снова от нуля.
+      final double target = (_exposureOffsetEv - (step > 0 ? step : 0.3))
+          .clamp(min, double.maxFinite)
+          .toDouble();
+      _exposureOffsetEv = await controller.setExposureOffset(target);
+      _emit('Экспозиция убавлена до $_exposureOffsetEv EV (пересвет)', isError: false);
+    } on CameraException catch (e) {
+      _emit('Убрать экспозицию не вышло: ${e.code}', isError: false);
+      return false;
+    } on Object catch (e) {
+      // StateError освобождённого контроллера сюда приходит, а не в
+      // Unhandled Exception: камеру могли закрыть во время паузы на сходимость.
+      _emit('Убрать экспозицию не вышло: $e', isError: false);
+      return false;
+    }
+    await Future<void>.delayed(options.lockSettle);
+    if (!_running) {
+      return false;
+    }
+    _exposureLocked = await _try(
+      'экспозиция locked',
+      () => controller.setExposureMode(ExposureMode.locked),
+    );
+    return true;
   }
 
   /// Возвращает true, если операция удалась. Ошибку устройства не считаем
@@ -191,6 +287,13 @@ class CameraFrameSource extends ChangeNotifier implements FrameSource, FrameMapp
     } on CameraException catch (e) {
       _emit('$label не поддерживается: ${e.code}', isError: false);
       return false;
+    } on Object catch (e) {
+      // Камеру освободили, пока операция ждала очереди: плагин кидает
+      // StateError («CameraController was used after being disposed»), и вне
+      // этой ветки он улетал в Unhandled Exception — в логе это выглядело как
+      // падение калибровки, хотя калибровка к нему непричастна.
+      _emit('$label: $e', isError: false);
+      return false;
     }
   }
 
@@ -200,14 +303,24 @@ class CameraFrameSource extends ChangeNotifier implements FrameSource, FrameMapp
     _ => ImageFormatGroup.unknown,
   };
 
-  /// Image stream приходит в ориентации сенсора; превью повёрнуто под
-  /// ориентацию устройства. Считаем, на сколько повернуть ROI, чтобы оно
-  /// попало в те же пиксели: превью -> кадр = против часовой на sensorOrientation,
-  /// то есть (4 - sensorOrientation/90) поворотов по часовой.
+  /// Image stream приходит в ориентации сенсора, а превью плагин поворачивает на
+  /// sensorOrientation ПО ЧАСОВОЙ. Значит от превью к пикселям кадра надо
+  /// повернуть на столько же поворотов [FrameMapping.toFrame], то есть ровно
+  /// sensorOrientation/90 — а не (4 - sensorOrientation/90), как было раньше.
+  ///
+  /// Проверено на живом устройстве (Pixel 8 Pro, sensorOrientation=90): дамп
+  /// кадра 720x480 и скриншот превью. Рамка, нарисованная на белой лампе, при
+  /// turns=3 попадала в тёмный фон (wf=0.18 в дампе против 0.97 на экране), при
+  /// turns=1 — ровно в колпак (wf=0.88). Формула «4 - turns» давала 3.
+  ///
+  /// Ориентацию устройства здесь сознательно НЕ учесть: на экране в ландшафте
+  /// превью доворачивается, и рамка начнёт sampling не той четверти кадра.
+  /// Проверено только в портрете; пока не измерено на живой лампе, остаётся
+  /// ручное «Поворот ROI 90°».
   FrameMapping _computeMapping(CameraController controller) {
     final int sensorTurns = (controller.description.sensorOrientation ~/ 90) % 4;
     return FrameMapping(
-      quarterTurns: (4 - sensorTurns) % 4,
+      quarterTurns: sensorTurns,
       mirrorHorizontal: controller.description.lensDirection == CameraLensDirection.front,
     );
   }

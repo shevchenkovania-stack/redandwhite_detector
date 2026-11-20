@@ -2,75 +2,114 @@ import 'dart:math' show Random;
 
 import 'package:lamp_detection/lamp_detection.dart';
 
-/// Синтетические сценарии для тестов детектора и автомата.
+/// Синтетические сцены для тестов детектора и автомата.
 ///
-/// Значения подобраны так, чтобы соответствовать реальной записи: тёмная
-/// подставка, белая лампа даёт пересвет (низкая sat), красная — рост яркости
-/// и жёлто-белое ядро, при этом красит всю сцену (высокая sat в белой ROI).
+/// Кадр несёт ОБА способа измерения: прежние доли «своих» пикселей
+/// (`whiteFrac`/`redFrac`) и яркость четырёх областей — ядра и ореола каждой
+/// рамки. Второе обязательно, потому что решение по умолчанию принимается
+/// пространственной картиной яркости, а калибровка без измеренных ореолов
+/// отвергается как несущая ровно тот дефект, ради которого всё и затевалось.
+///
+/// Числа физически согласованы: вспышка поднимает СВОЮ рамку сильнее, чем
+/// чужую. Это не украшение — если соседняя область ярче источника, никакого
+/// пространственного различия не остаётся, и ни один способ (ни яркость, ни
+/// OpenCV) источник там не назовёт; такой случай проверяется отдельно и
+/// обязан кончаться `AMBIGUOUS`, а не угадыванием.
+///
+/// По живым замерам: вспышка белой ΔwhiteFrac ≈ 0.35 и ΔЯ ≈ 140 уровней,
+/// вспышка красной ΔredFrac ≈ 0.42, ореол растёт примерно в полтора раза
+/// слабее колпака.
 class Scene {
   const Scene({
     this.whiteOff = const FrameFeatures(
       meanY: 60,
-      brightFrac: 0.01,
-      sat: 0.05,
-      redDom: 5,
-      coreEdgeDiff: 2,
+      p90Luma: 80,
       sampleCount: 400,
+      whiteFrac: 0.05,
+      redFrac: 0.01,
     ),
     this.redOff = const FrameFeatures(
       meanY: 50,
-      brightFrac: 0.02,
-      sat: 0.35,
-      redDom: 40,
-      coreEdgeDiff: 3,
+      p90Luma: 70,
       sampleCount: 400,
+      whiteFrac: 0.02,
+      redFrac: 0.03,
     ),
   });
 
   final FrameFeatures whiteOff;
   final FrameFeatures redOff;
 
-  /// Белая горит: пересвеченное пятно, низкая насыщенность.
+  /// Насколько ореол слабее колпака в тех же единицах яркости.
+  static const double _haloFactor = 0.6;
+
+  /// Белая горит: много «настоящих белых» пикселей (min(R,G,B) ≥ порога) и
+  /// яркий колпак.
   FrameFeatures get whiteOn => const FrameFeatures(
     meanY: 200,
-    brightFrac: 0.35,
-    sat: 0.06,
-    redDom: 4,
-    coreEdgeDiff: 30,
+    p90Luma: 235,
     sampleCount: 400,
+    whiteFrac: 0.40,
+    redFrac: 0.01,
   );
 
-  /// Красная горит: ярче на 40 относительно baseline + выросшее ядро.
+  /// Красная горит: выросла доля красных пикселей в красной ROI.
   FrameFeatures get redOn => const FrameFeatures(
     meanY: 90,
-    brightFrac: 0.05,
-    sat: 0.6,
-    redDom: 95,
-    coreEdgeDiff: 28,
+    p90Luma: 120,
     sampleCount: 400,
+    whiteFrac: 0.02,
+    redFrac: 0.45,
   );
 
-  /// Белая ROI под подсветкой красной: яркое пятно ЕСТЬ, но насыщенность
-  /// высокая — белая лампа не должна сработать.
+  /// Белая ROI под подсветкой красной: яркие пиксели ЕСТЬ, но они не белые
+  /// (синий и зелёный низкие) — белая лампа не должна сработать.
+  ///
+  /// Фикстура именно ЦВЕТОВАЯ: здесь чужая рамка поднялась ЯРЧЕ своей, и по
+  /// яркости этот кадр неотличим от вспышки белой. Поэтому он проверяет
+  /// прежний способ решения (`spatialVectors: false`), а не новый.
   FrameFeatures get whiteTintedByRed => const FrameFeatures(
     meanY: 150,
-    brightFrac: 0.3,
-    sat: 0.55,
-    redDom: 70,
-    coreEdgeDiff: 20,
+    p90Luma: 190,
     sampleCount: 400,
+    whiteFrac: 0.08,
+    redFrac: 0.30,
   );
+
+  /// Ореол своей лампы из её же колпака: поднимается на ту же долю, что и
+  /// ядро, но слабее. Благодаря этому кадр остаётся согласованным и при шуме,
+  /// и при провале внутри вспышки, и при частичном затенении.
+  FrameFeatures _haloOf(FrameFeatures core, {required bool white}) {
+    final FrameFeatures off = white ? whiteOff : redOff;
+    // Фон ореола — те же уровни, что и у своего колпака, минус чуть более
+    // тёмное окружение.
+    final double ringOffY = white ? 40 : 35;
+    final double ringOffP = white ? 55 : 48;
+    return FrameFeatures(
+      meanY: ringOffY + (core.meanY - off.meanY) * _haloFactor,
+      p90Luma: ringOffP + (core.p90Luma - off.p90Luma) * _haloFactor,
+      sampleCount: 900,
+      whiteFrac: (off.whiteFrac * 0.5 + core.whiteFrac * 0.5).clamp(0.0, 1.0),
+      redFrac: (off.redFrac * 0.5 + core.redFrac * 0.5).clamp(0.0, 1.0),
+    );
+  }
 
   LampFrame both({
     FrameFeatures? white,
     FrameFeatures? red,
     required int index,
     int frameMs = 33,
-  }) => LampFrame(
-    timestamp: DateTime.fromMillisecondsSinceEpoch(1000 + index * frameMs),
-    white: white ?? whiteOff,
-    red: red ?? redOff,
-  );
+  }) {
+    final FrameFeatures w = white ?? whiteOff;
+    final FrameFeatures r = red ?? redOff;
+    return LampFrame(
+      timestamp: DateTime.fromMillisecondsSinceEpoch(1000 + index * frameMs),
+      white: w,
+      red: r,
+      whiteRing: _haloOf(w, white: true),
+      redRing: _haloOf(r, white: false),
+    );
+  }
 
   /// Кадр «обе выключены».
   LampFrame off({required int index, int frameMs = 33}) => both(index: index, frameMs: frameMs);
@@ -82,41 +121,46 @@ class Scene {
         (int i) => both(index: startIndex + i, white: white, red: red, frameMs: frameMs),
       );
 
-  /// Кадр с шумом яркости вокруг baseline.
-  LampFrame noisy({required int index, required double jitterY, double jitterBright = 0}) {
+  /// Кадр с шумом вокруг baseline: яркость и верх распределения гуляют вместе
+  /// (так и есть на камере: шумит весь кадр, а не одна доля), доли белых и
+  /// красных — на единицы процентов. Детектор обязан молчать.
+  LampFrame noisy({required int index, required double jitterY}) {
     final Random rnd = Random(index);
     final double noise = (rnd.nextDouble() - 0.5) * 2 * jitterY;
-    final double brightNoise = (rnd.nextDouble() - 0.5) * 2 * jitterBright;
+    final double fracNoise = (rnd.nextDouble() - 0.5) * 2 * 0.01;
     return both(
       index: index,
       white: FrameFeatures(
         meanY: whiteOff.meanY + noise,
-        brightFrac: (whiteOff.brightFrac + brightNoise).clamp(0.0, 1.0),
-        sat: whiteOff.sat,
-        redDom: whiteOff.redDom,
-        coreEdgeDiff: whiteOff.coreEdgeDiff,
+        p90Luma: whiteOff.p90Luma + noise,
         sampleCount: 400,
+        whiteFrac: (whiteOff.whiteFrac + fracNoise).clamp(0.0, 1.0),
+        redFrac: whiteOff.redFrac,
       ),
       red: FrameFeatures(
         meanY: redOff.meanY - noise,
-        brightFrac: redOff.brightFrac,
-        sat: redOff.sat,
-        redDom: redOff.redDom,
-        coreEdgeDiff: redOff.coreEdgeDiff,
+        p90Luma: redOff.p90Luma - noise,
         sampleCount: 400,
+        whiteFrac: redOff.whiteFrac,
+        redFrac: (redOff.redFrac + fracNoise).clamp(0.0, 1.0),
       ),
     );
   }
 }
 
 /// Прогон кадров через детектор + автомат, как это делает живая сессия.
+///
+/// По умолчанию режим эталонов (`liveReference: false`): эти тесты проверяют
+/// разложение отклика на измеренные эталоны и калибровку. Живой отсчёт
+/// проверяется отдельно в `live_reference_test.dart` — он намеренно не требует
+/// калибровки, и мешать два режима в одном сценарии значит не проверить ни один.
 class Harness {
   Harness({LampConfig? config, Scene? scene})
-    : config = config ?? const LampConfig(),
+    : config = config ?? const LampConfig(liveReference: false),
       scene = scene ?? const Scene() {
     detector = LampDetector(this.config);
     machine = HitStateMachine(sessionId: 'test-session', idGenerator: _ids.next);
-    calibrate();
+    _detectFrom = calibrate();
   }
 
   final LampConfig config;
@@ -125,14 +169,32 @@ class Harness {
   late final HitStateMachine machine;
   final _IdGenerator _ids = _IdGenerator();
 
+  /// Первый кадр после калибровки: индексы обязаны идти дальше, иначе
+  /// `detectedAt` двух разных шагов нельзя сравнить.
+  late final int _detectFrom;
+  int get detectFrom => _detectFrom;
+
   int get ambiguousFrames => detector.ambiguousFrames;
 
-  /// Калибровка «обе выключены» по [LampConfig.calibrationFrames] кадров.
-  void calibrate() {
-    for (int i = 0; i < config.calibrationFrames; i++) {
-      detector.addCalibrationFrame(scene.off(index: i));
+  /// Калибровка в три состояния, как на стенде: фон → держат белую → держат
+  /// красную. Возвращает число скормленных кадров.
+  int calibrate() {
+    int i = 0;
+    for (final CalibrationStep step in CalibrationStep.values) {
+      for (int k = 0; k < config.calibrationFrames; k++, i++) {
+        detector.addCalibrationFrame(calibrationFrame(step, index: i));
+      }
     }
+    return i;
   }
+
+  /// Кадр шага калибровки: только нужная лампа горит, вторая — в фоне.
+  LampFrame calibrationFrame(CalibrationStep step, {required int index}) =>
+      switch (step) {
+        CalibrationStep.background => scene.off(index: index),
+        CalibrationStep.whiteOn => scene.both(white: scene.whiteOn, index: index),
+        CalibrationStep.redOn => scene.both(red: scene.redOn, index: index),
+      };
 
   /// Скормить кадр, вернуть порождённые события.
   List<HitEvent> feed(LampFrame frame) => machine.onEvaluation(detector.evaluate(frame));
@@ -147,7 +209,7 @@ class Harness {
     int offFrames = 5,
     int? startIndex,
   }) {
-    final int from = startIndex ?? config.calibrationFrames;
+    final int from = startIndex ?? _detectFrom;
     final List<HitEvent> events = <HitEvent>[];
     events.addAll(feedAll(scene.sequence(onFrames, white: scene.whiteOn, startIndex: from)));
     events.addAll(feedAll(scene.sequence(offFrames, startIndex: from + onFrames)));
@@ -159,7 +221,7 @@ class Harness {
     int offFrames = 5,
     int? startIndex,
   }) {
-    final int from = startIndex ?? config.calibrationFrames;
+    final int from = startIndex ?? _detectFrom;
     final List<HitEvent> events = <HitEvent>[];
     events.addAll(feedAll(scene.sequence(onFrames, red: scene.redOn, startIndex: from)));
     events.addAll(feedAll(scene.sequence(offFrames, startIndex: from + onFrames)));

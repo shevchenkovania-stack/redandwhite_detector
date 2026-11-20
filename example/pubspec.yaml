@@ -39,6 +39,21 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
 
+  # Второй способ измерения света — OpenCV как теневой измеритель
+  # (`ShadowProbe`): сравнивает числа с рабочим конвейером на живых кадрах,
+  # решения не принимает.
+  #
+  # ЦЕНА ПОДКЛЮЧЕНИЯ (замерено 20.11.2026): хук `dartcv4` берёт исходники
+  # OpenCV и кросс-компилирует их NDK-ом под arm64-v8a ~20 минут, молча и без
+  # прогресса в консоли — ровно это выглядит как «приложение зависло на
+  # старте». Кладёт результат в `.dart_tool/hooks_runner/shared/dartcv4`, так
+  # что `flutter clean` и `flutter pub get` сбрасывают сборку в ноль.
+  # Пока сборка идёт, второй `flutter build/run` падает через 5 минут с
+  # `Could not acquire the lock to ...dartcv4\.lock` — это не конфликт кода, а
+  # два сборщика одной библиотеки (ЖУРНАЛ §9).
+  opencv_dart: 2.2.2
+  ffi: ^2.2.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
