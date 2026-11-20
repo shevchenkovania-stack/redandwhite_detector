@@ -2,22 +2,20 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import '../models/frame_features.dart';
-import '../models/lamp_config.dart';
 import 'lamp_calibration.dart';
 
 /// Вектор признаков кадра для решения «какая лампа горит».
 ///
-/// Форматов два, выбирает их [LampConfig.spatialVectors]:
+/// Восемь чисел: среднее и верхний процентиль яркости ЧЕТЫРЁХ измеряемых
+/// областей (ядро и кольцо каждой рамки). Цвета в нём нет вовсе: оттенок
+/// пересвеченной красной лампы для сенсора белый, а вот КУДА лёг свет различим
+/// всегда. Цветовые доли (`whiteFrac`/`redFrac`) по-прежнему измеряются и
+/// пишутся в CSV — но только для разбора записей, ни на одно решение они не
+/// влияют. Раньше влияли, и именно из-за этого красная вспышка уезжала в белую
+/// корзину.
 ///
-/// * прежний — шесть чисел: доли белых и красных пикселей и яркость каждой из
-///   двух РАМОК;
-/// * пространственный — восемь чисел: среднее и верхний процентиль яркости
-///   ЧЕТЫРЁХ измеряемых областей (ядро и кольцо каждой рамки). Цвета в нём нет
-///   вовсе: оттенок пересвеченной красной лампы для сенсора белый, а вот КУДА
-///   лёг свет различим всегда.
-///
-/// Яркость делится на 255, чтобы она и доли были в одном масштабе — иначе
-/// наименьшие квадраты решались бы по одной только яркости.
+/// Яркость делится на 255, чтобы все координаты вектора были в одном масштабе
+/// 0..1 — иначе наименьшие квадраты решались бы по одной только яркости.
 ///
 /// Кольцо, которого в кадре нет (null), даёт в векторе нули ПО ВСЕМ своим
 /// координатам — и у эталона, и у измерения. Такие координаты ничем не
@@ -27,25 +25,12 @@ import 'lamp_calibration.dart';
 /// Порядок фиксирован и открыт: к вектору обращаются и калибровка, и детектор,
 /// и экраны диагностики.
 class LampVector {
-  const LampVector({required this.spatial});
+  const LampVector();
 
-  factory LampVector.fromConfig(LampConfig config) =>
-      LampVector(spatial: config.spatialVectors);
+  /// Число координат: четыре области × два числа яркости.
+  static const int coordinateCount = 8;
 
-  /// Пространственная яркостная картина вместо цветовых долей.
-  final bool spatial;
-
-  static const int legacyLength = 6;
-  static const int spatialLength = 8;
-
-  int get length => spatial ? spatialLength : legacyLength;
-
-  static const int whiteWhiteFrac = 0;
-  static const int whiteRedFrac = 1;
-  static const int whiteMeanY = 2;
-  static const int redWhiteFrac = 3;
-  static const int redRedFrac = 4;
-  static const int redMeanY = 5;
+  int get length => coordinateCount;
 
   static const int whiteCoreMean = 0;
   static const int whiteCoreP90 = 1;
@@ -57,32 +42,19 @@ class LampVector {
   static const int redRingP90 = 7;
 
   /// Вектор текущего кадра: обе рамки и оба кольца.
-  Float64List of(LampFrame frame) => spatial
-      ? _luma(frame.white, frame.whiteRing, frame.red, frame.redRing)
-      : _legacy(frame.white, frame.red);
+  Float64List of(LampFrame frame) =>
+      _luma(frame.white, frame.whiteRing, frame.red, frame.redRing);
 
-  Float64List ofState(CalibrationState state) => spatial
-      ? _luma(state.white, state.whiteRing, state.red, state.redRing)
-      : _legacy(state.white, state.red);
+  Float64List ofState(CalibrationState state) =>
+      _luma(state.white, state.whiteRing, state.red, state.redRing);
 
   /// σ признаков состояния — тот же вектор, только из отклонений.
-  Float64List ofSigma(CalibrationState state) => spatial
-      ? _luma(state.whiteSigma, state.whiteRingSigma, state.redSigma, state.redRingSigma)
-      : _legacy(state.whiteSigma, state.redSigma);
+  Float64List ofSigma(CalibrationState state) => _luma(
+      state.whiteSigma, state.whiteRingSigma, state.redSigma, state.redRingSigma);
 
   /// Измеренный отклик лампы: чем состояние «лампа горит» отличается от фона.
   Float64List ofResponse(CalibrationState lit, CalibrationState background) =>
       subtract(ofState(lit), ofState(background));
-
-  static Float64List _legacy(FrameFeatures white, FrameFeatures red) =>
-      Float64List.fromList(<double>[
-        white.whiteFrac,
-        white.redFrac,
-        white.meanY / 255.0,
-        red.whiteFrac,
-        red.redFrac,
-        red.meanY / 255.0,
-      ]);
 
   /// Четыре области × два числа яркости. Отсутствующее кольцо — два нуля.
   static Float64List _luma(
@@ -123,8 +95,7 @@ class LampVector {
 
   /// Имя координаты для сообщения об ошибке: оператор обязан понять, какой
   /// признак шумит и какую область из-за этого нечем мерить.
-  String name(int index) => spatial
-      ? switch (index) {
+  String name(int index) => switch (index) {
           whiteCoreMean => 'яркость ядра белой рамки',
           whiteCoreP90 => 'p90 ядра белой рамки',
           whiteRingMean => 'яркость кольца белой рамки',
@@ -133,15 +104,6 @@ class LampVector {
           redCoreP90 => 'p90 ядра красной рамки',
           redRingMean => 'яркость кольца красной рамки',
           redRingP90 => 'p90 кольца красной рамки',
-          _ => 'признак #$index',
-        }
-      : switch (index) {
-          whiteWhiteFrac => 'whiteFrac белой рамки',
-          whiteRedFrac => 'redFrac белой рамки',
-          whiteMeanY => 'яркость белой рамки',
-          redWhiteFrac => 'whiteFrac красной рамки',
-          redRedFrac => 'redFrac красной рамки',
-          redMeanY => 'яркость красной рамки',
           _ => 'признак #$index',
         };
 }
@@ -187,14 +149,12 @@ class LampResponse {
 ///
 /// Никакого «цвета пикселя» в решении нет: кадр описывается изменением
 /// измеряемых областей и раскладывается на два эталона — «горит белая» и
-/// «горит красная» — методом наименьших квадратов. Система из шести (в
-/// пространственном векторе — восьми) уравнений с двумя неизвестными
-/// переопределена, а решение остаётся детерминированной арифметикой: 2×2
-/// матрица Грама обращается явно, итераций здесь нет. Размер здесь не важен
-/// вовсе — важна только размерность вектора, которым собраны эталоны.
+/// «горит красная» — методом наименьших квадратов. Система из восьми уравнений
+/// с двумя неизвестными переопределена, а решение остаётся детерминированной
+/// арифметикой: 2×2 матрица Грама обращается явно, итераций здесь нет.
 class LampResponseModel {
-  factory LampResponseModel(LampBaseline baseline, {required LampConfig config}) {
-    final LampVector v = LampVector.fromConfig(config);
+  factory LampResponseModel(LampBaseline baseline) {
+    const LampVector v = LampVector();
     return LampResponseModel._(
       baseline: baseline,
       vector: v,

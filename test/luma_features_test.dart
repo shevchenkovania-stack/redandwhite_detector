@@ -105,7 +105,7 @@ void main() {
     });
   });
 
-  group('CSV v3', () {
+  group('CSV v4', () {
     test('новое число колонок и яркость колец переживают запись/чтение', () {
       final FeatureCsvRow row = FeatureCsvRow(
         timestampMs: 1000,

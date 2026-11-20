@@ -2,7 +2,6 @@ import 'dart:math' as math;
 
 import '../detection/hit_state_machine.dart';
 import '../detection/lamp_detector.dart';
-import '../models/frame_features.dart';
 import '../models/hit_event.dart';
 import '../models/lamp_config.dart';
 import 'feature_csv_recorder.dart';
@@ -60,17 +59,14 @@ class DarkRunTiming {
       '${separable ? 'правило = $suggestedOffConfirmMs мс' : 'разделить нечем'}';
 }
 
-/// Результат сравнения двух способов решения на одной и той же записи.
-class ModeComparison {
-  const ModeComparison({
+/// Итог разбора записанной серии.
+class RunAnalysis {
+  const RunAnalysis({
     required this.frames,
     required this.span,
     required this.medianFrameMs,
-    required this.legacyWhiteEvents,
-    required this.legacyRedEvents,
-    required this.spatialWhiteEvents,
-    required this.spatialRedEvents,
-    required this.mismatches,
+    required this.whiteEvents,
+    required this.redEvents,
     required this.whiteTiming,
     required this.redTiming,
     required this.offConfirmMs,
@@ -86,13 +82,9 @@ class ModeComparison {
   /// стенде: именно поэтому подтверждение выключения меряется временем.
   final int medianFrameMs;
 
-  final int legacyWhiteEvents;
-  final int legacyRedEvents;
-  final int spatialWhiteEvents;
-  final int spatialRedEvents;
-
-  /// Короткие строки, где способы разошлись: время и кто из них что решил.
-  final List<String> mismatches;
+  /// Сколько событий каждого цвета набралось на этой записи.
+  final int whiteEvents;
+  final int redEvents;
 
   final DarkRunTiming whiteTiming;
   final DarkRunTiming redTiming;
@@ -100,100 +92,63 @@ class ModeComparison {
   /// Каким было `offConfirmMs` в этот прогон.
   final int offConfirmMs;
 
-  /// Совпали ли числа событий во всех четырёх каналах.
-  bool get countsAgree =>
-      legacyWhiteEvents == spatialWhiteEvents && legacyRedEvents == spatialRedEvents;
-
   String describe() => <String>[
       'кадров $frames за ${span.inMilliseconds} мс · медианный кадр $medianFrameMs мс',
-      'цвет: W=$legacyWhiteEvents R=$legacyRedEvents · '
-          'яркость: W=$spatialWhiteEvents R=$spatialRedEvents '
-          '${countsAgree ? '(совпало)' : '(РАЗОШЛОСЬ)'}',
+      'событий: белая $whiteEvents · красная $redEvents '
+          '(подтверждение выключения было $offConfirmMs мс)',
       whiteTiming.describe(),
       redTiming.describe(),
-      if (mismatches.isNotEmpty) 'расхождения: ${mismatches.join('; ')}',
     ].join('\n');
 }
 
-/// Прогон одной записи двумя способами решения — цветовым и пространственным.
+/// Разбор записанной серии (CSV v4 и старых форматов) нынешним способом решения.
 ///
-/// Сравнивать их иначе нельзя: оба читают ОДНИ и ТЕ ЖЕ измеренные признаки из
-/// CSV v3, где записаны и цветовые доли, и яркость четырёх областей. Любое
-/// «новый алгоритм лучше» без такой пары — просто два разных прогона стенда, а
-/// не сравнение алгоритмов.
+/// Здесь когда-то жил `ModeComparator`, прогонявший ОДНУ запись двумя способами
+/// — цветовым и яркостным, — чтобы новое решение не отменяло старую реализацию,
+/// а сравнивалось с ней на одних и тех же измеренных признаках. Цветовое
+/// решение удалено: пересвеченная красная лампа для сенсора белая, и её вспышка
+/// уезжала в белую корзину, а на «прежнем» способе это воспроизводилось.
+/// Сравнивать больше не с чем, поэтому остался один прогон.
 ///
-/// Третья задача здесь даже важнее первой: по тем же строкам измеряются
-/// длительности провалов и пауз ([DarkRunTiming]), то есть правило подтверждения
-/// выключения получает числа от записи, а не от догадки.
-class ModeComparator {
-  const ModeComparator();
+/// Главная задача здесь теперь одна, и она важнее подсчёта событий: по тем же
+/// строкам измеряются длительности провалов и пауз ([DarkRunTiming]), то есть
+/// правило подтверждения выключения получает числа от записи, а не от догадки.
+///
+/// Разбор идёт в режиме живого отсчёта: калибровки у записи нет, а живой отсчёт
+/// — именно тот способ, каким демо работает на стенде.
+class RunAnalyzer {
+  const RunAnalyzer();
 
-  /// Способ решения по цветовым долям — прежний живой отсчёт.
-  static LampConfig legacy(LampConfig base) =>
-      base.copyWith(liveReference: true, spatialVectors: false);
-
-  /// Способ решения по яркости четырёх областей — тоже живой, поэтому калибровка
-  /// для сравнения не нужна ни одному из них.
-  static LampConfig spatial(LampConfig base) =>
-      base.copyWith(liveReference: true, spatialVectors: true);
-
-  static ModeComparison compare(String csv, {LampConfig base = const LampConfig()}) {
+  static RunAnalysis analyze(String csv, {LampConfig base = const LampConfig()}) {
     final List<FeatureCsvRow> rows = FeatureCsv.decode(csv);
     if (rows.length < 2) {
-      throw ArgumentError('для сравнения нужно минимум два кадра записи');
+      throw ArgumentError('для разбора нужно минимум два кадра записи');
     }
 
-    final _Run legacyRun = _replay(rows, legacy(base));
-    final _Run spatialRun = _replay(rows, spatial(base));
-    final _Timing timing = _measureTiming(rows, base);
-
-    final List<int> deltas = <int>[];
-    for (int i = 1; i < rows.length; i++) {
-      deltas.add(rows[i].timestampMs - rows[i - 1].timestampMs);
-    }
-    deltas.sort();
-
-    final List<String> mismatches = <String>[];
-    for (final int t in <int>{...legacyRun.eventMs, ...spatialRun.eventMs}) {
-      final bool inLegacy = legacyRun.eventMs.contains(t);
-      final bool inSpatial = spatialRun.eventMs.contains(t);
-      if (inLegacy == inSpatial) {
-        continue;
-      }
-      mismatches.add('$t мс ${inLegacy ? 'только цвет' : 'только яркость'}');
-      if (mismatches.length >= 8) {
-        break;
-      }
-    }
-
-    return ModeComparison(
-      frames: rows.length,
-      span: Duration(
-        milliseconds: rows.last.timestampMs - rows.first.timestampMs,
-      ),
-      medianFrameMs: deltas[deltas.length ~/ 2],
-      legacyWhiteEvents: legacyRun.white,
-      legacyRedEvents: legacyRun.red,
-      spatialWhiteEvents: spatialRun.white,
-      spatialRedEvents: spatialRun.red,
-      mismatches: mismatches,
-      whiteTiming: timing.white,
-      redTiming: timing.red,
-      offConfirmMs: base.offConfirmMs,
-    );
-  }
-
-  /// Считает провалы и паузы по решениям детектора, идя по записи в точности
-  /// так, как на живом стенде.
-  static _Timing _measureTiming(List<FeatureCsvRow> rows, LampConfig cfg) {
-    final LampDetector detector = LampDetector(cfg);
+    final LampDetector detector =
+        LampDetector(base.copyWith(liveReference: true));
+    final HitStateMachine machine = HitStateMachine(sessionId: 'analysis');
     final _Tracker white = _Tracker();
     final _Tracker red = _Tracker();
+    int whiteEvents = 0;
+    int redEvents = 0;
     for (final FeatureCsvRow row in rows) {
-      final LampFrame frame = row.toLampFrame();
-      final LampEvaluation e = detector.evaluate(frame);
+      final LampEvaluation e = detector.evaluate(row.toLampFrame());
+      for (final HitEvent event in machine.onEvaluation(e)) {
+        if (event.color == HitColor.white) {
+          whiteEvents++;
+        } else {
+          redEvents++;
+        }
+      }
       final double level = detector.whiteOnLevel ?? 0;
-      white.step(darkMs: e.whiteDarkMs, on: e.whiteOn, off: e.whiteOff, lit: e.whiteLit, back: e.whiteAmplitude >= level);
+      white.step(
+        darkMs: e.whiteDarkMs,
+        on: e.whiteOn,
+        off: e.whiteOff,
+        lit: e.whiteLit,
+        back: e.whiteAmplitude >= level,
+      );
       red.step(
         darkMs: e.redDarkMs,
         on: e.redOn,
@@ -202,47 +157,26 @@ class ModeComparator {
         back: e.redAmplitude >= (detector.redOnLevel ?? 0),
       );
     }
-    return _Timing(
-      white: white.done('белая'),
-      red: red.done('красная'),
+
+    final List<int> deltas = <int>[];
+    for (int i = 1; i < rows.length; i++) {
+      deltas.add(rows[i].timestampMs - rows[i - 1].timestampMs);
+    }
+    deltas.sort();
+
+    return RunAnalysis(
+      frames: rows.length,
+      span: Duration(
+        milliseconds: rows.last.timestampMs - rows.first.timestampMs,
+      ),
+      medianFrameMs: deltas[deltas.length ~/ 2],
+      whiteEvents: whiteEvents,
+      redEvents: redEvents,
+      whiteTiming: white.done('белая'),
+      redTiming: red.done('красная'),
+      offConfirmMs: base.offConfirmMs,
     );
   }
-
-  /// Один прогон записи выбранным способом: сколько событий и в какие моменты.
-  static _Run _replay(List<FeatureCsvRow> rows, LampConfig cfg) {
-    final LampDetector detector = LampDetector(cfg);
-    final HitStateMachine machine = HitStateMachine(sessionId: 'compare');
-    final Set<int> events = <int>{};
-    int white = 0;
-    int red = 0;
-    for (final FeatureCsvRow row in rows) {
-      for (final HitEvent event in machine.onEvaluation(detector.evaluate(row.toLampFrame()))) {
-        if (event.color == HitColor.white) {
-          white++;
-        } else {
-          red++;
-        }
-        // Событие датировано кадром-кандидатом, а не кадром подтверждения: по
-        // нему и надо сравнивать способы, иначе их расхождение превратится в
-        // сдвиг на два кадра.
-        events.add(event.detectedAt.millisecondsSinceEpoch);
-      }
-    }
-    return _Run(white: white, red: red, eventMs: events);
-  }
-}
-
-class _Run {
-  const _Run({required this.white, required this.red, required this.eventMs});
-  final int white;
-  final int red;
-  final Set<int> eventMs;
-}
-
-class _Timing {
-  const _Timing({required this.white, required this.red});
-  final DarkRunTiming white;
-  final DarkRunTiming red;
 }
 
 /// Накопитель интервалов «не выше ON-уровня» одного канала.

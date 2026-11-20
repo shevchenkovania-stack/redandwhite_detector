@@ -85,6 +85,12 @@ class OpenCvShadowInstrument {
   /// проверить, что тень их не изменила.
   int get events => _pairs.where((ShadowPair p) => p.whiteDecision || p.redDecision).length;
 
+  /// Последняя пара «наше число | число OpenCV» — для показа на экране.
+  ///
+  /// Отдельный геттер, а не [pairs]: `pairs` копирует список, а экран
+  /// перерисовывается на каждый кадр.
+  ShadowPair? get last => _pairs.isEmpty ? null : _pairs.last;
+
   /// Единственная точка входа для сессии.
   ///
   /// Вызывается ПОСЛЕ того, как события уже приняты и отправлены, поэтому

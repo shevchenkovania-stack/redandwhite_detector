@@ -35,13 +35,9 @@ dependencies:
   lamp_detection:
     path: ../
 
-  # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
-  cupertino_icons: ^1.0.8
-
   # Второй способ измерения света — OpenCV как теневой измеритель
   # (`ShadowProbe`): сравнивает числа с рабочим конвейером на живых кадрах,
-  # решения не принимает.
+  # решений не принимает.
   #
   # ЦЕНА ПОДКЛЮЧЕНИЯ (замерено 20.11.2026): хук `dartcv4` берёт исходники
   # OpenCV и кросс-компилирует их NDK-ом под arm64-v8a ~20 минут, молча и без

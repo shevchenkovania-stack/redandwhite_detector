@@ -13,7 +13,7 @@ import '../detection/lamp_detector.dart';
 import '../detection/response_model.dart';
 import '../diagnostics/diagnostics_collector.dart';
 import '../diagnostics/feature_csv_recorder.dart';
-import '../diagnostics/mode_comparator.dart';
+import '../diagnostics/run_analyzer.dart';
 import '../models/frame_features.dart';
 import '../models/hit_event.dart';
 import '../models/lamp_config.dart';
@@ -92,7 +92,10 @@ class LampStatus {
   static const LampStatus initial = LampStatus(
     running: false,
     calibrating: false,
-    calibration: CalibrationProgress(collected: 0, needed: LampConfig.defaultCalibrationFrames),
+    calibration: CalibrationProgress(
+      collected: 0,
+      needed: LampConfig.defaultCalibrationFrames,
+    ),
     isCalibrated: false,
     whiteLit: false,
     redLit: false,
@@ -176,6 +179,7 @@ class DetectionSession extends ChangeNotifier {
        diagnostics = diagnostics ?? DiagnosticsCollector(),
        _config = config,
        _roi = roi {
+    _dartExtractor = _extractor;
     this.diagnostics.isolateThresholdMs = config.analysisIsolateThresholdMs;
   }
 
@@ -212,14 +216,23 @@ class DetectionSession extends ChangeNotifier {
   final FeatureCsvRecorder csvRecorder;
   final DiagnosticsCollector diagnostics;
 
-  final FeatureExtractor _extractor;
+  /// Измеритель признаков текущего кадра. Не final: ветка сравнения датчиков
+  /// подменяет его на лету (см. [sensorExtractor]). Штатный Dart-измеритель
+  /// хранится отдельно, чтобы возврат к нему не зависел от порядка правок.
+  FeatureExtractor _extractor;
+
+  /// Тот измеритель, с которым сессия родилась, — единственный, кого возвращает
+  /// `sensorExtractor = null`.
+  late final FeatureExtractor _dartExtractor;
+
   final LampDetector _detector;
   final HitStateMachine _machine;
 
   LampConfig _config;
   RoiLayout _roi;
 
-  final StreamController<HitEvent> _hits = StreamController<HitEvent>.broadcast();
+  final StreamController<HitEvent> _hits =
+      StreamController<HitEvent>.broadcast();
   final StreamController<String> _errors = StreamController<String>.broadcast();
   final List<String> _lastErrors = <String>[];
 
@@ -265,6 +278,7 @@ class DetectionSession extends ChangeNotifier {
   bool _running = false;
   bool _calibrating = false;
   bool _recordingCsv = false;
+  bool _csvEnabled = false;
   bool _whiteLit = false;
   bool _redLit = false;
   bool _disposed = false;
@@ -374,13 +388,15 @@ class DetectionSession extends ChangeNotifier {
       return 'Калибровка есть. Переснять шаг — жми его кнопку';
     }
     return switch (step) {
-      CalibrationStep.background => _referenceLit
-          ? 'В кадре светло — гаси лампы и жми «1 ФОН»'
-          : 'Погаси обе лампы и жми «1 ФОН»',
+      CalibrationStep.background =>
+        _referenceLit
+            ? 'В кадре светло — гаси лампы и жми «1 ФОН»'
+            : 'Погаси обе лампы и жми «1 ФОН»',
       CalibrationStep.whiteOn => 'Включи белую и жми «2 БЕЛАЯ»',
-      CalibrationStep.redOn => _whiteStillLit
-          ? 'Гаси белую — потом жми «3 КРАСНАЯ»'
-          : 'Гаси белую, включай красную и жми «3 КРАСНАЯ»',
+      CalibrationStep.redOn =>
+        _whiteStillLit
+            ? 'Гаси белую — потом жми «3 КРАСНАЯ»'
+            : 'Гаси белую, включай красную и жми «3 КРАСНАЯ»',
     };
   }
 
@@ -425,6 +441,9 @@ class DetectionSession extends ChangeNotifier {
   double? get whiteOnLevel => _detector.whiteOnLevel;
   double? get redOnLevel => _detector.redOnLevel;
 
+  /// Диагностика окон живого отсчёта для периодического LAMPDBG.
+  String get liveDebugTag => _detector.liveDebugTag;
+
   /// Можно ли считать удар прямо сейчас и если нет — чего не хватает. Рождается
   /// здесь, а не в UI: половина причин сидит внутри сессии, а оператор у лампы
   /// обязан видеть не «жива ли программа», а «можно ли жать».
@@ -447,7 +466,7 @@ class DetectionSession extends ChangeNotifier {
     // Живому отсчёту нужно окно темноты: до него решения просто нет.
     final int warmup = _config.liveReference ? _detector.liveWarmupLeft : 0;
     if (warmup > 0) {
-      return (ready: false, why: 'Свет стабилизируется, осталось кадров: $warmup');
+      return (ready: false, why: 'Жду тёмный фон, осталось значений: $warmup');
     }
     return (ready: true, why: 'ГОТОВ К РАБОТЕ — считаю удары');
   }
@@ -463,6 +482,29 @@ class DetectionSession extends ChangeNotifier {
 
   /// Экстрактор признаков этого кадра — нужен демо, чтобы сохранить кадр в RGB.
   FeatureExtractor get extractor => _extractor;
+
+  /// Рубильник измерителя признаков: `null` — штатный Dart-измеритель,
+  /// значение — подставленный (например, OpenCV-датчик из демо).
+  ///
+  /// Смена ТОЛЬКО меняет способ измерения: пороги, калибровка и CSV при этом
+  /// остаются прежними, а они набраны числами прежнего измерителя. Поэтому
+  /// вызывающая сторона обязана при каждом переключении сбросить калибровку и
+  /// перезаписать CSV — в демо это делает пунк меню «Датчик». Сам сеттер
+  /// нарочно ничего не стирает: пакет не знает, сравнивают датчики или
+  /// продолжают прогон.
+  FeatureExtractor get sensorExtractor => _extractor;
+
+  set sensorExtractor(FeatureExtractor? value) {
+    final FeatureExtractor next = value ?? _dartExtractor;
+    if (identical(next, _extractor)) {
+      return;
+    }
+    _extractor = next;
+    // Конфиг мог смениться, пока измеритель был другой: свежий получает
+    // текущий, а не тот, с которым его создавали.
+    _extractor.config = _config;
+    _notify(force: true);
+  }
 
   /// История score по времени — для графика «повторное попадание».
   List<ScorePoint> get scoreHistory => diagnostics.scores;
@@ -513,7 +555,9 @@ class DetectionSession extends ChangeNotifier {
       );
     } else if (baseline != null) {
       final int ageMin = DateTime.now()
-          .difference(DateTime.fromMillisecondsSinceEpoch(baseline.capturedAtMs))
+          .difference(
+            DateTime.fromMillisecondsSinceEpoch(baseline.capturedAtMs),
+          )
           .inMinutes;
       if (ageMin <= _config.baselineMaxAgeMinutes) {
         _detector.setBaseline(baseline);
@@ -526,7 +570,10 @@ class DetectionSession extends ChangeNotifier {
           gain: baseline.sensorSensitivity,
         );
       } else {
-        _report('Старая калибровка отброшена (возраст $ageMin мин): освещение могло смениться.', isError: false);
+        _report(
+          'Старая калибровка отброшена (возраст $ageMin мин): освещение могло смениться.',
+          isError: false,
+        );
       }
     }
     final String? storedSession = settings.readSessionId();
@@ -558,6 +605,10 @@ class DetectionSession extends ChangeNotifier {
       _notify(force: true);
     } on Object catch (e) {
       _report('Старт камеры: $e');
+    }
+    // Стоп закрывает файл, но не отменяет выбор оператора «писать CSV».
+    if (_running && _csvEnabled && !_recordingCsv) {
+      await setRecordingCsv(true);
     }
     await deliverPending();
   }
@@ -634,7 +685,9 @@ class DetectionSession extends ChangeNotifier {
       _detector.seedCalibration(previous);
     }
     if (step != CalibrationStep.background &&
-        !_detector.completedCalibrationSteps.contains(CalibrationStep.background)) {
+        !_detector.completedCalibrationSteps.contains(
+          CalibrationStep.background,
+        )) {
       // Сравнивать лампу пока не с чем: без фона шаг не измеряет отклик, а
       // «готовая» калибровка из одного состояния была бы молча слепой.
       // Проверка до goToStep — иначе отказ ещё и стёр бы снятые состояния.
@@ -690,25 +743,37 @@ class DetectionSession extends ChangeNotifier {
     _detector.discardCalibrationStep();
     _settleLeft = calibrationSettleFrames;
     _phaseStartedAt = DateTime.now();
-    _report('Пересвет убран, «${step.label}» набирается заново', isError: false);
+    _report(
+      'Пересвет убран, «${step.label}» набирается заново',
+      isError: false,
+    );
     _notify(force: true);
   }
 
-  /// Забыть недобранные состояния и вернуться к кнопке «1 ФОН». Рабочая
-  /// калибровка при этом остаётся: до нового полного набора события считаются
-  /// по ней, а не по половинкам. [dropBaseline] убирает и её — нужно, когда
-  /// прежние состояния уже не относятся к текущим рамкам.
-  void resetCalibration({bool dropBaseline = false}) {
+  /// Забыть калибровку целиком: и недобранный набор, и рабочую базу, и «пол»
+  /// живого отсчёта.
+  ///
+  /// Раньше у метода был флаг `dropBaseline` со значением по умолчанию `false`,
+  /// и кнопка «Сброс калибровки» в демо звала именно его: стирались только
+  /// недобранные кадры, а решение продолжало приниматься по прежней базе.
+  /// Оператор нажимал «сброс» и видел, что счётчик идёт как ни в чём не
+  /// бывало (замерено 20.11.2026). Прервать текущий шаг и так можно, начав
+  /// другой, — поэтому неотключаемого «мягкого» режима здесь больше нет.
+  ///
+  /// Счётчики ударов не обнуляются: за них отвечает отдельный ⟳, иначе сброс
+  /// калибровки посреди серии терял бы саму серию.
+  void resetCalibration() {
     _calibrating = false;
     _settleLeft = 0;
     final Completer<CalibrationReport>? pending = _calibrationCompleter;
     _calibrationCompleter = null;
     pending?.completeError(StateError('Калибровка сброшена'));
-    _detector.clearCalibration();
-    if (dropBaseline) {
-      _detector.startCalibration();
-      unawaited(settings.clearBaseline());
-    }
+    // Единственный честный путь: `startCalibration` стирает собранные
+    // состояния И базу (`clearBaseline`), а с базой — гистерезис, состояние
+    // «горит» и окно живого отсчёта. Отдельный `clearCalibration` для этого не
+    // годился: он трогал только набор.
+    _detector.startCalibration();
+    unawaited(settings.clearBaseline());
     _stepResult = '';
     _stepError = '';
     _notify(force: true);
@@ -720,7 +785,10 @@ class DetectionSession extends ChangeNotifier {
   /// калибровки (колонка `calibration_step`) — так запись и ведётся; можно
   /// передать готовый [baseline]. В режиме живого отсчёта калибровка не нужна,
   /// поэтому воспроизводится любой файл: «ноль» берётся из тех же строк.
-  Future<List<HitEvent>> replayCsv(String csvContent, {LampBaseline? baseline}) async {
+  Future<List<HitEvent>> replayCsv(
+    String csvContent, {
+    LampBaseline? baseline,
+  }) async {
     final List<FeatureCsvRow> rows = FeatureCsv.decode(csvContent);
     if (rows.isEmpty) {
       return const <HitEvent>[];
@@ -739,22 +807,22 @@ class DetectionSession extends ChangeNotifier {
     return events;
   }
 
-  /// Сравнение двух способов решения по ОДНОЙ записи: цветового и
-  /// пространственно-яркостного. Оба читают одни и те же строки CSV v3, поэтому
-  /// различаются ровно одним фактором, а не двумя прогонами стенда.
+  /// Разбор ОДНОЙ записи (CSV v4 и старых форматов): сколько событий
+  /// она набрала и какие у неё длительности провалов и пауз.
   ///
-  /// Заодно по той же записи измеряются длительности провалов и пауз — те числа,
-  /// которыми задают [LampConfig.offConfirmMs]; без записи их придумывать
-  /// нечем (см. журнал §11).
-  ModeComparison compareModesCsv(String csvContent) =>
-      ModeComparator.compare(csvContent, base: _config);
+  /// Главное здесь — второе: по записи измеряются числа, которыми задают
+  /// [LampConfig.offConfirmMs]; без записи их придумывать нечем (см. журнал §11).
+  RunAnalysis analyzeRecording(String csvContent) =>
+      RunAnalyzer.analyze(csvContent, base: _config);
 
   /// Калибровка из CSV по меткам шагов: по три состояния, как на живом стенде.
   LampBaseline _calibrateFrom(List<FeatureCsvRow> rows) {
     final Map<CalibrationStep, List<LampFrame>> byStep =
         <CalibrationStep, List<LampFrame>>{};
     for (final FeatureCsvRow row in rows) {
-      final CalibrationStep? step = CalibrationStep.fromCsvTag(row.calibrationStep);
+      final CalibrationStep? step = CalibrationStep.fromCsvTag(
+        row.calibrationStep,
+      );
       if (step == null) {
         continue;
       }
@@ -768,20 +836,33 @@ class DetectionSession extends ChangeNotifier {
       );
     }
     final List<String> missing = CalibrationStep.values
-        .where((CalibrationStep s) => (byStep[s] ?? const <LampFrame>[]).isEmpty)
+        .where(
+          (CalibrationStep s) => (byStep[s] ?? const <LampFrame>[]).isEmpty,
+        )
         .map((CalibrationStep s) => '«${s.label}» (шаг ${s.number})')
         .toList();
     if (missing.isNotEmpty) {
-      throw ArgumentError('в CSV нет кадров ${missing.join(', ')} — калибровку '
-          'по такому файлу не восстановить');
+      throw ArgumentError(
+        'в CSV нет кадров ${missing.join(', ')} — калибровку '
+        'по такому файлу не восстановить',
+      );
     }
     return LampBaseline(
-      background: LampCalibration.stateFrom(byStep[CalibrationStep.background]!, _config,
-          step: CalibrationStep.background),
-      whiteOn: LampCalibration.stateFrom(byStep[CalibrationStep.whiteOn]!, _config,
-          step: CalibrationStep.whiteOn),
-      redOn: LampCalibration.stateFrom(byStep[CalibrationStep.redOn]!, _config,
-          step: CalibrationStep.redOn),
+      background: LampCalibration.stateFrom(
+        byStep[CalibrationStep.background]!,
+        _config,
+        step: CalibrationStep.background,
+      ),
+      whiteOn: LampCalibration.stateFrom(
+        byStep[CalibrationStep.whiteOn]!,
+        _config,
+        step: CalibrationStep.whiteOn,
+      ),
+      redOn: LampCalibration.stateFrom(
+        byStep[CalibrationStep.redOn]!,
+        _config,
+        step: CalibrationStep.redOn,
+      ),
       capturedAtMs: rows.last.timestampMs,
       // Условия света восстановляются по первому кадру набора: рабочий прогон
       // по этому baseline должен сброситься, если экспозиция ушла, а без метки
@@ -810,13 +891,16 @@ class DetectionSession extends ChangeNotifier {
   /// как ранее снятые. Сброс срабатывает один раз на перетаскивание — дальше
   /// данных для сброса уже нет.
   void _dropCalibrationOnRoiMove() {
-    final bool hasCalibration = _calibrating ||
+    final bool hasCalibration =
+        _calibrating ||
         _detector.completedCalibrationSteps.isNotEmpty ||
         _detector.isCalibrated;
     if (hasCalibration) {
-      resetCalibration(dropBaseline: true);
-      _report('Рамки сдвинулись — калибровка сброшена. Наведи и жми «1 ФОН»',
-          isError: false);
+      resetCalibration();
+      _report(
+        'Рамки сдвинулись — калибровка сброшена. Наведи и жми «1 ФОН»',
+        isError: false,
+      );
       return;
     }
     // Калибровки нет, сбрасывать нечего — но «пол» живого отсчёта всё равно
@@ -842,7 +926,7 @@ class DetectionSession extends ChangeNotifier {
     LampFrame frame,
   ) {
     final bool wasCalibrated = _detector.isCalibrated;
-    resetCalibration(dropBaseline: true);
+    resetCalibration();
     final String shift = ExposureGuard.describe(
       aNs: previous.ns,
       aGain: previous.gain,
@@ -892,7 +976,10 @@ class DetectionSession extends ChangeNotifier {
   void setFrameMapping(int quarterTurns, {bool mirror = false}) {
     final FrameSource target = source;
     if (target is FrameMappingControl) {
-      (target as FrameMappingControl).setFrameMapping(quarterTurns, mirror: mirror);
+      (target as FrameMappingControl).setFrameMapping(
+        quarterTurns,
+        mirror: mirror,
+      );
     }
     _notify(force: true);
   }
@@ -930,19 +1017,19 @@ class DetectionSession extends ChangeNotifier {
   /// Здесь ровно этот сброс, но без потери прогона: счётчики, id сессии и
   /// номера событий остаются, уходят только окно «пола», гистерезис и состояние
   /// «горит» (а с ним и залипший канал). Пока окно не наберётся, [readiness]
-  /// честно пишет сколько кадров осталось.
+  /// честно пишет сколько допустимых значений осталось.
   ///
   /// Калибровку не трогает: она привязана к рамкам, а не к моменту нажатия.
   void relearnLight() {
     _detector.resetTracking();
-    // Локу экспозиции без калибровки держаться не за что: первый же кадр нового
+    // Лока экспозиции без калибровки держаться не за что: первый же кадр нового
     // набора задаст условия, и прежняя база стала бы выдумкой.
     if (!_detector.isCalibrated) {
       _exposure.clear();
     }
     _report(
       'Перемеряю свет. Держи лампы погашенными, '
-      'осталось кадров: ${_detector.liveWarmupLeft}',
+      'осталось значений: ${_detector.liveWarmupLeft}',
       isError: false,
     );
     _notify(force: true);
@@ -950,6 +1037,7 @@ class DetectionSession extends ChangeNotifier {
 
   /// Включает/выключает запись CSV признаков.
   Future<void> setRecordingCsv(bool on) async {
+    _csvEnabled = on;
     if (on == _recordingCsv) {
       return;
     }
@@ -975,7 +1063,8 @@ class DetectionSession extends ChangeNotifier {
     final DateTime? prev = _prevFrameAt;
     _prevFrameAt = frame.receivedAt;
     if (prev != null) {
-      final double gap = frame.receivedAt.difference(prev).inMicroseconds / 1000.0;
+      final double gap =
+          frame.receivedAt.difference(prev).inMicroseconds / 1000.0;
       if (_avgGapMs > 0 && gap > _avgGapMs * 2.2) {
         final int lost = (gap / _avgGapMs).round() - 1;
         for (int i = 0; i < lost; i++) {
@@ -1011,8 +1100,8 @@ class DetectionSession extends ChangeNotifier {
     // пишутся: иначе replayCsv восстановит состояние по переходным кадрам.
     final bool settlingNow = settling;
     final bool wasCalibrating = _calibrating && !settlingNow;
-    _overexposed = lampFrame.white.meanY >= clipLuma ||
-        lampFrame.red.meanY >= clipLuma;
+    _overexposed =
+        lampFrame.white.meanY >= clipLuma || lampFrame.red.meanY >= clipLuma;
     // Свет — часть измерения, а не обстановка: и эталоны, и «пол» живого
     // отсчёта сняты при конкретной экспозиции. Поймали смену — кадр не
     // оценивается вовсе (скачок сенсора неотличим от вспышки лампы), а
@@ -1063,7 +1152,9 @@ class DetectionSession extends ChangeNotifier {
           );
         }
         try {
-          final CalibrationReport? report = _detector.addCalibrationFrame(lampFrame);
+          final CalibrationReport? report = _detector.addCalibrationFrame(
+            lampFrame,
+          );
           if (report != null) {
             _calibrating = false;
             _settleLeft = 0;
@@ -1119,6 +1210,13 @@ class DetectionSession extends ChangeNotifier {
     );
 
     if (_recordingCsv) {
+      // Диагностика привязана к тому же кадру, что и решение. При калибровке
+      // живой отсчёт не вызывался, поэтому его поля остаются пустыми, а не
+      // повторяют устаревшее состояние предыдущего рабочего кадра.
+      final liveReading = evaluation != null && _config.liveReference
+          ? _detector.liveReading
+          : null;
+      final reference = liveReading == null ? null : _detector.liveDiagnostics;
       unawaited(
         csvRecorder.write(
           FeatureCsvRow(
@@ -1146,6 +1244,15 @@ class DetectionSession extends ChangeNotifier {
             exposureTimeNs: lampFrame.exposureTimeNs,
             sensorSensitivity: lampFrame.sensorSensitivity,
             calibrationStep: wasCalibrating ? stepAtStart.csvTag : '',
+            whiteNet: liveReading?.whiteNet ?? 0,
+            redNet: liveReading?.redNet ?? 0,
+            whiteDarkMs: evaluation?.whiteDarkMs ?? 0,
+            redDarkMs: evaluation?.redDarkMs ?? 0,
+            whiteValid: liveReading?.whiteValid,
+            redValid: liveReading?.redValid,
+            whiteBelowOff: liveReading?.whiteBelowOff,
+            redBelowOff: liveReading?.redBelowOff,
+            reference: reference,
           ),
         ),
       );
@@ -1240,7 +1347,10 @@ class DetectionSession extends ChangeNotifier {
           final DeliveryResult result = await sender.send(event);
           if (!result.success) {
             await repository.markFailed(event.eventId);
-            _report('Доставка ${event.eventId} не удалась: ${result.error}', isError: false);
+            _report(
+              'Доставка ${event.eventId} не удалась: ${result.error}',
+              isError: false,
+            );
             return;
           }
           await repository.markSent(event.eventId);

@@ -1,7 +1,6 @@
-// Пространственный вектор (LampConfig.spatialVectors): решение «какая лампа
-// горит» берут яркость ЧЕТЫРЁХ измеряемых областей и то, КУДА лёг свет. Доли
-// белых и красных пикселей в этих тестах выставлены нарочно враждебно — там,
-// где цвет говорит одно, геометрия обязана сказать другое.
+// Решение «какая лампа горит» берут яркость ЧЕТЫРЁХ измеряемых областей и то,
+// КУДА лёг свет. Доли белых и красных пикселей в этих тестах выставлены нарочно
+// враждебно — там, где цвет сказал бы одно, яркость обязана сказать другое.
 import 'dart:convert' show jsonDecode, jsonEncode;
 import 'dart:math' show min;
 
@@ -79,11 +78,10 @@ LampFrame _whiteTinted() =>
 LampFrame _whiteSpill() =>
     _scene(whiteCore: 200, whiteRing: 120, redCore: 85, redRing: 52, whiteWf: 0.5);
 
-/// Конфиг режима эталонов: решение по измеренным откликам, пространственный
-/// вектор включён, набор шага короткий — синтетика шума не имеет.
-LampConfig _cfg({bool spatial = true, bool rings = true, double ringScale = 1.7}) => LampConfig(
+/// Конфиг режима эталонов: решение по измеренным откликам, набор шага
+/// короткий — синтетика шума не имеет.
+LampConfig _cfg({bool rings = true, double ringScale = 1.7}) => LampConfig(
   liveReference: false,
-  spatialVectors: spatial,
   calibrationFrames: 3,
   ringScale: rings ? ringScale : 1,
 );
@@ -113,7 +111,7 @@ void main() {
   test('пересвеченная красная лампа остаётся красной', () {
     final LampDetector d = _spatial();
     expect(d.isCalibrated, isTrue);
-    expect(d.model!.vector.length, LampVector.spatialLength);
+    expect(d.model!.vector.length, LampVector.coordinateCount);
     expect(d.model!.crosstalk, closeTo(0, 1e-12));
 
     final HitStateMachine m = HitStateMachine(sessionId: 's', idGenerator: () => 'e');
@@ -250,22 +248,12 @@ void main() {
   });
 
   test('вектор подписывает свои координаты', () {
-    expect(LampVector(spatial: true).name(LampVector.redRingMean), contains('кольца красной'));
-    expect(LampVector(spatial: false).name(LampVector.whiteWhiteFrac), contains('whiteFrac'));
-    expect(LampVector(spatial: true).length, 8);
-    expect(LampVector(spatial: false).length, 6);
-  });
-
-  test('прежний вектор остаётся шестимерным и решает по цветам', () {
-    // Старая реализация не удалена: с spatialVectors = false калибровка и
-    // расклад живут ровно так, как жили, и сравнивать их можно на одной записи.
-    final LampConfig config = _cfg(spatial: false);
-    final LampDetector d = LampDetector(config);
-    _state(d, _scene(whiteCore: _bgCore, redCore: _bgCore));
-    _state(d, _scene(whiteWf: 0.4));
-    _state(d, _scene(redRf: 0.3));
-    expect(d.model!.vector.length, LampVector.legacyLength);
-    expect(d.isCalibrated, isTrue);
-    expect(d.evaluate(_scene(whiteWf: 0.4)).whiteAmplitude, greaterThan(0.9));
+    const LampVector v = LampVector();
+    expect(v.name(LampVector.redRingMean), contains('кольца красной'));
+    expect(v.name(LampVector.whiteCoreP90), contains('p90 ядра белой'));
+    expect(v.length, 8);
+    // Координат ровно восемь: четыре области × два числа яркости, цвета в них
+    // нет ни одной.
+    expect(LampVector.coordinateCount, 8);
   });
 }

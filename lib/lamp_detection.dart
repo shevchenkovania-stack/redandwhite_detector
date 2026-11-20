@@ -16,7 +16,7 @@ export 'src/detection/lamp_detector.dart';
 export 'src/detection/response_model.dart';
 export 'src/diagnostics/diagnostics_collector.dart';
 export 'src/diagnostics/feature_csv_recorder.dart';
-export 'src/diagnostics/mode_comparator.dart';
+export 'src/diagnostics/run_analyzer.dart';
 export 'src/models/frame_features.dart';
 export 'src/models/hit_event.dart';
 export 'src/models/lamp_config.dart';

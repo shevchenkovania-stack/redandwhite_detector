@@ -146,23 +146,6 @@ void main() {
       expect(events.single.color, HitColor.red);
     });
 
-    test('10b. Прежний способ: яркие, но НЕ белые пиксели белой не считаются', () {
-      // Кадр физически противоречивый: чужая рамка поднялась ЯРЧЕ своей, так
-      // что яркостью источник не назвать. Он проверяет именно цветовое
-      // решение (spatialVectors = false), где «белый» пиксель — это min(R,G,B)
-      // над порогом, а не просто светло.
-      final Harness h = Harness(
-        config: const LampConfig(liveReference: false, spatialVectors: false),
-      );
-      final List<HitEvent> events = h.feedAll(
-        h.scene.sequence(6, white: scene.whiteTintedByRed, red: scene.redOn, startIndex: 90),
-      );
-
-      expect(events.where((HitEvent e) => e.color == HitColor.white), isEmpty);
-      expect(events, hasLength(1));
-      expect(events.single.color, HitColor.red);
-    });
-
     test('11. Обе лампы горят одновременно: ДВА независимых события', () {
       final Harness h = Harness();
       final List<HitEvent> events = h.feedAll(

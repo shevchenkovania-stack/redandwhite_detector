@@ -3,11 +3,11 @@ import 'package:lamp_detection/lamp_detection.dart';
 
 import 'support/session_fakes.dart';
 
-/// Сравнение двух способов решения на ОДНОЙ записи (инструкция, п. 11 этап D,
-/// критерий 4). Ценность компаратора в том, что оба способа читают те же
-/// строки: расхождение может быть только от способа, а не от второго прогона
-/// стенда. Заодно по тем же строкам измеряются длительности провалов и пауз —
-/// единственные числа, которыми задают `offConfirmMs` вместо догадки.
+/// Разбор записанной серии (CSV v3) нынешним способом решения. Ценность
+/// разбора в том, что он читает РОВНО ТЕ ЖЕ измеренные строки, что и живой
+/// стенд: ни второго прогона, ни другой выборки. Заодно по тем же строкам
+/// измеряются длительности провалов и пауз — единственные числа, которыми
+/// задают `offConfirmMs` вместо догадки.
 void main() {
   FrameFeatures field(
     double meanY, {
@@ -15,15 +15,14 @@ void main() {
     double redFrac = 0.03,
     double? p90,
     double clip = 0,
-  }) =>
-      FrameFeatures(
-        meanY: meanY,
-        sampleCount: 400,
-        whiteFrac: whiteFrac,
-        redFrac: redFrac,
-        p90Luma: p90 ?? meanY + 2,
-        clippedRatio: clip,
-      );
+  }) => FrameFeatures(
+    meanY: meanY,
+    sampleCount: 400,
+    whiteFrac: whiteFrac,
+    redFrac: redFrac,
+    p90Luma: p90 ?? meanY + 2,
+    clippedRatio: clip,
+  );
 
   /// Кадр: красная рамка показывает [red], белая — фон.
   FeatureCsvRow row(
@@ -31,47 +30,51 @@ void main() {
     FrameFeatures? red,
     FrameFeatures? white,
     int frameMs = 33,
-  }) =>
-      FeatureCsvRow(
-        timestampMs: 1000 + index * frameMs,
-        white: white ?? field(60),
-        red: red ?? field(50),
-        state: 'working',
-      );
+  }) => FeatureCsvRow(
+    timestampMs: 1000 + index * frameMs,
+    white: white ?? field(60),
+    red: red ?? field(50),
+    state: 'working',
+  );
 
   final List<FeatureCsvRow> background = List<FeatureCsvRow>.generate(
     10,
     (int i) => row(i),
   );
 
-  group('Сравнение способов по записи', () {
-    test('пересвет: цвет его не видит, яркость — да', () {
-      // Красная лампа на клиппинге: доли красных пикселей почти не сдвигаются —
-      // цветовой способ пропускает вспышку, яркостный её считает.
+  group('Разбор записи', () {
+    test('пересвет красной лампы не уезжает в белую корзину', () {
+      // Красная лампа на клиппинге: цветовых «красных» пикселей в ней почти не
+      // осталось (пересвеченный колпак для сенсора белый). Решение берётся из
+      // того, КУДА поднялась яркость, — поэтому событие красное, а не белое.
       final List<FeatureCsvRow> rows = <FeatureCsvRow>[
         ...background,
         ...List<FeatureCsvRow>.generate(
           6,
           (int i) => row(
             10 + i,
-            red: field(250, whiteFrac: 0.06, redFrac: 0.05, p90: 255, clip: 0.6),
+            red: field(
+              250,
+              whiteFrac: 0.06,
+              redFrac: 0.05,
+              p90: 255,
+              clip: 0.6,
+            ),
           ),
         ),
         ...List<FeatureCsvRow>.generate(6, (int i) => row(16 + i)),
       ];
 
-      final ModeComparison c = ModeComparator.compare(FeatureCsv.encode(rows));
+      final RunAnalysis a = RunAnalyzer.analyze(FeatureCsv.encode(rows));
 
-      expect(c.frames, rows.length);
-      expect(c.medianFrameMs, 33);
-      expect(c.legacyRedEvents, 0);
-      expect(c.spatialRedEvents, 1);
-      expect(c.countsAgree, isFalse);
-      expect(c.mismatches, isNotEmpty);
-      expect(c.describe(), contains('РАЗОШЛОСЬ'));
+      expect(a.frames, rows.length);
+      expect(a.medianFrameMs, 33);
+      expect(a.redEvents, 1);
+      expect(a.whiteEvents, 0);
+      expect(a.describe(), contains('красная'));
     });
 
-    test('обычная вспышка: способы совпадают, пауза и провал измерены', () {
+    test('вспышка с провалом и пауза между ударами: числа измерены', () {
       final FrameFeatures flash = field(
         150,
         whiteFrac: 0.04,
@@ -92,13 +95,12 @@ void main() {
         ...List<FeatureCsvRow>.generate(6, (int i) => row(31 + i)),
       ];
 
-      final ModeComparison c = ModeComparator.compare(FeatureCsv.encode(rows));
+      final RunAnalysis a = RunAnalyzer.analyze(FeatureCsv.encode(rows));
 
-      expect(c.legacyRedEvents, c.spatialRedEvents);
-      expect(c.spatialRedEvents, 2);
-      expect(c.spatialWhiteEvents, 0);
+      expect(a.redEvents, 2);
+      expect(a.whiteEvents, 0);
 
-      final DarkRunTiming red = c.redTiming;
+      final DarkRunTiming red = a.redTiming;
       expect(red.dipsMs, isNotEmpty);
       expect(red.pausesMs, isNotEmpty);
       expect(red.separable, isTrue);
@@ -106,7 +108,7 @@ void main() {
       // два. Проверка ровно этого, без новых чисел.
       expect(red.suggestedOffConfirmMs, greaterThan(red.maxDipMs));
       expect(red.suggestedOffConfirmMs, lessThan(red.minPauseMs));
-      expect(c.describe(), contains('красная'));
+      expect(a.describe(), contains('красная'));
     });
   });
 
@@ -148,26 +150,41 @@ void main() {
       return (events: events, frames: seen, rawBytes: rawBytes);
     }
 
-    test('вспышка считается и без тени, и с тенью, и со сломанной тенью', () async {
-      final ({int events, int frames, int rawBytes}) plain =
-          await run(probe: Probe.none);
-      expect(plain.events, 1, reason: 'вспышка белой обязана дать одно событие');
+    test(
+      'вспышка считается и без тени, и с тенью, и со сломанной тенью',
+      () async {
+        final ({int events, int frames, int rawBytes}) plain = await run(
+          probe: Probe.none,
+        );
+        expect(
+          plain.events,
+          1,
+          reason: 'вспышка белой обязана дать одно событие',
+        );
 
-      final ({int events, int frames, int rawBytes}) watched =
-          await run(probe: Probe.watch);
-      expect(watched.events, plain.events);
-      expect(watched.frames, 18, reason: 'тень обязана видеть все обработанные кадры');
-      expect(
-        watched.rawBytes,
-        64 * 64 * 4,
-        reason: 'тени отдан тот же кадр в пикселях, что и рабочему экстрактору',
-      );
+        final ({int events, int frames, int rawBytes}) watched = await run(
+          probe: Probe.watch,
+        );
+        expect(watched.events, plain.events);
+        expect(
+          watched.frames,
+          18,
+          reason: 'тень обязана видеть все обработанные кадры',
+        );
+        expect(
+          watched.rawBytes,
+          64 * 64 * 4,
+          reason:
+              'тени отдан тот же кадр в пикселях, что и рабочему экстрактору',
+        );
 
-      // Падение тени не имеет права ни уронить прогон, ни изменить его итог.
-      final ({int events, int frames, int rawBytes}) broken =
-          await run(probe: Probe.broken);
-      expect(broken.events, plain.events);
-    });
+        // Падение тени не имеет права ни уронить прогон, ни изменить его итог.
+        final ({int events, int frames, int rawBytes}) broken = await run(
+          probe: Probe.broken,
+        );
+        expect(broken.events, plain.events);
+      },
+    );
   });
 }
 

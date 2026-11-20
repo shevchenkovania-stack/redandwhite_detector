@@ -146,7 +146,10 @@ class OpenCvFeatureExtractor {
   });
 
   /// Те же рамки, ореолы и пороги цвета, что у рабочего экстрактора.
-  final LampConfig config;
+  /// Не final: датчик-подкласс (`OpenCvSensorExtractor`) переприсваивает его
+  /// при смене конфига сессией, чтобы пороги не отставали от порогов
+  /// основного конвейера.
+  LampConfig config;
 
   /// Нечётный размер гауссова ядра; меньше 3 = без сглажения.
   final int blurKernelSize;
@@ -167,6 +170,11 @@ class OpenCvFeatureExtractor {
 
   cv.Mat? _previous;
 
+  /// Почему последний кадр не удалось измерить. Пусто — всё посчитано.
+  /// Нужно, чтобы отказ был виден в логе как причина, а не как молчаливый
+  /// возврат к Dart-измерителю.
+  String? lastFailure;
+
   /// Измерить кадр. Null, если формата, который умеет OpenCV, в кадре нет.
   ///
   /// YUV420 берётся как есть: плоскость Y у камеры — те же оттенки серого, что
@@ -182,8 +190,10 @@ class OpenCvFeatureExtractor {
     final List<String> notes = <String>[];
     final _Plane? plane = _toGray(frame, notes);
     if (plane == null) {
+      lastFailure = notes.join('; ');
       return null;
     }
+    lastFailure = null;
     final int width = plane.mat.cols;
     final int height = plane.mat.rows;
     final cv.Mat blurred = _blur(plane.mat);
@@ -289,8 +299,13 @@ class OpenCvFeatureExtractor {
           return null;
         }
         final int stride = frame.lumaStride ?? frame.width;
-        if (luma.length < stride * frame.height) {
-          notes.add('плоскость Y короче кадра');
+        // Camera2 отдаёт YUV-плоскость размером (height-1)*stride + width:
+        // последняя строка НЕ имеет хвостового паддинга. Требовать
+        // stride*height — значит ошибочно выбрасывать каждый кадр Pixel.
+        if (luma.length < (frame.height - 1) * stride + frame.width) {
+          notes.add(
+            'плоскость Y короче кадра: ${luma.length} < ${(frame.height - 1) * stride + frame.width}',
+          );
           return null;
         }
         if (stride == frame.width) {
@@ -318,8 +333,11 @@ class OpenCvFeatureExtractor {
           notes.add('упаковка BGRA с pixelStride $pixelStride ≠ 4');
           return null;
         }
-        if (pixels.length < stride * frame.height) {
-          notes.add('буфер пикселей короче кадра');
+        // Как и у Y-плоскости: последняя строка без хвостового паддинга.
+        if (pixels.length < (frame.height - 1) * stride + frame.width * 4) {
+          notes.add(
+            'буфер пикселей короче кадра: ${pixels.length} < ${(frame.height - 1) * stride + frame.width * 4}',
+          );
           return null;
         }
         final Uint8List packedBytes;

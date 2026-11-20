@@ -125,17 +125,16 @@ class FeatureExtractor {
   /// Признаки обеих ламп одного кадра. [roi] задан в координатах превью и
   /// переносится в координаты кадра через [mapping].
   ///
-  /// Кольца вокруг рамок считаются в двух случаях. В режиме живого отсчёта —
-  /// потому что у настоящих ламп светит ореол, а колпак при включении может
-  /// даже побледнеть (замер: колпак 0.727 → 0.630, ореол 0.007 → 0.811), и
-  /// одной центральной зоны физически не хватает. В пространственном векторе —
-  /// потому что для него ореол и есть вторая измеряемая область: без неё
-  /// восьмимерное решение молча съезжается до яркости двух колпаков.
+  /// Кольцо вокруг рамки считается всегда, когда включён `ringScale > 1`. На это
+  /// есть две причины, и обе настоящие: у ламп светит ореол, а колпак при
+  /// включении может даже побледнеть (замер: колпак 0.727 → 0.630, ореол
+  /// 0.007 → 0.811), поэтому одной центральной зоне не веришь; и для самого
+  /// решения ореол — вторая измеряемая область, без которой восьмимерный вектор
+  /// молча съезжается до яркости двух колпаков.
   LampFrame extract(RawLampFrame frame, RoiLayout roi, FrameMapping mapping) {
     final LampRoi white = mapping.toFrameRoi(roi.white);
     final LampRoi red = mapping.toFrameRoi(roi.red);
-    final bool withRing =
-        (config.liveReference || config.spatialVectors) && config.ringScale > 1;
+    final bool withRing = config.ringScale > 1;
     final FrameFeatures whiteCore = extractRoi(frame, white);
     final FrameFeatures redCore = extractRoi(frame, red);
     return LampFrame(

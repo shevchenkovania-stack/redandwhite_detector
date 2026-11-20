@@ -1,11 +1,17 @@
 import 'dart:convert' show LineSplitter;
 import 'dart:io';
 
+import '../detection/live_reference.dart';
 import '../models/frame_features.dart';
 
 /// Одна строка CSV диагностики.
 ///
-/// Формат v3 (41 колонка). Колонки 0–26 — формат v2 без изменений:
+/// Формат v4 (65 колонок). Колонки 0–40 — формат v3 без изменений,
+/// колонки 41–64 сохраняют внутреннее состояние живого отсчёта: `net`,
+/// длительность провала, готовность каналов, значения/«пол»/σ окон, счётчик
+/// общего света и номер с причиной последнего сброса.
+///
+/// Колонки 0–26 — формат v2 без изменений:
 /// `timestamp_ms, white_meanY, red_meanY, state, white_whiteFrac,
 /// red_redFrac, white_redFrac, red_whiteFrac, calibration_step,
 /// white_ring_whiteFrac, white_ring_redFrac, red_ring_whiteFrac,
@@ -32,7 +38,7 @@ import '../models/frame_features.dart';
 /// больше не участвуют, но без них нельзя сравнить старый и новый алгоритм на
 /// ОДНОЙ записи — а другого способа сравнить их на стенде нет.
 ///
-/// Старые файлы читаются по числу колонок: 27–40 — формат v2 (яркостных
+/// Старые файлы читаются по числу колонок: 41–64 — v3, 27–40 — v2 (яркостных
 /// признаков в нём нет, они считаются нулём), 10–26 — формат v1
 /// (`brightFrac`/`sat`/`redDom`/`coreEdgeDiff`, если 10, или прежние шесть),
 /// кольца и решение по ним считаются нулём; 6–9 — прежние колонки рамок.
@@ -59,6 +65,15 @@ class FeatureCsvRow {
     this.exposureTimeNs,
     this.sensorSensitivity,
     this.calibrationStep = '',
+    this.whiteNet = 0,
+    this.redNet = 0,
+    this.whiteDarkMs = 0,
+    this.redDarkMs = 0,
+    this.whiteValid,
+    this.redValid,
+    this.whiteBelowOff,
+    this.redBelowOff,
+    this.reference,
   });
 
   static const String header =
@@ -69,10 +84,16 @@ class FeatureCsvRow {
       'off_white,off_red,ambiguous,unexplained,exposure_ns,sensitivity,'
       'white_p90,white_std,white_clip,red_p90,red_std,red_clip,'
       'white_ring_meanY,white_ring_p90,white_ring_std,white_ring_clip,'
-      'red_ring_meanY,red_ring_p90,red_ring_std,red_ring_clip';
+      'red_ring_meanY,red_ring_p90,red_ring_std,red_ring_clip,'
+      'white_net,red_net,white_dark_ms,red_dark_ms,white_valid,red_valid,'
+      'white_below_off,red_below_off,white_core_samples,white_ring_samples,'
+      'red_core_samples,red_ring_samples,white_core_floor,white_ring_floor,'
+      'red_core_floor,red_ring_floor,white_core_sigma,white_ring_sigma,'
+      'red_core_sigma,red_ring_sigma,warmup_left,common_run,reset_seq,reset_reason';
 
-  /// Число колонок формата v3: короче строка — записана старой сборкой.
-  static const int currentColumnCount = 41;
+  /// Число колонок формата v4: короче строка — записана старой сборкой.
+  static const int currentColumnCount = 65;
+  static const int columnsV3 = 41;
 
   /// Число колонок формата v2: яркость областей в нём ещё не писалась, но
   /// индексы 0–26 совпадают с v3, поэтому читается тем же разбором.
@@ -114,6 +135,20 @@ class FeatureCsvRow {
 
   /// Метка шага калибровки, к которому относится кадр, — пусто для прогона.
   final String calibrationStep;
+
+  /// Вход гистерезиса и длительность текущего провала. В v3 их не было,
+  /// поэтому по событию OFF нельзя было восстановить причину перехода.
+  final double whiteNet;
+  final double redNet;
+  final int whiteDarkMs;
+  final int redDarkMs;
+
+  /// Null — живой отсчёт в этом кадре не выполнялся или запись старая.
+  final bool? whiteValid;
+  final bool? redValid;
+  final bool? whiteBelowOff;
+  final bool? redBelowOff;
+  final LiveReferenceDiagnostics? reference;
 
   String toCsvLine() => <Object>[
     timestampMs,
@@ -157,11 +192,36 @@ class FeatureCsvRow {
     _lum(redRing?.p90Luma),
     _lum(redRing?.lumaStdDev),
     _frac(redRing?.clippedRatio),
+    whiteNet.toStringAsFixed(5),
+    redNet.toStringAsFixed(5),
+    whiteDarkMs,
+    redDarkMs,
+    _optionalBit(whiteValid),
+    _optionalBit(redValid),
+    _optionalBit(whiteBelowOff),
+    _optionalBit(redBelowOff),
+    reference?.whiteCoreSamples ?? '',
+    reference?.whiteRingSamples ?? '',
+    reference?.redCoreSamples ?? '',
+    reference?.redRingSamples ?? '',
+    _frac(reference?.whiteCoreFloor),
+    _frac(reference?.whiteRingFloor),
+    _frac(reference?.redCoreFloor),
+    _frac(reference?.redRingFloor),
+    _frac(reference?.whiteCoreSigma),
+    _frac(reference?.whiteRingSigma),
+    _frac(reference?.redCoreSigma),
+    _frac(reference?.redRingSigma),
+    reference?.warmupLeft ?? '',
+    reference?.commonRun ?? '',
+    reference?.resetSequence ?? '',
+    reference?.resetReason ?? '',
   ].join(',');
 
   static String _frac(double? v) => v?.toStringAsFixed(5) ?? '';
   static String _lum(double? v) => v?.toStringAsFixed(2) ?? '';
   static String _bit(bool v) => v ? '1' : '0';
+  static String _optionalBit(bool? v) => v == null ? '' : _bit(v);
 
   /// Кадр для прогона детектора без камеры. Кольца обязательно едут вместе с
   /// рамками: в живом отсчёте решение принимает именно кольцо.
@@ -180,21 +240,26 @@ class FeatureCsvRow {
     if (c.length < 6) {
       throw FormatException('Строка CSV должна содержать не меньше 6 полей: "$line"');
     }
-    final bool v3 = c.length >= currentColumnCount;
-    // Индексы 0–26 у v3 и v2 совпадают, поэтому всё, что записано до
-    // `sensitivity`, читается одним и тем же условием `modern`.
-    final bool v2 = !v3 && c.length >= columnsV2;
-    final bool modern = v3 || v2;
+    final bool v4 = c.length >= currentColumnCount;
+    final bool v3 = !v4 && c.length >= columnsV3;
+    // Индексы 0–26 у всех современных форматов совпадают, поэтому всё, что
+    // записано до `sensitivity`, читается одним условием `modern`.
+    final bool v2 = !v4 && !v3 && c.length >= columnsV2;
+    final bool modern = v4 || v3 || v2;
     final bool legacy = !modern && c.length >= 10;
     final bool v0 = !modern && !legacy && c.length >= 9;
     double d(int i) => double.parse(c[i]);
     // Недостаток колонок = признак не записывался: 0 честнее, чем догадка.
     double opt(int i) => i < c.length ? double.parse(c[i]) : 0;
     double? num(int i) => modern && c[i].isNotEmpty ? double.parse(c[i]) : null;
-    double? lum(int i) => v3 && c[i].isNotEmpty ? double.parse(c[i]) : null;
+    double? num4(int i) => v4 && c[i].isNotEmpty ? double.parse(c[i]) : null;
+    double? lum(int i) =>
+        (v4 || v3) && c[i].isNotEmpty ? double.parse(c[i]) : null;
     double val(int i) => lum(i) ?? 0;
     int? int_(int i) => modern && c[i].isNotEmpty ? int.parse(c[i]) : null;
+    int? int4(int i) => v4 && c[i].isNotEmpty ? int.parse(c[i]) : null;
     bool bit(int i) => modern && c[i] == '1';
+    bool? bit4(int i) => v4 && c[i].isNotEmpty ? c[i] == '1' : null;
     FrameFeatures? ring(int w, int r, int y, int p, int s, int cl) =>
         modern && (c[w].isNotEmpty || c[r].isNotEmpty)
             ? FrameFeatures(
@@ -245,6 +310,34 @@ class FeatureCsvRow {
       exposureTimeNs: int_(25),
       sensorSensitivity: num(26),
       calibrationStep: modern || v0 ? c[8].trim() : '',
+      whiteNet: num4(41) ?? 0,
+      redNet: num4(42) ?? 0,
+      whiteDarkMs: int4(43) ?? 0,
+      redDarkMs: int4(44) ?? 0,
+      whiteValid: bit4(45),
+      redValid: bit4(46),
+      whiteBelowOff: bit4(47),
+      redBelowOff: bit4(48),
+      reference: v4
+          ? LiveReferenceDiagnostics(
+              whiteCoreSamples: int4(49) ?? 0,
+              whiteRingSamples: int4(50) ?? 0,
+              redCoreSamples: int4(51) ?? 0,
+              redRingSamples: int4(52) ?? 0,
+              whiteCoreFloor: num4(53),
+              whiteRingFloor: num4(54),
+              redCoreFloor: num4(55),
+              redRingFloor: num4(56),
+              whiteCoreSigma: num4(57) ?? 0,
+              whiteRingSigma: num4(58) ?? 0,
+              redCoreSigma: num4(59) ?? 0,
+              redRingSigma: num4(60) ?? 0,
+              warmupLeft: int4(61) ?? 0,
+              commonRun: int4(62) ?? 0,
+              resetSequence: int4(63) ?? 0,
+              resetReason: c[64],
+            )
+          : null,
     );
   }
 }

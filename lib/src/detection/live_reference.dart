@@ -21,9 +21,15 @@ class RollingFloor {
   final double percentile;
 
   final List<double> _values = <double>[];
+  final List<double> _observed = <double>[];
   final List<double> _scratch;
 
   int get count => _values.length;
+
+  /// Сколько реальных значений нужно до первого решения.
+  int get needed => (window * 0.5).ceil();
+  int get missing => count < needed ? needed - count : 0;
+  bool get ready => missing == 0;
 
   void add(double value) {
     _values.add(value);
@@ -32,13 +38,39 @@ class RollingFloor {
     }
   }
 
-  void reset() => _values.clear();
+  void reset() {
+    _values.clear();
+    _observed.clear();
+  }
 
-  /// Нижняя граница признака по последним кадрам.
-  double get floor {
+  /// Все значения зоны за то же окно, включая яркие и пересвеченные: по ним
+  /// меряется РАЗМАХ канала (пик минус «пол»), а не только его тёмное состояние.
+  void observe(double value) {
+    _observed.add(value);
+    if (_observed.length > window) {
+      _observed.removeAt(0);
+    }
+  }
+
+  /// Наибольшее значение зоны за окно. Null — зону ещё не видели ни разу.
+  double? get peak {
+    if (_observed.isEmpty) {
+      return null;
+    }
+    double result = _observed.first;
+    for (final double value in _observed) {
+      if (value > result) {
+        result = value;
+      }
+    }
+    return result;
+  }
+
+  /// Нижняя граница по набранным значениям. Пустое окно — не ноль, а неизвестность.
+  double? get floor {
     final int n = _values.length;
     if (n == 0) {
-      return 0;
+      return null;
     }
     for (int i = 0; i < n; i++) {
       _scratch[i] = _values[i];
@@ -72,14 +104,14 @@ class RollingFloor {
     return math.sqrt(squares / (n - 1));
   }
 
-  /// Насколько признак выше «пола».
-  double rise(double value) => (value - floor).clamp(0.0, 1.0);
-
-  /// Насколько признак УПАЛ под «пол». Нужно для того же ореола: у настоящей
-  /// лампы колпак при включении может побледнеть (замер redFrac 0.727 → 0.630,
-  /// ядро выжжено в оранжево-белое), и движение в любую сторону доказывает,
-  /// что лампа реагирует.
-  double drop(double value) => (floor - value).clamp(0.0, 1.0);
+  /// Подъём считается только по достаточному окну; иначе решения ещё нет.
+  double? rise(double value) {
+    final double? reference = floor;
+    if (!ready || reference == null) {
+      return null;
+    }
+    return (value - reference).clamp(0.0, 1.0);
+  }
 }
 
 /// Решение по одному кадру в режиме живого отсчёта.
@@ -94,6 +126,8 @@ class LiveReading {
     required this.whiteBelowOff,
     required this.redBelowOff,
     required this.warm,
+    required this.whiteValid,
+    required this.redValid,
     this.whiteNet = 0,
     this.redNet = 0,
   });
@@ -105,9 +139,11 @@ class LiveReading {
     redLevel: 0,
     whiteAboveOn: false,
     redAboveOn: false,
-    whiteBelowOff: true,
-    redBelowOff: true,
+    whiteBelowOff: false,
+    redBelowOff: false,
     warm: false,
+    whiteValid: false,
+    redValid: false,
   );
 
   /// Подъём над «полом» своей доли: максимум по колпаку и ореолу.
@@ -129,10 +165,58 @@ class LiveReading {
   final bool whiteBelowOff;
   final bool redBelowOff;
 
-  /// Окно ещё не набрано: решения не выдаются, чтобы первый же кадр не стал
-  /// «вспышкой» из-за нулевого «пола». Ниже OFF — канал в прогреве считается
-  /// погасшим, иначе он мог бы залипнуть в «горит» и молчать весь прогон.
+  /// Достаточно ли СВОИХ значений в окне, чтобы двигать этот канал. Невалидный
+  /// кадр не означает ни ON, ни OFF: гистерезис сохраняет прежнее состояние.
+  final bool whiteValid;
+  final bool redValid;
+
+  /// Оба канала набрали достаточные окна. По отдельности готовность смотрится
+  /// через [whiteValid] и [redValid].
   final bool warm;
+}
+
+/// Внутреннее состояние окон живого отсчёта для сохраняемой диагностики.
+/// Это измерения, а не очередное решение: по ним видно, что стало с фоном
+/// после движения телефона и на каком кадре окно было сброшено.
+class LiveReferenceDiagnostics {
+  const LiveReferenceDiagnostics({
+    required this.whiteCoreSamples,
+    required this.whiteRingSamples,
+    required this.redCoreSamples,
+    required this.redRingSamples,
+    required this.whiteCoreFloor,
+    required this.whiteRingFloor,
+    required this.redCoreFloor,
+    required this.redRingFloor,
+    required this.whiteCoreSigma,
+    required this.whiteRingSigma,
+    required this.redCoreSigma,
+    required this.redRingSigma,
+    required this.warmupLeft,
+    required this.commonRun,
+    required this.resetSequence,
+    required this.resetReason,
+  });
+
+  final int whiteCoreSamples;
+  final int whiteRingSamples;
+  final int redCoreSamples;
+  final int redRingSamples;
+  final double? whiteCoreFloor;
+  final double? whiteRingFloor;
+  final double? redCoreFloor;
+  final double? redRingFloor;
+  final double whiteCoreSigma;
+  final double whiteRingSigma;
+  final double redCoreSigma;
+  final double redRingSigma;
+  final int warmupLeft;
+  final int commonRun;
+
+  /// Номер растёт только в кадре сброса: причина остаётся, номер показывает,
+  /// что это была за точка записи, а не продолжающийся сброс на каждом кадре.
+  final int resetSequence;
+  final String resetReason;
 }
 
 /// Живой отсчёт: «ноль» берётся из последних кадров, а не из калибровки.
@@ -151,13 +235,11 @@ class LiveReading {
 ///
 /// 1. **Изменился ли свет** — подъём над «полом» своей зоны и её ореола
 ///    ([RollingFloor]). Ему всё равно, какой природы свет.
-/// 2. **Какой физический источник его создал** — в цветовом режиме это доля
-///    «своих» пикселей, в пространственном ([LampConfig.spatialVectors]) —
-///    яркость четырёх измеряемых областей и асимметрия между ними.
+/// 2. **Какой физический источник его создал** — яркость четырёх измеряемых
+///    областей и асимметрия между ними.
 ///
-/// Во втором режиме цвет в решении не участвует вовсе: пересвеченная красная
-/// лампа для сенсора белая, но ложится её свет вокруг КРАСНОЙ рамки, и это
-/// различимо всегда.
+/// Цвет в решении не участвует вовсе: пересвеченная красная лампа для сенсора
+/// белая, но ложится её свет вокруг КРАСНОЙ рамки, и это различимо всегда.
 class LiveReference {
   LiveReference(LampConfig config) : _config = config {
     _build();
@@ -166,20 +248,15 @@ class LiveReference {
   LampConfig _config;
 
   set config(LampConfig value) {
-    // Смена способа решения меняет МЕРЯЕМУЮ величину (долю пикселей — на
-    // яркость области), поэтому окно обязано начаться заново: усреднять их
-    // вместе — это вывести «пол» по каше из величин разной природы.
+    // Меняются окно или процентиль — меняется сама измеряемая величина, поэтому
+    // окно обязано начаться заново: усреднять прежнее и новое вместе — это
+    // вывести «пол» по каше из величин разной природы.
     final bool rebuild =
         value.referenceWindowFrames != _config.referenceWindowFrames ||
-        value.referencePercentile != _config.referencePercentile ||
-        value.spatialVectors != _config.spatialVectors;
+        value.referencePercentile != _config.referencePercentile;
     _config = value;
     if (rebuild) {
-      _build();
-      _frames = 0;
-      _commonRun = 0;
-      _unstableRun = 0;
-      _last = LiveReading.warmup;
+      _resetWindow('config');
     }
   }
 
@@ -190,33 +267,32 @@ class LiveReference {
 
   int _frames = 0;
 
-  /// Сколько кадров подряд порог упирается в потолок [LampConfig.referenceMaxLevel].
-  /// Это не лампы, а камера, гуляющая по сцене: окно с таким шумом не описывает
-  /// темноту, и решение по нему выдавать нечем.
-  int _unstableRun = 0;
-
   /// Сколько кадров подряд растут ОБЕ рамки — кандидат на смену сцены.
   int _commonRun = 0;
   LiveReading _last = LiveReading.warmup;
+  String _lastResetReason = 'start';
+  int _resetSequence = 0;
+  bool _hasWhiteRing = false;
+  bool _hasRedRing = false;
 
   LiveReading get last => _last;
 
   /// Был ли уже хотя бы один кадр: до него порога показывать нечего.
   bool get hasReading => _frames > 0;
 
-  /// Сколько кадров ещё нужно, чтобы окно считалось набранным.
+  /// Сколько РЕАЛЬНЫХ значений ещё нужно до готовности каналов. Каналу
+  /// достаточно ОДНОЙ набранной зоны (колпак или ореол), поэтому из двух зон
+  /// берётся меньший остаток, а не больший.
   int get warmupLeft {
-    final int need = (_config.referenceWindowFrames * 0.5).ceil();
-    return need > _frames ? need - _frames : 0;
+    int channelMissing(RollingFloor core, RollingFloor ring, bool hasRing) =>
+        hasRing ? math.min(core.missing, ring.missing) : core.missing;
+    return math.max(
+      channelMissing(_whiteCore, _whiteRing, _hasWhiteRing),
+      channelMissing(_redCore, _redRing, _hasRedRing),
+    );
   }
 
-  void reset() {
-    _build();
-    _frames = 0;
-    _commonRun = 0;
-    _unstableRun = 0;
-    _last = LiveReading.warmup;
-  }
+  void reset() => _resetWindow('manual');
 
   void _build() {
     final int window = _config.referenceWindowFrames;
@@ -225,6 +301,58 @@ class LiveReference {
     _whiteRing = RollingFloor(window: window, percentile: percentile);
     _redCore = RollingFloor(window: window, percentile: percentile);
     _redRing = RollingFloor(window: window, percentile: percentile);
+    _hasWhiteRing = false;
+    _hasRedRing = false;
+  }
+
+  void _resetWindow(String reason) {
+    _build();
+    _frames = 0;
+    _commonRun = 0;
+    _last = LiveReading.warmup;
+    _lastResetReason = reason;
+    _resetSequence++;
+  }
+
+  LiveReferenceDiagnostics get diagnostics => LiveReferenceDiagnostics(
+    whiteCoreSamples: _whiteCore.count,
+    whiteRingSamples: _whiteRing.count,
+    redCoreSamples: _redCore.count,
+    redRingSamples: _redRing.count,
+    whiteCoreFloor: _whiteCore.floor,
+    whiteRingFloor: _whiteRing.floor,
+    redCoreFloor: _redCore.floor,
+    redRingFloor: _redRing.floor,
+    whiteCoreSigma: _whiteCore.sigma,
+    whiteRingSigma: _whiteRing.sigma,
+    redCoreSigma: _redCore.sigma,
+    redRingSigma: _redRing.sigma,
+    warmupLeft: warmupLeft,
+    commonRun: _commonRun,
+    resetSequence: _resetSequence,
+    resetReason: _lastResetReason,
+  );
+
+  /// Состояние окон одной короткой строкой для LAMPDBG.
+  String get debugTag {
+    String number(double? value) => value?.toStringAsFixed(3) ?? '-';
+    String span(RollingFloor ref) {
+      final double? floor = ref.floor;
+      final double? peak = ref.peak;
+      return floor == null || peak == null
+          ? '-'
+          : (peak - floor).toStringAsFixed(3);
+    }
+
+    return 'ref samples W=${_whiteCore.count}/${_whiteRing.count} '
+        'R=${_redCore.count}/${_redRing.count} '
+        'floor W=${number(_whiteCore.floor)}/${number(_whiteRing.floor)} '
+        'R=${number(_redCore.floor)}/${number(_redRing.floor)} '
+        'sigma W=${_whiteCore.sigma.toStringAsFixed(3)}/${_whiteRing.sigma.toStringAsFixed(3)} '
+        'R=${_redCore.sigma.toStringAsFixed(3)}/${_redRing.sigma.toStringAsFixed(3)} '
+        'span W=${span(_whiteCore)}/${span(_whiteRing)} '
+        'R=${span(_redCore)}/${span(_redRing)} '
+        'reset=$_lastResetReason left=$warmupLeft';
   }
 
   /// Оценивает кадр, затем добавляет его в окно: «пол» всегда описывает
@@ -236,96 +364,103 @@ class LiveReference {
   /// двигаются, затем окно начинается заново и «пол» берётся уже из новой
   /// сцены. Поэтому перекалибровка при смене картинок не нужна.
   LiveReading step(LampFrame frame) {
-    final bool spatial = _config.spatialVectors;
-    // Чем именно меряется зона. В цветовом режиме это доля «своих» пикселей, в
-    // пространственном — верхний процентиль яркости той же области, приведённый
-    // к 0..1, чтобы порог окна ([_level]: `referenceNoiseSigmas` × σ и
+    // Чем меряется зона: верхний процентиль яркости области, приведённый к
+    // 0..1, чтобы порог окна ([_level]: `referenceNoiseSigmas` × σ и
     // `referenceMinRise`) остался в тех же единицах и не потребовал новых чисел.
     // Процентиль, а не среднее: среднее по плохо наведённой рамке размазывает
     // колпак по тёмному фону, а верх распределения показывает, что засвеченная
     // площадь есть.
-    final double whiteCore = spatial ? _lit(frame.white) : frame.white.whiteFrac;
-    final double redCore = spatial ? _lit(frame.red) : frame.red.redFrac;
+    final double whiteCore = _lit(frame.white);
+    final double redCore = _lit(frame.red);
     final FrameFeatures? whiteRing = frame.whiteRing;
     final FrameFeatures? redRing = frame.redRing;
 
-    // Ореол каждой лампы меряется «очищенным» от чужого цвета. Пиксель, который
-    // в кольце белой лампы одновременно и «белый», и «красный», — это засветка
-    // от КРАСНОЙ лампы, перекормившая сенсор: у неё R задирается выше 170, и
-    // белый признак считает её белой. В настоящем белом свете redFrac того же
-    // кольца стоит на шуме, поэтому вычитание у белой лампы ничего не отнимает
-    // (и симметрично у красной). Без этой очистки красные вспышки на стенде
-    // давали aW 0.12–0.17 при wf 0.002 (колпак чёрный) и улетали в «белую».
-    // В яркостном режиме вычитать нечего: цвета там нет, а чужой ореол уже
-    // вычитается геометрически — на уровне колец (FeatureExtractor.extractRing).
-    final double whiteRingValue = whiteRing == null
-        ? 0
-        : spatial
-            ? _lit(whiteRing)
-            : (whiteRing.whiteFrac - whiteRing.redFrac).clamp(0.0, 1.0);
-    final double redRingValue = redRing == null
-        ? 0
-        : spatial
-            ? _lit(redRing)
-            : (redRing.redFrac - redRing.whiteFrac).clamp(0.0, 1.0);
+    // Ореол меряется той же яркостью, что и колпак. Чужой ореол вычитается
+    // геометрически — на уровне колец (FeatureExtractor.extractRing), а не
+    // цветом: доля «белых» пикселей в кольце белой лампы росла и от засветки
+    // красной (у неё R задирается выше 170, и белый признак считает её белой).
+    final double whiteRingValue = whiteRing == null ? 0 : _lit(whiteRing);
+    final double redRingValue = redRing == null ? 0 : _lit(redRing);
+    _hasWhiteRing = whiteRing != null;
+    _hasRedRing = redRing != null;
 
-    final double whiteCoreRise = _whiteCore.rise(whiteCore);
-    final double redCoreRise = _redCore.rise(redCore);
-    final double whiteRingRise = whiteRing == null ? 0 : _whiteRing.rise(whiteRingValue);
-    final double redRingRise = redRing == null ? 0 : _redRing.rise(redRingValue);
+    // Размах меряется по КАЖДОМУ кадру, даже по тому, что не решён (смена
+    // сцены): это наблюдение за зоной, а не решение о вспышке.
+    _whiteCore.observe(whiteCore);
+    _redCore.observe(redCore);
+    if (whiteRing != null) {
+      _whiteRing.observe(whiteRingValue);
+    }
+    if (redRing != null) {
+      _redRing.observe(redRingValue);
+    }
+
+    final double whiteCoreRise = _whiteCore.rise(whiteCore) ?? 0;
+    final double redCoreRise = _redCore.rise(redCore) ?? 0;
+    final double whiteRingRise = whiteRing == null
+        ? 0
+        : (_whiteRing.rise(whiteRingValue) ?? 0);
+    final double redRingRise = redRing == null
+        ? 0
+        : (_redRing.rise(redRingValue) ?? 0);
 
     final double whiteCoreLevel = _level(_whiteCore);
     final double whiteRingLevel = _level(_whiteRing);
     final double redCoreLevel = _level(_redCore);
     final double redRingLevel = _level(_redRing);
 
-    // Порог, упёршийся в потолок, — это уже не защита от шума, а сломанный
-    // отсчёт: подъём ограничен 1.0, а `6σ` не ограничен ничем, так что канал
-    // замолкает до перезапуска (замер 20.11.2026: onW 1.256 / onR 1.521 при
-    // реальном подъёме 0.561). Такое окно не лечится ничем, кроме набора
-    // заново: кадры с ним не оцениваются и в окно не пишутся.
-    final double maxLevel = _config.referenceMaxLevel;
-    final bool unstable = whiteCoreLevel >= maxLevel ||
-        whiteRingLevel >= maxLevel ||
-        redCoreLevel >= maxLevel ||
-        redRingLevel >= maxLevel;
-    _unstableRun = unstable ? _unstableRun + 1 : 0;
-    if (_unstableRun >= _commonRunLimit) {
-      _build();
-      _frames = 0;
-      _commonRun = 0;
-      _unstableRun = 0;
-      _last = LiveReading.warmup;
-      return _last;
-    }
+    // Готовность своя у каждого канала и у каждой ЗОНЫ: пустое окно соседа не
+    // обнуляет уже рабочий отсчёт. Канал жив, если набрана ХОТЯ БЫ ОДНА его
+    // зона: на яркой сцене колпак упирается в потолок сенсора и его окно не
+    // набирается, а ореол при этом измеряется — связывание зон через «и»
+    // замораживало рабочий канал целиком. Порог ограничен referenceMaxLevel и
+    // размахом, поэтому автоматический общий сброс по sigma не нужен.
+    final bool whiteValid =
+        _whiteCore.ready || (whiteRing != null && _whiteRing.ready);
+    final bool redValid = _redCore.ready || (redRing != null && _redRing.ready);
 
     // Ореол вправе решить канал только тогда, когда сдвинулся и СОБСТВЕННЫЙ
-    // колпак — в любую сторону (у красной лампы он при включении бледнеет).
+    // колпак. Подъёмом: «бледнение» колпака — это падение той же величины, по
+    // которой считается вспышка, а падение яркости вспышкой быть не может по
+    // определению (в прежнем цветовом режиме могло: выжженное в оранжево-белое
+    // ядро теряло «красные» пиксели, и приходилось слушать обе стороны).
     // Без этого правила кольцо белой лампы слушало засветку от красной: на
     // стенде красные вспышки давали aW 0.12–0.17 при wf 0.002 (колпак чёрный)
     // и считались белыми событиями. Кольцо — усилитель своей лампы, а не
     // ловец чужого света.
-    //
-    // В яркостном режиме «бледнение» колпака — это падение той же величины, по
-    // которой и считается вспышка, поэтому достаточно подъёма: падение яркости
-    // вспышкой быть не может по определению.
-    final bool whiteRingHeard = spatial
-        ? whiteCoreRise >= whiteCoreLevel
-        : whiteCoreRise >= whiteCoreLevel || _whiteCore.drop(whiteCore) >= whiteCoreLevel;
-    final bool redRingHeard = spatial
-        ? redCoreRise >= redCoreLevel
-        : redCoreRise >= redCoreLevel || _redCore.drop(redCore) >= redCoreLevel;
+    final bool whiteRingHeard =
+        _whiteCore.ready && whiteCoreRise >= whiteCoreLevel;
+    final bool redRingHeard = _redCore.ready && redCoreRise >= redCoreLevel;
 
-    final double whiteRise =
-        whiteRingHeard ? math.max(whiteCoreRise, whiteRingRise) : whiteCoreRise;
-    final double redRise =
-        redRingHeard ? math.max(redCoreRise, redRingRise) : redCoreRise;
+    // Колпак ещё не набран — ведущей становится готовая зона ореола. Это не
+    // послабление правила «ореол не ловит чужой свет» в обычной работе: оно
+    // действует, только пока собственного колпака нет вовсе, иначе канал
+    // оставался бы немым ровно на тех вспышках, ради которых окно набирается.
+    final bool whiteRingLeads = !_whiteCore.ready && whiteRing != null;
+    final bool redRingLeads = !_redCore.ready && redRing != null;
+
+    final double whiteRise = whiteRingLeads
+        ? whiteRingRise
+        : whiteRingHeard
+        ? math.max(whiteCoreRise, whiteRingRise)
+        : whiteCoreRise;
+    final double redRise = redRingLeads
+        ? redRingRise
+        : redRingHeard
+        ? math.max(redCoreRise, redRingRise)
+        : redCoreRise;
     // Порог показываем тот, по которому канал реально сработал бы: зона с
     // большим подъёмом — ведущая.
-    final double whiteLevel =
-        whiteRingHeard && whiteRingRise > whiteCoreRise ? whiteRingLevel : whiteCoreLevel;
-    final double redLevel =
-        redRingHeard && redRingRise > redCoreRise ? redRingLevel : redCoreLevel;
+    final double whiteLevel = whiteRingLeads
+        ? whiteRingLevel
+        : whiteRingHeard && whiteRingRise > whiteCoreRise
+        ? whiteRingLevel
+        : whiteCoreLevel;
+    final double redLevel = redRingLeads
+        ? redRingLevel
+        : redRingHeard && redRingRise > redCoreRise
+        ? redRingLevel
+        : redCoreLevel;
 
     // Общее для обеих рамок — это НЕ вспышка одной из них, а свет, лёгший на всю
     // сцену: засветка от соседней лампы, автоэкспозиция, движение фона. Снимаем
@@ -338,12 +473,19 @@ class LiveReference {
     final double whiteNet = whiteRise - common;
     final double redNet = redRise - common;
 
-    final bool warm = warmupLeft == 0;
-    final bool whiteUp = warm &&
-        (whiteCoreRise >= whiteCoreLevel ||
-            (whiteRingHeard && whiteRingRise >= whiteRingLevel));
-    final bool redUp = warm &&
-        (redCoreRise >= redCoreLevel || (redRingHeard && redRingRise >= redRingLevel));
+    final bool warm = whiteValid && redValid;
+    final bool whiteUp =
+        whiteValid &&
+        (whiteRingLeads
+            ? whiteRingRise >= whiteRingLevel
+            : whiteCoreRise >= whiteCoreLevel ||
+                  (whiteRingHeard && whiteRingRise >= whiteRingLevel));
+    final bool redUp =
+        redValid &&
+        (redRingLeads
+            ? redRingRise >= redRingLevel
+            : redCoreRise >= redCoreLevel ||
+                  (redRingHeard && redRingRise >= redRingLevel));
 
     // Вопрос «какая лампа» задаётся РАНЬШЕ вопроса «не смена ли это сцены».
     // Чужая вспышка поднимает нашу рамку засветкой, но свою — заметно сильнее,
@@ -354,8 +496,8 @@ class LiveReference {
     // (замер 20.11.2026: `aW 0.561 / aR 0.553`, обе выше порога — отсюда и
     // «не считает», и «всё в одну корзину»).
     final double gate = LampCalibration.lampGateAsymmetry;
-    bool whiteYielded = spatial && redRise >= gate * whiteRise;
-    bool redYielded = spatial && whiteRise >= gate * redRise;
+    bool whiteYielded = redRise >= gate * whiteRise;
+    bool redYielded = whiteRise >= gate * redRise;
 
     // Перевеса по яркости нет — уступать некому. Цвет тут ничего не
     // доказывает: разницу `redFrac − whiteFrac` между рамками даёт не только
@@ -368,10 +510,7 @@ class LiveReference {
       _commonRun++;
       if (_commonRun >= _commonRunLimit) {
         // Сцена шагнула целиком — это не лампы. Новый «пол» набирается заново.
-        _build();
-        _frames = 0;
-        _commonRun = 0;
-        _last = LiveReading.warmup;
+        _resetWindow('scene');
         return _last;
       }
       // Пока непонятно, что это, — ни один канал не двигаем и в окно кадр не
@@ -388,6 +527,8 @@ class LiveReference {
         whiteBelowOff: false,
         redBelowOff: false,
         warm: true,
+        whiteValid: whiteValid,
+        redValid: redValid,
       );
       _last = holding;
       return holding;
@@ -410,9 +551,11 @@ class LiveReference {
       // Ведущая зона берётся та, что решила о включении, — заглушённый ореол
       // (своего колпака не видно) в [whiteRise] не входит и потому не вправе
       // удерживать канал в «не погасло».
-      whiteBelowOff: !warm || whiteNet < whiteLevel * off,
-      redBelowOff: !warm || redNet < redLevel * off,
+      whiteBelowOff: whiteValid && whiteNet < whiteLevel * off,
+      redBelowOff: redValid && redNet < redLevel * off,
       warm: warm,
+      whiteValid: whiteValid,
+      redValid: redValid,
     );
 
     // Кадр, где лампа горит, в окно НЕ попадает: иначе долгое горение поднимет
@@ -424,15 +567,23 @@ class LiveReference {
     // там тоже сгорают (замер: выжженный колпак wf 1.000 вошёл в окно «пола»).
     // Такие кадры в окно не пишутся ни при каком решении.
     final double clip = _config.clipLuma;
-    final bool whiteClipped = frame.white.p90Luma >= clip;
-    final bool redClipped = frame.red.p90Luma >= clip;
     _add(
       whiteCore: whiteCore,
       redCore: redCore,
       whiteRing: whiteRing == null ? null : whiteRingValue,
       redRing: redRing == null ? null : redRingValue,
-      whiteDark: !whiteUp && !whiteClipped,
-      redDark: !redUp && !redClipped,
+      whiteCoreDark: _darkSample(
+        _whiteCore,
+        whiteCore,
+        frame.white.p90Luma >= clip,
+      ),
+      redCoreDark: _darkSample(_redCore, redCore, frame.red.p90Luma >= clip),
+      whiteRingDark:
+          whiteRing != null &&
+          _darkSample(_whiteRing, whiteRingValue, whiteRing.p90Luma >= clip),
+      redRingDark:
+          redRing != null &&
+          _darkSample(_redRing, redRingValue, redRing.p90Luma >= clip),
     );
     _last = reading;
     return reading;
@@ -443,33 +594,76 @@ class LiveReference {
     required double redCore,
     required double? whiteRing,
     required double? redRing,
-    required bool whiteDark,
-    required bool redDark,
+    required bool whiteCoreDark,
+    required bool redCoreDark,
+    required bool whiteRingDark,
+    required bool redRingDark,
   }) {
-    if (whiteDark) {
+    if (whiteCoreDark) {
       _whiteCore.add(whiteCore);
-      if (whiteRing != null) {
-        _whiteRing.add(whiteRing);
-      }
     }
-    if (redDark) {
+    if (whiteRing != null && whiteRingDark) {
+      _whiteRing.add(whiteRing);
+    }
+    if (redCoreDark) {
       _redCore.add(redCore);
-      if (redRing != null) {
-        _redRing.add(redRing);
-      }
+    }
+    if (redRing != null && redRingDark) {
+      _redRing.add(redRing);
     }
     _frames++;
+  }
+
+  /// Тёмный кадр доказывается значением, а не флагом `up`: во время набора окна
+  /// этот флаг ещё не существует, но яркая вспышка всё равно не должна стать «полом».
+  bool _darkSample(RollingFloor ref, double value, bool clipped) {
+    if (clipped) {
+      return false;
+    }
+    final double? floor = ref.floor;
+    // Пока окно не набрано, годится любой непересвеченный кадр: иначе на сцене,
+    // где рамка почти всё время яркая, новые значения отвергаются как «не
+    // тёмные», окно навсегда остаётся полупустым, а канал — замороженным
+    // (замер 21.11.2026: redValid = false на протяжении целых вспышек).
+    if (!ref.ready || floor == null) {
+      return true;
+    }
+    return value <= floor + _level(ref);
   }
 
   /// Порог = шум окна × σ-множитель, но не ниже абсолютного минимума и не выше
   /// потолка: на идеально ровной сцене σ = 0, и «6σ» не защищает от пары
   /// пикселей, а на гуляющей камере «6σ» перерастает максимум подъёма и убивает
   /// канал (см. [LampConfig.referenceMaxLevel]).
+  ///
+  /// Потолок дополнительно ограничен ПОЛОВИНОЙ СОБСТВЕННОГО РАЗМАХА канала
+  /// (пик за окно минус «пол»), но не ниже `referenceMinRise`. Абсолютный
+  /// потолок 0.15 предполагал, что у вспышки всегда есть запас яркости: на
+  /// пересвеченной рамке (замер 21.11.2026: красная рамка 243/255 от чужой
+  /// белой лампы, 255 от своей) весь подъём — 0.05, и канал молчал, а у тусклой
+  /// лампы тот же порог не достигался никогда. Половина размаха — порог в
+  /// единицах самой лампы: яркой и тусклой достаётся одно правило. Нижняя
+  /// граница `referenceMinRise` обязательна: на тёмной сцене размах стремится
+  /// к нулю, и порог по размаху без неё начинает считать шум (проверено
+  /// прогоном записи: без нижней границы — 7 ложных событий в темноте).
   double _level(RollingFloor ref) {
-    final double maxLevel = _config.referenceMaxLevel;
+    final double minRise = _config.referenceMinRise;
+    double maxLevel = _config.referenceMaxLevel;
+    final double? floor = ref.floor;
+    final double? peak = ref.peak;
+    if (floor != null && peak != null) {
+      final double span = peak - floor;
+      if (span > 0) {
+        final double bySpan = 0.5 * span;
+        final double capped = bySpan > minRise ? bySpan : minRise;
+        if (capped < maxLevel) {
+          maxLevel = capped;
+        }
+      }
+    }
     final double byNoise = _config.referenceNoiseSigmas * ref.sigma;
     final double capped = byNoise > maxLevel ? maxLevel : byNoise;
-    return capped > _config.referenceMinRise ? capped : _config.referenceMinRise;
+    return capped > minRise ? capped : minRise;
   }
 
   /// Яркость области, приведённая к 0..1 — в те же единицы, в каких живут

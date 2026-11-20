@@ -1,11 +1,10 @@
 import 'dart:async';
-import 'dart:io' show Directory, File;
+import 'dart:io' show Directory;
 
 import 'package:flutter/material.dart';
 import 'package:lamp_detection/lamp_detection.dart';
 
-import 'opencv_features.dart';
-import 'opencv_shadow.dart';
+import 'opencv_sensor.dart';
 import 'widgets/event_log.dart';
 import 'widgets/roi_editor.dart';
 
@@ -35,10 +34,9 @@ class _HomePageState extends State<HomePage> {
   bool _staleLogged = false;
   Timer? _logTimer;
 
-  /// Теневой измеритель OpenCV: пока не выключен, каждый кадр после решения
-  /// основного конвейера мерится вторым способом. Решений он не принимает —
-  /// подключён как `ShadowProbe` и вызывается после отправки событий.
-  OpenCvShadowInstrument? _shadow;
+  /// Датчик: null = 1 Dart, значение = 2 OpenCV (строго). Держим ссылку,
+  /// чтобы освободить нативную память при переключении и закрытии экрана.
+  OpenCvSensorExtractor? _sensor;
 
   /// Сколько ждём подъёма камеры. Больше — и первый запуск выглядит зависшим:
   /// плагин `camera` на части устройств не отвечает вовсе, а оператор обязан
@@ -126,7 +124,7 @@ class _HomePageState extends State<HomePage> {
 
   /// Внизу экрана — только следующее действие, одной строкой.
   static String _nextStepMessage(DetectionSession session) =>
-      session.canEvaluate ? 'Считаю' : 'Жми «1 ФОН»';
+      session.canEvaluate ? '' : 'Жми «1 ФОН»';
 
   /// Подробности ошибки уже в «Ошибках» и в логе, здесь — первая строка.
   static String _short(Object e) {
@@ -145,7 +143,8 @@ class _HomePageState extends State<HomePage> {
   void _onHit(HitEvent event) {
     setState(() {
       _events.insert(0, event);
-      _message = '${event.lampId == HitEvent.whiteLampId ? 'БЕЛАЯ' : 'КРАСНАЯ'}'
+      _message =
+          '${event.lampId == HitEvent.whiteLampId ? 'БЕЛАЯ' : 'КРАСНАЯ'}'
           ' #${event.sequenceNumber}';
     });
     unawaited(_refreshStatuses());
@@ -158,7 +157,9 @@ class _HomePageState extends State<HomePage> {
     if (repository == null || session == null) {
       return;
     }
-    final List<StoredEvent> stored = await repository.eventsWithStatus(session.sessionId);
+    final List<StoredEvent> stored = await repository.eventsWithStatus(
+      session.sessionId,
+    );
     if (!mounted) {
       return;
     }
@@ -176,9 +177,11 @@ class _HomePageState extends State<HomePage> {
     _logTimer?.cancel();
     unawaited(_hitsSub?.cancel());
     unawaited(_errorsSub?.cancel());
-    _session?.shadowProbe = null;
-    _shadow?.dispose();
-    _shadow = null;
+    // Датчик-подкласс сидит в сессии и держит Mat прошлого кадра: сначала
+    // возвращаем штатный измеритель, потом освобождаем нативную память.
+    _session?.sensorExtractor = null;
+    _sensor?.dispose();
+    _sensor = null;
     _session?.removeListener(_onSessionChanged);
     unawaited(_session?.dispose());
     super.dispose();
@@ -242,148 +245,64 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// Вернуть набор к кнопке «1 ФОН», ничего не сохраняя.
+  /// Забыть калибровку целиком: базу, собранные состояния и «пол» живого
+  /// отсчёта. Счётчики ударов остаются — для них есть отдельный ⟳.
+  ///
+  /// Что делать дальше говорит полоса готовности, а не эта строка: в режиме
+  /// эталонов там «нет калибровки — жми 1 ФОН», а в живом отсчёте калибровка не
+  /// нужна вовсе и остаётся только дождаться нового «пола».
   void _resetCalibration() {
-    _session!.resetCalibration();
-    setState(() => _message = 'Сброшено. Жми «1 ФОН»');
+    final DetectionSession session = _session!;
+    session.resetCalibration();
+    setState(() => _message = 'Калибровка сброшена. ${session.readiness.why}');
   }
 
-  /// Включает и выключает теневой измеритель OpenCV.
-  ///
-  /// Включение ставит `session.shadowProbe`: каждый кадр после решения
-  /// основного конвейера мерится вторым способом, но ни пороги, ни событие
-  /// тень не трогает — вызов идёт после отправки, ошибка гасится сама.
-  /// Выключение печатает накопленное: таблицу «рабочий | OpenCV», сводку
-  /// расхождений и путь к файлу отчёта.
-  Future<void> _toggleShadow(DetectionSession session) async {
-    final OpenCvShadowInstrument? active = _shadow;
-    if (active != null) {
-      session.shadowProbe = null;
-      final String report = active.report();
-      final int seen = active.seen;
-      final int failures = active.failures;
-      active.dispose();
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _shadow = null;
-        _message = 'OpenCV: $seen кадров, сбоев $failures';
-      });
-      final String path = await _writeShadowReport(report);
-      debugPrint('OPENCV отчёт: $path');
-      // Сводка — в logcat целиком: по ней видно, сходятся ли способы,
-      // не дёргая pull файла. Таблицу кадров в лог не дублируем.
-      for (final String line in report.split('\n')) {
-        if (line.startsWith('сводка') ||
-            line.startsWith('  ') ||
-            line.startsWith('центр') ||
-            line.startsWith('яркость')) {
-          debugPrint('OPENCV $line');
-        }
-      }
-      if (mounted) {
-        await _showShadowReport(report, path);
-      }
+  /// Два режима: 1 — Dart, 2 — только OpenCV. При выборе того же режима
+  /// ничего не меняем: калибровка не сбрасывается зря.
+  Future<void> _setSensor(
+    DetectionSession session, {
+    required bool opencv,
+  }) async {
+    if ((_sensor != null) == opencv) {
       return;
     }
-    final OpenCvShadowInstrument instrument = OpenCvShadowInstrument(
-      extractor: OpenCvFeatureExtractor(config: session.config),
-      workingExtractor: FeatureExtractor(session.config),
-      maxPairs: 400,
-    );
-    session.shadowProbe = instrument.observe;
+    final bool wasRecording = session.status.recordingCsv;
+    if (wasRecording) {
+      await session.setRecordingCsv(false);
+    }
+    final OpenCvSensorExtractor? current = _sensor;
+    if (current != null) {
+      session.sensorExtractor = null;
+      current.dispose();
+      _sensor = null;
+    }
+    if (opencv) {
+      final OpenCvSensorExtractor next = OpenCvSensorExtractor(
+        config: session.config,
+      );
+      session.sensorExtractor = next;
+      _sensor = next;
+    }
+    session.resetCalibration();
+    if (wasRecording) {
+      await session.setRecordingCsv(true);
+    }
     if (!mounted) {
       return;
     }
-    setState(() {
-      _shadow = instrument;
-      _message = 'OpenCV считаю… прогон off/white/off/red, жми ещё раз';
-    });
+    final String name = opencv ? 'OpenCV' : 'Dart';
+    setState(() => _message = 'Датчик: $name. Жми «1 ФОН»');
+    debugPrint('SENSOR $name');
   }
 
-  /// Отчёт живёт вне памяти приложения: числа нужны и после закрытия экрана,
-  /// а файл проще всего снять с устройства (run-as) или через лог.
-  Future<String> _writeShadowReport(String report) async {
-    try {
-      final Directory directory = await lampDataDirectory();
-      final File file = File('${directory.path}/lamp_opencv_compare.txt');
-      await file.writeAsString(report);
-      return file.path;
-    } on Object catch (e) {
-      debugPrint('OPENCV файл не записан: $e');
-      return 'не записан ($e)';
-    }
-  }
-
-  /// Таблицы в 14 колонок на телефоне не читаются, поэтому на экран идёт
-  /// только сводка расхождений и «центр − кольцо» — то, по чему видно,
-  /// сходятся ли два способа. Полный текст остаётся в файле.
-  Future<void> _showShadowReport(String report, String path) => showDialog<void>(
-    context: context,
-    builder: (BuildContext context) {
-      final List<String> lines = report.split('\n');
-      final int summaryAt = lines.indexWhere(
-        (String l) => l.startsWith('сводка расхождений'),
-      );
-      final String head = lines.isEmpty ? '' : lines.first;
-      final String body = summaryAt < 0
-          ? report
-          : lines.sublist(summaryAt).join('\n');
-      return AlertDialog(
-        title: const Text('Сравнение способов (OpenCV)'),
-        content: SingleChildScrollView(
-          child: SelectableText(
-            '$head\n\n$body\n\nфайл: $path',
-            style: const TextStyle(
-              fontFamily: 'monospace',
-              fontSize: 11,
-              height: 1.35,
-            ),
-          ),
-        ),
-        actions: <Widget>[
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('Закрыть'),
-          ),
-        ],
-      );
-    },
-  );
-
-  /// Переключает СПОСОБ решения: цвет рамок или яркость четырёх областей.
-  ///
-  /// Переключается на лету и сохраняется: на стенде нельзя сравнивать
-  /// алгоритмы, меняя сборку, — прогон делается один, а решение должно быть
-  /// видно по экрану, а не по памяти оператора.
-  void _toggleMode(DetectionSession session) {
-    final bool nextSpatial = !session.config.spatialVectors;
-    session.applyConfig(session.config.copyWith(spatialVectors: nextSpatial));
-    unawaited(session.saveConfig());
-    setState(
-      () => _message = nextSpatial
-          ? 'Решение: ЯРКОСТЬ + геометрия'
-          : 'Решение: цвет (прежнее)',
-    );
-  }
-
-  /// Чем именно мы сейчас работаем — короткая метка для лога.
-  ///
-  /// Способ решения (`spatialVectors`) переключается на экране, тень OpenCV —
-  /// тоже, а в CSV и в logcat строки от обоих выглядят одинаково. Без этой
-  /// метки разбирать потом нечем: «что, на ЯРКОСТИ столько намусорило?»
+  /// Какой датчик меряет — метка в каждой строке лога.
   String get _modeTag {
     final DetectionSession? s = _session;
     if (s == null) {
-      return 'mode=?';
+      return 'sensor=?';
     }
-    final String shadow = _shadow == null
-        ? 'off'
-        : 'on:${_shadow!.seen}';
-    return 'mode=${s.config.spatialVectors ? "spatial" : "color"} '
-        'ref=${s.config.liveReference ? "live" : "etalon"} '
-        'shadow=$shadow';
+    return 'ref=${s.config.liveReference ? "live" : "etalon"} '
+        'sensor=${_sensor == null ? "dart" : "opencv"}';
   }
 
   /// Компактная строка чисел прогона в logcat (тег LAMPDBG), примерно 5 раз/с.
@@ -438,15 +357,17 @@ class _HomePageState extends State<HomePage> {
         // пересвет (Y упирается в 255).
         '| Y w=${f.white.meanY.toStringAsFixed(0)} '
         'r=${f.red.meanY.toStringAsFixed(0)} '
-        // p90 — то, чем яркостной способ реально решает (`wf`/`rf` при
-        // `spatialVectors` напечатаны для справки и на решение не влияют), а
+        // p90 — та величина, по которой решение принимает (`wf`/`rf` напечатаны
+        // для справки: цвет измеряется, но ни на одно решение не влияет), а
         // `dark` — сколько длится текущий провал: по нему видно, ЗАЧЕМ канал
         // не отпускает («горит» навечно = провал не подтверждён).
         '| p90 w=${f.white.p90Luma.toStringAsFixed(0)} '
+        'wr=${whiteRing == null ? "-" : whiteRing.p90Luma.toStringAsFixed(0)} '
         'r=${f.red.p90Luma.toStringAsFixed(0)} '
+        'rr=${redRing == null ? "-" : redRing.p90Luma.toStringAsFixed(0)} '
         'dark W=${e?.whiteDarkMs ?? 0}ms R=${e?.redDarkMs ?? 0}ms '
         'exp=${s.exposureLocked ? "lock" : "auto"} '
-        '| hits W=${s.whiteHits} R=${s.redHits}',
+        '| hits W=${s.whiteHits} R=${s.redHits} ${s.liveDebugTag}',
       );
       return;
     }
@@ -485,7 +406,8 @@ class _HomePageState extends State<HomePage> {
     ),
   );
 
-  static String _shortSession(String id) => id.length <= 8 ? id : id.substring(0, 8);
+  static String _shortSession(String id) =>
+      id.length <= 8 ? id : id.substring(0, 8);
 
   @override
   Widget build(BuildContext context) {
@@ -493,33 +415,40 @@ class _HomePageState extends State<HomePage> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          session == null ? 'Lamp detection' : 'Lamp detection · ${_shortSession(session.sessionId)}',
+          session == null
+              ? 'Lamp detection'
+              : 'Lamp detection · ${_shortSession(session.sessionId)}',
         ),
         actions: <Widget>[
           if (session != null)
             PopupMenuButton<String>(
               onSelected: (String id) => _onMenu(id, session),
               itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+                const PopupMenuItem<String>(
+                  value: 'calreset',
+                  child: Text('Сброс калибровки'),
+                ),
                 PopupMenuItem<String>(
-                  value: 'mode',
+                  value: 'dart',
                   child: Text(
-                    session.config.spatialVectors
-                        ? 'Решение: ЯРКОСТЬ + геометрия'
-                        : 'Решение: цвет (прежнее)',
+                    _sensor == null ? '1 Датчик: Dart ✓' : '1 Считать по Dart',
                   ),
                 ),
-                const PopupMenuItem<String>(value: 'calreset', child: Text('Сброс калибровки')),
                 PopupMenuItem<String>(
-                  value: 'shadow',
+                  value: 'opencv',
                   child: Text(
-                    _shadow == null
-                        ? 'Сравнить способы (OpenCV)'
-                        : 'Отчёт OpenCV (${_shadow!.seen} кадров)',
+                    _sensor != null ? '2 Датчик: OpenCV ✓' : '2 Только OpenCV',
                   ),
                 ),
                 const PopupMenuDivider(),
-                const PopupMenuItem<String>(value: 'log', child: Text('Журнал событий')),
-                const PopupMenuItem<String>(value: 'errors', child: Text('Ошибки')),
+                const PopupMenuItem<String>(
+                  value: 'log',
+                  child: Text('Журнал событий'),
+                ),
+                const PopupMenuItem<String>(
+                  value: 'errors',
+                  child: Text('Ошибки'),
+                ),
               ],
             ),
         ],
@@ -544,7 +473,8 @@ class _HomePageState extends State<HomePage> {
                               session.source.buildPreview(),
                               RoiEditor(
                                 layout: session.roi,
-                                onChanged: (RoiLayout layout) => session.updateRoi(layout),
+                                onChanged: (RoiLayout layout) =>
+                                    session.updateRoi(layout),
                                 onCommit: () {
                                   unawaited(session.saveRoi());
                                   setState(() => _message = 'ROI сохранены');
@@ -562,27 +492,12 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ),
                   ),
-                  _ReadyBanner(
-                    session: session,
-                    onRelearn: () {
-                      // Ровно то, ради чего раньше приходилось жать «Стоп» и
-                      // снова «Пуск»: перемерить свет, не потеряв счётчики.
-                      session.relearnLight();
-                    },
-                  ),
                   _StatusRow(
                     session: session,
                     onReset: () {
                       session.resetCounters();
                       setState(() => _message = 'Сброшено');
                     },
-                  ),
-                  _ModeStrip(
-                    spatial: session.config.spatialVectors,
-                    liveReference: session.config.liveReference,
-                    shadowFrames: _shadow?.seen,
-                    onToggleMode: () => _toggleMode(session),
-                    onToggleShadow: () => _toggleShadow(session),
                   ),
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
@@ -600,94 +515,30 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _onMenu(String id, DetectionSession session) async {
     switch (id) {
-      case 'mode':
-        _toggleMode(session);
       case 'calreset':
         _resetCalibration();
-      case 'shadow':
-        await _toggleShadow(session);
+      case 'dart':
+        await _setSensor(session, opencv: false);
+      case 'opencv':
+        await _setSensor(session, opencv: true);
       case 'log':
-        await _sheet('Журнал событий', EventLog(events: _events, statuses: _statuses));
+        await _sheet(
+          'Журнал событий',
+          EventLog(events: _events, statuses: _statuses),
+        );
       case 'errors':
         await _sheet(
           'Ошибки',
           ListView(
             padding: const EdgeInsets.all(12),
             children: _errors
-                .map((String e) => Text(e, style: const TextStyle(fontSize: 12)))
+                .map(
+                  (String e) => Text(e, style: const TextStyle(fontSize: 12)),
+                )
                 .toList(),
           ),
         );
     }
-  }
-}
-
-/// Полоса «можно ли уже считать» и кнопка «перемерить свет».
-///
-/// Единственный вопрос оператора у лампы — не «жива ли программа», а «готово ли
-/// считать». Пока ответа нет, экран обязан говорить, чего не хватает: камера,
-/// калибровка или стабилизирующийся свет. Иначе тишина выглядит как зависшее
-/// приложение, а это ровно то, на что жалуются после первого запуска.
-///
-/// Кнопка рядом с ней — по той же причине: навести рамки на колпаки можно только
-/// ПОСЛЕ «Пуск», а «пол» живого отсчёта к этому моменту уже набран по фону и по
-/// чужому месту в кадре. Раньше это лечилось только рестартом камеры.
-class _ReadyBanner extends StatelessWidget {
-  const _ReadyBanner({required this.session, required this.onRelearn});
-
-  final DetectionSession session;
-  final VoidCallback onRelearn;
-
-  @override
-  Widget build(BuildContext context) {
-    final ({bool ready, String why}) state = session.readiness;
-    final Color color = state.ready ? Colors.teal : Colors.orange.shade800;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 2, 12, 2),
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: color),
-        ),
-        child: Row(
-          children: <Widget>[
-            Icon(
-              state.ready ? Icons.check_circle : Icons.hourglass_top,
-              color: color,
-              size: 20,
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                state.ready
-                    ? 'ГОТОВ К РАБОТЕ'
-                    : state.why,
-                style: TextStyle(
-                  color: color,
-                  fontSize: 14,
-                  fontWeight: state.ready ? FontWeight.w700 : FontWeight.w500,
-                ),
-              ),
-            ),
-            // Отдельного экрана и пункта меню под это нет: действие нужно в
-            // те секунды, когда руки уже держат телефон над табло.
-            TextButton.icon(
-              onPressed: onRelearn,
-              style: TextButton.styleFrom(
-                foregroundColor: color,
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                visualDensity: VisualDensity.compact,
-              ),
-              icon: const Icon(Icons.autorenew, size: 16),
-              label: const Text('СВЕТ ЗАНОВО', style: TextStyle(fontSize: 12)),
-            ),
-          ],
-        ),
-      ),
-    );
   }
 }
 
@@ -708,7 +559,9 @@ class _PrimaryControls extends StatelessWidget {
             child: FilledButton.icon(
               onPressed: onRun,
               style: FilledButton.styleFrom(
-                backgroundColor: status.running ? Colors.redAccent : Colors.teal,
+                backgroundColor: status.running
+                    ? Colors.redAccent
+                    : Colors.teal,
               ),
               icon: Icon(status.running ? Icons.stop : Icons.play_arrow),
               label: Text(status.running ? 'Стоп' : 'Пуск'),
@@ -746,13 +599,17 @@ class _CalibrationSteps extends StatelessWidget {
         children: <Widget>[
           Row(
             children: CalibrationStep.values
-                .map((CalibrationStep step) => Expanded(child: _button(step, s)))
+                .map(
+                  (CalibrationStep step) => Expanded(child: _button(step, s)),
+                )
                 .toList(growable: false),
           ),
           Padding(
             padding: const EdgeInsets.only(top: 4),
             child: Text(
-              s.calibrationError.isNotEmpty ? s.calibrationError : s.calibrationHint,
+              s.calibrationError.isNotEmpty
+                  ? s.calibrationError
+                  : s.calibrationHint,
               textAlign: TextAlign.center,
               style: TextStyle(
                 fontSize: 13,
@@ -782,10 +639,10 @@ class _CalibrationSteps extends StatelessWidget {
     final (IconData, Color) mark = collecting
         ? (Icons.timelapse, Colors.tealAccent)
         : refused
-            ? (Icons.error_outline, Colors.redAccent)
-            : shot
-                ? (Icons.check_circle, Colors.teal)
-                : (Icons.radio_button_unchecked, Colors.white54);
+        ? (Icons.error_outline, Colors.redAccent)
+        : shot
+        ? (Icons.check_circle, Colors.teal)
+        : (Icons.radio_button_unchecked, Colors.white54);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 3),
       child: FilledButton.tonalIcon(
@@ -883,8 +740,8 @@ class _CollectionOverlayState extends State<_CollectionOverlay> {
     final String warning = !s.exposureLocked
         ? 'Экспозиция не заперта: камера пересчитывает свет, цифры плывут'
         : s.overexposed
-            ? 'Пересвет: в рамке нет ни цвета, ни яркости'
-            : '';
+        ? 'Пересвет: в рамке нет ни цвета, ни яркости'
+        : '';
     return Align(
       alignment: Alignment.topCenter,
       child: Padding(
@@ -943,93 +800,6 @@ class _CollectionOverlayState extends State<_CollectionOverlay> {
   }
 }
 
-/// Чем прибор сейчас работает — две кнопки-индикатора на главном экране.
-///
-/// Обе величины можно переключать, но до этого они были видны только внутри
-/// всплывающего меню: оператор не мог, не открывая `⋮`, узнать каким способом
-/// сегодня посчитаны его три события. Открывать меню ради ответа «как мы
-/// работаем» — лишний тап, а сверить потом надо ровно это.
-///
-/// OpenCV здесь НЕ вторая линия решения: тень мерит рядом и не вправе создать
-/// событие, поэтому она показана как измеритель, а не как режим.
-class _ModeStrip extends StatelessWidget {
-  const _ModeStrip({
-    required this.spatial,
-    required this.liveReference,
-    required this.shadowFrames,
-    required this.onToggleMode,
-    required this.onToggleShadow,
-  });
-
-  final bool spatial;
-  final bool liveReference;
-  final int? shadowFrames;
-  final VoidCallback onToggleMode;
-  final VoidCallback onToggleShadow;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
-      child: Row(
-        children: <Widget>[
-          Expanded(
-            child: _chip(
-              // Живой отсчёт и способ решения — разные оси: и то и то влияет на
-              // порог, но меняется одно на лету, а другое только в конфиге.
-              spatial
-                  ? 'РЕШЕНИЕ: ЯРКОСТЬ + ГЕОМЕТРИЯ'
-                  : 'РЕШЕНИЕ: ЦВЕТ (ПРЕЖНЕЕ)',
-              spatial ? Colors.teal : Colors.blueGrey,
-              onToggleMode,
-            ),
-          ),
-          const SizedBox(width: 6),
-          Expanded(
-            child: _chip(
-              shadowFrames == null
-                  ? 'OpenCV: ВЫКЛ'
-                  : 'OpenCV: $shadowFrames кадров',
-              shadowFrames == null ? Colors.blueGrey : Colors.amber,
-              onToggleShadow,
-            ),
-          ),
-          const SizedBox(width: 6),
-          _chip(
-            liveReference ? 'ЖИВОЙ ПОЛ' : 'ЭТАЛОНЫ',
-            Colors.grey,
-            null,
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// `_chip(..., null)` — только показывает и не нажимается.
-  Widget _chip(String text, Color color, VoidCallback? onTap) => InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(6),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-          decoration: BoxDecoration(
-            color: color.withValues(alpha: 0.12),
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(color: color.withValues(alpha: 0.7)),
-          ),
-          alignment: Alignment.center,
-          child: Text(
-            text,
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: color,
-              fontSize: 10.5,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ),
-      );
-}
-
 class _StatusRow extends StatelessWidget {
   const _StatusRow({required this.session, required this.onReset});
 
@@ -1058,16 +828,18 @@ class _StatusRow extends StatelessWidget {
   }
 
   Widget _counter(String label, int value, bool lit, Color color) => Column(
-        children: <Widget>[
-          Text('$value',
-              style: TextStyle(
-                fontSize: 40,
-                fontWeight: FontWeight.bold,
-                color: lit ? color : Colors.grey,
-              )),
-          Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
-        ],
-      );
+    children: <Widget>[
+      Text(
+        '$value',
+        style: TextStyle(
+          fontSize: 40,
+          fontWeight: FontWeight.bold,
+          color: lit ? color : Colors.grey,
+        ),
+      ),
+      Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+    ],
+  );
 }
 
 /// Держит превью и ROI в реальном соотношении сторон кадра. Без этого
@@ -1086,10 +858,19 @@ class _AspectStage extends StatelessWidget {
       return child;
     }
     // previewSize камеры всегда «ландшафтный» (w > h); в портрете меняем стороны.
-    final bool portrait = MediaQuery.orientationOf(context) == Orientation.portrait;
-    final double longSide = size.width >= size.height ? size.width : size.height;
-    final double shortSide = size.width >= size.height ? size.height : size.width;
-    final double aspect = portrait ? shortSide / longSide : longSide / shortSide;
-    return Center(child: AspectRatio(aspectRatio: aspect, child: child));
+    final bool portrait =
+        MediaQuery.orientationOf(context) == Orientation.portrait;
+    final double longSide = size.width >= size.height
+        ? size.width
+        : size.height;
+    final double shortSide = size.width >= size.height
+        ? size.height
+        : size.width;
+    final double aspect = portrait
+        ? shortSide / longSide
+        : longSide / shortSide;
+    return Center(
+      child: AspectRatio(aspectRatio: aspect, child: child),
+    );
   }
 }

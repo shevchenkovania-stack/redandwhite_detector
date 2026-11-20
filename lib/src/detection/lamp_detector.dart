@@ -122,7 +122,13 @@ class _LampTracker {
     required int offConfirmFrames,
     required int offConfirmMs,
     required double floorAmplitude,
+    bool valid = true,
   }) {
+    // Нет достоверного отсчёта — время и счётчики не идут. В частности, прогрев
+    // не является провалом до OFF и не может переоткрыть одно и то же горение.
+    if (!valid) {
+      return (becameOn: false, becameOff: false);
+    }
     if (aboveOn) {
       _onRun++;
       _offRun = 0;
@@ -221,18 +227,12 @@ class LampDetector {
   /// Пороги можно менять на лету (подбор по записанным CSV).
   LampConfig get config => _config;
   set config(LampConfig value) {
-    // Смена вектора меняет и модель: те же эталоны в других координатах —
-    // другое раскладочное решение, поэтому пересобирать обязаны сразу, иначе
-    // детектор продолжал бы решать по старому вектору, даже когда конфиг уже
-    // просит новый.
-    final bool revector = value.spatialVectors != _config.spatialVectors;
+    // Вектор признаков с тех пор один (яркость четырёх областей), и конфиг на
+    // него не влияет, поэтому пересобирать модель здесь нечего: пороги
+    // уходят калибровке и живому отсчёту.
     _config = value;
     _calibration.config = value;
     _live.config = value;
-    final LampBaseline? baseline = _baseline;
-    if (revector && baseline != null) {
-      _model = LampResponseModel(baseline, config: value);
-    }
   }
 
   LampConfig _config;
@@ -267,7 +267,7 @@ class LampDetector {
   /// Восстановление калибровки из настроек.
   void setBaseline(LampBaseline baseline) {
     _baseline = baseline;
-    _model = LampResponseModel(baseline, config: _config);
+    _model = LampResponseModel(baseline);
     resetTracking();
   }
 
@@ -300,12 +300,15 @@ class LampDetector {
   /// Начать пошаговую калибровку с нуля: фон → белая → красная. Прежняя
   /// калибровка при этом сбрасывается, и до третьего шага детектор не считает
   /// события — иначе он решал бы по эталонам другой сцены.
+  ///
+  /// Единственный способ «калибровки нет»: метод стирает и собранные состояния,
+  /// и базу (`clearBaseline`). Отдельный `clearCalibration`, трогавший только
+  /// набор, был удалён: им пользовались как сбросом, и калибровка переживала
+  /// его.
   void startCalibration() {
     _calibration.reset();
     clearBaseline();
   }
-
-  void clearCalibration() => _calibration.reset();
 
   /// Забыть недобранный текущий шаг калибровки, сохранив принятые состояния.
   void discardCalibrationStep() => _calibration.discardCurrentStep();
@@ -363,9 +366,16 @@ class LampDetector {
       ? (_live.hasReading ? _live.last.redLevel : null)
       : _model?.redOnLevel(config.hitFraction);
 
-  /// Сколько кадров ещё нужно, чтобы окно живого отсчёта набралось. Ноль —
+  /// Сколько реальных значений ещё нужно, чтобы окна набрались. Ноль —
   /// решения уже принимаются.
   int get liveWarmupLeft => _live.warmupLeft;
+
+  /// Количество значений, «пол», sigma и причина последнего сброса для LAMPDBG.
+  String get liveDebugTag => _live.debugTag;
+
+  /// Решение и состояние окон именно последнего оценённого кадра для CSV.
+  LiveReading get liveReading => _live.last;
+  LiveReferenceDiagnostics get liveDiagnostics => _live.diagnostics;
 
   LampEvaluation evaluate(LampFrame frame) {
     if (_config.liveReference) {
@@ -468,11 +478,9 @@ class LampDetector {
 
   /// Живой отсчёт: амплитуда = подъём своей зоны над недавним «полом» (колпака
   /// и, если он слышен, ореола), событие — подтверждённый гистерезисом переход.
-  /// Чем именно меряется зона — долей «своих» пикселей или яркостью области —
-  /// решает [LampConfig.spatialVectors]; в яркостном режиме кадр, не похожий ни
-  /// на одну лампу, здесь тоже не отбрасывается: если своя область поднялась
-  /// сильнее чужой — это вспышка СВОЕЙ лампы, а какого она цвета, спрашивать
-  /// не у кого.
+  /// Зона меряется яркостью области; кадр, не похожий ни на одну лампу, здесь
+  /// тоже не отбрасывается: если своя область поднялась сильнее чужой — это
+  /// вспышка СВОЕЙ лампы, а какого она цвета, спрашивать не у кого.
   ///
   /// Наружу отдаётся измеренный подъём ([LampEvaluation.whiteAmplitude]), а
   /// гистерезис работает по подъёму без общего для обеих рамок света
@@ -505,6 +513,7 @@ class LampDetector {
       offConfirmFrames: config.offConfirmFrames,
       offConfirmMs: config.offConfirmMs,
       floorAmplitude: config.referenceMinRise,
+      valid: reading.whiteValid,
     );
     final ({bool becameOn, bool becameOff}) redStep = _red.step(
       aboveOn: reading.redAboveOn,
@@ -515,6 +524,7 @@ class LampDetector {
       offConfirmFrames: config.offConfirmFrames,
       offConfirmMs: config.offConfirmMs,
       floorAmplitude: config.referenceMinRise,
+      valid: reading.redValid,
     );
 
     final double change = math.sqrt(

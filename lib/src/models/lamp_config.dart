@@ -37,7 +37,6 @@ class LampConfig {
     this.ringScale = 1.7,
     this.lumaPercentile = 0.9,
     this.clipLuma = 248,
-    this.spatialVectors = true,
   });
 
   /// Доля измеренного отклика, при которой лампа считается включённой.
@@ -87,8 +86,8 @@ class LampConfig {
   /// паузу, может лежать только между ними.
   ///
   /// `0` выключает временное условие: остаётся только проверка глубины.
-  /// Сравнить оба числа на одной записи умеет `ModeComparator`, который меряет
-  /// по CSV длительности провалов и пауз (`DarkRunTiming`).
+  /// Достать эти два числа из записи умеет `RunAnalyzer`: он измеряет по CSV
+  /// длительности провалов и пауз (`DarkRunTiming`).
   final int offConfirmMs;
 
   /// Сколько пикселей берётся для КАЖДОГО шага калибровки (фон, белая, красная).
@@ -135,6 +134,12 @@ class LampConfig {
   final int csvFlushLines;
 
   /// Пиксель «настоящий белый», если min(R,G,B) ≥ этого значения (0..255).
+  ///
+  /// Все три цветовых числа измеряются и пишутся в CSV для разбора записей, но
+  /// НИ НА ОДНО РЕШЕНИЕ они не влияют: «белый» и «красный» пиксель выбираются
+  /// здесь, а какая лампа сработала — решает яркость четырёх областей и то,
+  /// куда она легла. Раньше цвет решал, и из-за этого пересвеченная красная
+  /// лампа (для сенсора белая) уезжала в белую корзину.
   final double whiteMinChannel;
 
   /// Пиксель «красный», если R − max(G,B) ≥ этого значения…
@@ -197,25 +202,10 @@ class LampConfig {
   /// пикселей — признак качества кадра, а не признак лампы.
   final double clipLuma;
 
-  /// Решать «какая лампа» по пространственной картине ЯРКОСТИ четырёх областей
-  /// (ядро и кольцо каждой рамки), а не по доле белых и красных пикселей.
-  ///
-  /// Значение по умолчанию — `true`: принадлежность события определяет
-  /// расположение ROI и куда лёг свет, а не цвет пикселя. Иначе инструкция
-  /// невыполнима: пересвеченная красная лампа для сенсора белая, и при
-  /// цветовом решении её вспышка ложится в белую корзину.
-  ///
-  /// `false` — прежний вектор: доли «своих» пикселей плюс яркость. Оставлен
-  /// специально, чтобы сравнивать способы на ОДНОЙ записи: CSV пишет и цветовые
-  /// доли, и яркость, поэтому `ModeComparator` прогоняет одну и ту же запись
-  /// обоими способами и новое решение не отменяет старую реализацию.
-  final bool spatialVectors;
-
-  /// Копия с одним-двумя изменёнными числами. Нужна сравнению способов решения:
-  /// прогонять два алгоритма по одной записи имеет смысл только тогда, когда они
-  /// различаются РОВНО одним фактором, а все пороги, окна и подвыборка у них
-  /// общие. Перечислять здесь обязано все поля: молча сброшенное число было бы
-  /// тем самым «одновременным изменением двух факторов».
+  /// Копия с одним-двумя изменёнными числами. Менять настройку стенда имеет
+  /// смысл по одному фактору за раз, иначе непонятно, что именно улучшило или
+  /// сломало результат. Перечислять здесь обязано все поля: молча сброшенное
+  /// число было бы тем самым «одновременным изменением двух факторов».
   LampConfig copyWith({
     double? hitFraction,
     double? templateMinSeparation,
@@ -244,7 +234,6 @@ class LampConfig {
     double? ringScale,
     double? lumaPercentile,
     double? clipLuma,
-    bool? spatialVectors,
   }) {
     return LampConfig(
       hitFraction: hitFraction ?? this.hitFraction,
@@ -275,7 +264,6 @@ class LampConfig {
       ringScale: ringScale ?? this.ringScale,
       lumaPercentile: lumaPercentile ?? this.lumaPercentile,
       clipLuma: clipLuma ?? this.clipLuma,
-      spatialVectors: spatialVectors ?? this.spatialVectors,
     );
   }
 
@@ -307,18 +295,12 @@ class LampConfig {
     'ringScale': ringScale,
     'lumaPercentile': lumaPercentile,
     'clipLuma': clipLuma,
-    // `spatialVectors` сюда не пишется нарочно: сохранённый флаг пережил бы
-    // смену значения по умолчанию и молча вернул цветовое решение на каждом
-    // следующем запуске. Это переключатель на прогон (меню «⋮»), а не настройка
-    // стенда.
   };
 
   /// Сохранённые конфиги могут содержать уже удалённые ключи (`brightY`,
   /// `whiteSatMax`, `redDeltaDivisor`, `coreSideRatio`, `baselineAlpha`,
-  /// `whiteOnThreshold`, `redOnThreshold`, `redFracDivisor`, `noiseSigmas`) —
-  /// они игнорируются. Игнорируется и `spatialVectors`: в старых файлах он
-  /// записан автоматически, по прежнему умолчанию `false`, и читать его как
-  /// выбор оператора нельзя.
+  /// `whiteOnThreshold`, `redOnThreshold`, `redFracDivisor`, `noiseSigmas`,
+  /// `spatialVectors`) — они игнорируются.
   factory LampConfig.fromJson(Map<String, Object?> json) {
     const LampConfig def = LampConfig();
     double d(String key, double fallback) => (json[key] as num?)?.toDouble() ?? fallback;
@@ -353,9 +335,6 @@ class LampConfig {
       ringScale: d('ringScale', def.ringScale),
       lumaPercentile: d('lumaPercentile', def.lumaPercentile),
       clipLuma: d('clipLuma', def.clipLuma),
-      // Ключ 'spatialVectors' из файла сознательно НЕ читается: см. комментарий
-      // в [toJson]. Решение по умолчанию — яркость и геометрия.
-      spatialVectors: def.spatialVectors,
     );
   }
 }

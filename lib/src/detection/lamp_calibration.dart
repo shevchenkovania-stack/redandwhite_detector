@@ -196,11 +196,10 @@ class LampCalibration {
   /// Шаг, который набирается сейчас.
   CalibrationStep get step => _step;
 
-  /// Каким вектором измерена эта калибровка: шестью цветовыми долями или
-  /// восемью яркостными областями. Зависит только от [LampConfig.spatialVectors]
-  /// и обязан совпадать с вектором `LampResponseModel`, иначе отчёт шага и
+  /// Каким вектором измерена эта калибровка: восемью яркостными областями.
+  /// Обязан совпадать с вектором `LampResponseModel`, иначе отчёт шага и
   /// решение детектора считаются в разных числах.
-  LampVector get vector => LampVector.fromConfig(config);
+  LampVector get vector => const LampVector();
 
   /// Прежний фон — единственное, с чем можно сравнить кадр, пока свой шаг
   /// «фон» ещё не набран. Нужен только подсказке мастера калибровки («лампа
@@ -220,37 +219,23 @@ class LampCalibration {
     step: _step,
   );
 
-  /// Насколько «своя» доля пикселей должна уйти от фона, чтобы счесть лампу
-  /// зажжённой: не меньше `lampGateSigmas` σ фона, но и не меньше
-  /// `lampGateMin` — иначе на спокойной сцене лампу «увидит» от одного дрога
-  /// автоэкспозиции.
+  /// Пороги, отделяющие подъём лампы от шума: не меньше `lampGateSigmas` σ
+  /// фона, но и не меньше `lampGateMinLuma` уровней яркости — иначе на
+  /// спокойной сцене лампу «увидит» от одного дрога автоэкспозиции.
   static const double lampGateSigmas = 4;
-  static const double lampGateMin = 0.05;
 
-  /// Те же два порога для яркости, в уровнях 0..255: `lampGateMinLuma` — это
-  /// `lampGateMin` в единицах яркости (12 уровней), а `lampGateAsymmetry` —
-  /// во сколько раз своя рамка обязана подняться сильнее чужой. Последнее и
-  /// есть ответ на автоэкспозицию: общий подъём света поднимает обе рамки
-  /// почти одинаково, лампа шага — только свою.
+  /// `lampGateAsymmetry` — во сколько раз своя рамка обязана подняться сильнее
+  /// чужой. Именно это и есть ответ на автоэкспозицию: общий подъём света
+  /// поднимает обе рамки почти одинаково, лампа шага — только свою.
   static const double lampGateMinLuma = 12.0;
   static const double lampGateAsymmetry = 1.5;
 
   /// Зажглась ли лампа этого шага прямо сейчас.
   ///
-  /// Смотрит только на долю «её» пикселей: белая — `whiteFrac`, красная —
-  /// `redFrac`. Яркость не годится: автоэкспозиция поднимает обе рамки разом,
-  /// и тогда красная «зажигалась» бы от белой.
-  ///
-  /// Признак берётся из своей рамки, а если рамка вписана в колпак плотно, то
-  /// ещё и из чужой: на стенде красный ореол живёт вокруг колпака
-  /// (`redFrac 0.007 → 0.811`), и своя рамка вспышку почти не видит. Доля
-  /// чужого цвета в чужой рамке на автоэкспозицию не растёт — она появляется
-  /// только когда цвет в кадре реально есть.
-  ///
-  /// При [LampConfig.spatialVectors] тот же вопрос решается по яркости своих
-  /// областей (см. [_litByLuma]) — без требования «чтобы в кадре появился
-  /// белый или красный пиксель», иначе пересвеченная красная лампа снова
-  /// стала бы невидимой для своего шага.
+  /// Считается по яркости СВОИХ областей — ядра и кольца этой рамки против тех
+  /// же областей фона ([_lit]). По доле «своих» цветных пикселей больше
+  /// никогда: пересвеченная красная лампа для сенсора белая, и её шаг при
+  /// цветовом признаке просто не набирался.
   ///
   /// `false` до того, как набран шаг «фон»: сравнивать ещё не с чем.
   bool lampAppeared(LampFrame frame, CalibrationStep step) {
@@ -274,41 +259,14 @@ class LampCalibration {
     return _lit(frame, step, bg);
   }
 
-  bool _lit(LampFrame frame, CalibrationStep step, CalibrationState bg) {
-    if (config.spatialVectors) {
-      return _litByLuma(frame, step, bg);
-    }
-    final double own;
-    final double ownSigma;
-    final double other;
-    final double otherSigma;
-    if (step == CalibrationStep.whiteOn) {
-      own = frame.white.whiteFrac - bg.white.whiteFrac;
-      ownSigma = bg.whiteSigma.whiteFrac;
-      other = frame.red.whiteFrac - bg.red.whiteFrac;
-      otherSigma = bg.redSigma.whiteFrac;
-    } else {
-      own = frame.red.redFrac - bg.red.redFrac;
-      ownSigma = bg.redSigma.redFrac;
-      other = frame.white.redFrac - bg.white.redFrac;
-      otherSigma = bg.whiteSigma.redFrac;
-    }
-    return _seen(own, ownSigma) || _seen(other, otherSigma);
-  }
-
   /// Вспышка лампы шага по яркости её собственных областей: ядро и кольцо
   /// этой рамки против тех же областей фона.
-  ///
-  /// Цвета здесь нет вовсе. Пересвеченная красная лампа для сенсора белая —
-  /// `redFrac` в ней падает до нуля, — но свет её ложится вокруг КРАСНОЙ
-  /// рамки, и это различимо всегда. Поэтому решение берётся из того, КУДА
-  /// поднялась яркость, а не из того, какого цвета пиксели.
   ///
   /// Чужая рамка нужна вторым условием, а не первым: автоэкспозиция и общий
   /// свет поднимают обе рамки почти одинаково, лампа шага — свою заметно
   /// сильнее. Именно эту асимметрию и проверяет `lampGateAsymmetry`; без неё
   /// яркостный порог ловил бы каждый дрог экспозиции как «лампа зажглась».
-  bool _litByLuma(LampFrame frame, CalibrationStep step, CalibrationState bg) {
+  bool _lit(LampFrame frame, CalibrationStep step, CalibrationState bg) {
     final bool white = step == CalibrationStep.whiteOn;
     final double own = _rise(
       white ? frame.white : frame.red,
@@ -357,9 +315,6 @@ class LampCalibration {
     }
     return best;
   }
-
-  static bool _seen(double delta, double sigma) =>
-      delta >= math.max(lampGateMin, lampGateSigmas * sigma);
 
   /// Начать заново с фона, забыв всё, что было набрано.
   void reset() {
@@ -537,16 +492,15 @@ class LampCalibration {
       exposureTimeNs: shot.ns,
       sensorSensitivity: shot.gain,
     );
-    final LampResponseModel model = LampResponseModel(baseline, config: config);
-    if (config.spatialVectors && baseline.background.whiteRing == null) {
-      // Пространственный вектор без колец — это те же два колпака и ничего
-      // больше: отличить засветку от своей лампы становится нечем, и модель
-      // начала бы решать по обрезанному вектору, не сказав об этом.
+    final LampResponseModel model = LampResponseModel(baseline);
+    if (baseline.background.whiteRing == null) {
+      // Вектор без колец — это те же два колпака и ничего больше: отличить
+      // засветку от своей лампы становится нечем, и модель начала бы решать по
+      // обрезанному вектору, не сказав об этом.
       throw CalibrationException(
-        'Пространственная калибровка не измеряла ореолы: кольцо вокруг рамок '
-        'выключено (ringScale = 1). Включи измерение кольца и повтори все три '
-        'шага — без ореолов восьмимерный вектор вырождается в яркость двух '
-        'колпаков.',
+        'Калибровка не измеряла ореолы: кольцо вокруг рамок выключено '
+        '(ringScale = 1). Включи измерение кольца и повтори все три шага — без '
+        'ореолов восьмимерный вектор вырождается в яркость двух колпаков.',
         brief: 'Нет колец: включи ringScale > 1 и повтори шаги 1–3.',
       );
     }
@@ -636,7 +590,7 @@ class LampCalibration {
     // В состояние ложится обычная σ (пороги от неё остаются консервативными),
     // а шаг отбраковывается по устойчивой к выбросам: один кадр с прошедшей
     // рукой не должен обесценивать весь набор.
-    final LampVector vector = LampVector.fromConfig(config);
+    final LampVector vector = const LampVector();
     final Float64List mean = vector.ofState(state);
     final Float64List sigma = _robustSigma(frames, vector);
     final Float64List? from =
