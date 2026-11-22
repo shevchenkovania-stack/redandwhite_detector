@@ -43,16 +43,19 @@ class RollingFloor {
     _observed.clear();
   }
 
-  /// Все значения зоны за то же окно, включая яркие и пересвеченные: по ним
-  /// меряется РАЗМАХ канала (пик минус «пол»), а не только его тёмное состояние.
-  void observe(double value) {
+  /// До [window] последних ярких значений зоны — те кадры, что НЕ вошли в
+  /// «пол» (отвергнуты как вспышка или как пересвет). Только по ним меряется размах
+  /// канала: значения, принятые в «пол», — это фон, и считать размах по ним
+  /// означало бы принять собственное гуляние фона за амплитуду лампы.
+  void observeBright(double value) {
     _observed.add(value);
     if (_observed.length > window) {
       _observed.removeAt(0);
     }
   }
 
-  /// Наибольшее значение зоны за окно. Null — зону ещё не видели ни разу.
+  /// Наибольшее из сохранённых ЯРКИХ значений. Null — ярких отклонений не было:
+  /// лампа свою амплитуду ещё не показала, и размах неизвестен.
   double? get peak {
     if (_observed.isEmpty) {
       return null;
@@ -384,17 +387,6 @@ class LiveReference {
     _hasWhiteRing = whiteRing != null;
     _hasRedRing = redRing != null;
 
-    // Размах меряется по КАЖДОМУ кадру, даже по тому, что не решён (смена
-    // сцены): это наблюдение за зоной, а не решение о вспышке.
-    _whiteCore.observe(whiteCore);
-    _redCore.observe(redCore);
-    if (whiteRing != null) {
-      _whiteRing.observe(whiteRingValue);
-    }
-    if (redRing != null) {
-      _redRing.observe(redRingValue);
-    }
-
     final double whiteCoreRise = _whiteCore.rise(whiteCore) ?? 0;
     final double redCoreRise = _redCore.rise(redCore) ?? 0;
     final double whiteRingRise = whiteRing == null
@@ -487,6 +479,41 @@ class LiveReference {
             : redCoreRise >= redCoreLevel ||
                   (redRingHeard && redRingRise >= redRingLevel));
 
+    // Допуск кадра в «пол» вычисляется до любого решения: по нему же зона
+    // сообщает свой ЯРКИЙ пик. Яркие кадры наблюдаются на КАЖДОМ шаге, в том
+    // числе на нерешённом (смена сцены, обе рамки выросли): это измерение
+    // размаха, а не решение о вспышке. Пропускать такие кадры нельзя — именно
+    // на них лампа показывает свою амплитуду, и пик устаревает.
+    final double clip = _config.clipLuma;
+    final bool whiteCoreDark = _darkSample(
+      _whiteCore,
+      whiteCore,
+      frame.white.p90Luma >= clip,
+    );
+    final bool redCoreDark = _darkSample(
+      _redCore,
+      redCore,
+      frame.red.p90Luma >= clip,
+    );
+    final bool whiteRingDark =
+        whiteRing != null &&
+        _darkSample(_whiteRing, whiteRingValue, whiteRing.p90Luma >= clip);
+    final bool redRingDark =
+        redRing != null &&
+        _darkSample(_redRing, redRingValue, redRing.p90Luma >= clip);
+    if (!whiteCoreDark) {
+      _whiteCore.observeBright(whiteCore);
+    }
+    if (!redCoreDark) {
+      _redCore.observeBright(redCore);
+    }
+    if (whiteRing != null && !whiteRingDark) {
+      _whiteRing.observeBright(whiteRingValue);
+    }
+    if (redRing != null && !redRingDark) {
+      _redRing.observeBright(redRingValue);
+    }
+
     // Вопрос «какая лампа» задаётся РАНЬШЕ вопроса «не смена ли это сцены».
     // Чужая вспышка поднимает нашу рамку засветкой, но свою — заметно сильнее,
     // и этот перевес (`lampGateAsymmetry` из калибровки, те же 1.5, что требует
@@ -566,24 +593,15 @@ class LiveReference {
     // причине: Y = 255 не различает «лампа горит» и «пересвечен фон», доли цвета
     // там тоже сгорают (замер: выжженный колпак wf 1.000 вошёл в окно «пола»).
     // Такие кадры в окно не пишутся ни при каком решении.
-    final double clip = _config.clipLuma;
     _add(
       whiteCore: whiteCore,
       redCore: redCore,
       whiteRing: whiteRing == null ? null : whiteRingValue,
       redRing: redRing == null ? null : redRingValue,
-      whiteCoreDark: _darkSample(
-        _whiteCore,
-        whiteCore,
-        frame.white.p90Luma >= clip,
-      ),
-      redCoreDark: _darkSample(_redCore, redCore, frame.red.p90Luma >= clip),
-      whiteRingDark:
-          whiteRing != null &&
-          _darkSample(_whiteRing, whiteRingValue, whiteRing.p90Luma >= clip),
-      redRingDark:
-          redRing != null &&
-          _darkSample(_redRing, redRingValue, redRing.p90Luma >= clip),
+      whiteCoreDark: whiteCoreDark,
+      redCoreDark: redCoreDark,
+      whiteRingDark: whiteRingDark,
+      redRingDark: redRingDark,
     );
     _last = reading;
     return reading;
@@ -637,7 +655,11 @@ class LiveReference {
   /// канал (см. [LampConfig.referenceMaxLevel]).
   ///
   /// Потолок дополнительно ограничен ПОЛОВИНОЙ СОБСТВЕННОГО РАЗМАХА канала
-  /// (пик за окно минус «пол»), но не ниже `referenceMinRise`. Абсолютный
+  /// (наибольшее ЯРКОЕ значение за окно минус «пол»), но не ниже
+  /// `referenceMinRise`. Ярких отклонений не было — потолок прежний,
+  /// `referenceMaxLevel`: иначе собственное гуляние фона (замер в тесте:
+  /// фон 0.04↔0.06) выдало бы себя за амплитуду лампы, уронило порог до
+  /// минимума, и следующий шаг фона стал бы событием. Абсолютный
   /// потолок 0.15 предполагал, что у вспышки всегда есть запас яркости: на
   /// пересвеченной рамке (замер 21.11.2026: красная рамка 243/255 от чужой
   /// белой лампы, 255 от своей) весь подъём — 0.05, и канал молчал, а у тусклой

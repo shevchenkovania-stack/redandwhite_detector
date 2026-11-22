@@ -357,6 +357,30 @@ void main() {
       expect(bench.events.single.color, HitColor.white);
     });
 
+    test('яркость неоднозначных кадров не теряется перед решением канала', () {
+      final _Bench bench = _Bench(config: cfg());
+      for (int i = 0; i < 40; i++) {
+        final double background = i.isEven ? 0.08 : 0.02;
+        bench.feed(white: background, red: background);
+      }
+      expect(bench.events, isEmpty);
+
+      // Обе рамки выше шумового порога, перевеса нет: кадр не решает канал,
+      // но его яркость обязана измерить размах для следующего кадра.
+      bench.feed(white: 0.20, red: 0.20);
+      bench.feed(white: 0.13, red: 0.13);
+      expect(bench.detector.liveReading.whiteAboveOn, isFalse);
+      expect(bench.detector.liveReading.redAboveOn, isFalse);
+      expect(bench.events, isEmpty);
+
+      // Теперь виден перевес красной. Без наблюдения пика на двух предыдущих
+      // кадрах её подъём меньше шумового порога и событие молча теряется.
+      bench.feed(white: 0.02, red: 0.13);
+      bench.feed(white: 0.02, red: 0.13);
+      expect(bench.events, hasLength(1));
+      expect(bench.events.single.color, HitColor.red);
+    });
+
     test('порог берётся из шума окна, а не только из минимума', () {
       final _Bench bench = _Bench(config: cfg());
       bench.warmup();
@@ -375,6 +399,30 @@ void main() {
       bench.feed(white: 0.40);
       bench.feed(white: 0.40);
       expect(bench.events, hasLength(1));
+    });
+
+    test('после яркой вспышки тусклая считается на том же шумном фоне', () {
+      final _Bench bench = _Bench(config: cfg());
+      bench.warmup();
+      for (int i = 0; i < 25; i++) {
+        bench.feed(white: i.isEven ? 0.06 : 0.04);
+      }
+      expect(bench.events, isEmpty);
+
+      for (int i = 0; i < 3; i++) {
+        bench.feed(white: 0.25);
+      }
+      expect(bench.events, hasLength(1));
+
+      // После паузы лампа вдвое слабее обязана срабатывать на том же шумном
+      // фоне: прежняя яркая вспышка не должна мешать следующему измерению.
+      for (int i = 0; i < 30; i++) {
+        bench.feed(white: i.isEven ? 0.06 : 0.04);
+      }
+      for (int i = 0; i < 3; i++) {
+        bench.feed(white: 0.13);
+      }
+      expect(bench.events, hasLength(2));
     });
 
     test('клиппинг на старте не переоткрывает вспышку каждые 10 кадров', () {

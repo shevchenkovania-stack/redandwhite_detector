@@ -4,14 +4,13 @@ import 'dart:io' show Directory;
 import 'package:flutter/material.dart';
 import 'package:lamp_detection/lamp_detection.dart';
 
-import 'opencv_sensor.dart';
 import 'widgets/event_log.dart';
 import 'widgets/roi_editor.dart';
 
 /// Демо детекции. На экране только главное: превью, «Пуск», три кнопки
 /// калибровки и строка «готов ли я считать». Рамки наводятся пальцем.
 ///
-/// В меню «⋮» ровно то, без чего прогона не сделать: способ решения, журнал
+/// В меню «⋮» ровно то, без чего прогона не сделать: журнал
 /// событий, ошибки и сброс калибровки. Отладочные переключатели (запись CSV и
 /// поток чисел) отсюда убраны и работают по умолчанию всегда: разбираться с
 /// прогоном без чисел нечем, а в меню они мешали оператору у лампы.
@@ -33,10 +32,6 @@ class _HomePageState extends State<HomePage> {
   StreamSubscription<String>? _errorsSub;
   bool _staleLogged = false;
   Timer? _logTimer;
-
-  /// Датчик: null = 1 Dart, значение = 2 OpenCV (строго). Держим ссылку,
-  /// чтобы освободить нативную память при переключении и закрытии экрана.
-  OpenCvSensorExtractor? _sensor;
 
   /// Сколько ждём подъёма камеры. Больше — и первый запуск выглядит зависшим:
   /// плагин `camera` на части устройств не отвечает вовсе, а оператор обязан
@@ -177,11 +172,6 @@ class _HomePageState extends State<HomePage> {
     _logTimer?.cancel();
     unawaited(_hitsSub?.cancel());
     unawaited(_errorsSub?.cancel());
-    // Датчик-подкласс сидит в сессии и держит Mat прошлого кадра: сначала
-    // возвращаем штатный измеритель, потом освобождаем нативную память.
-    _session?.sensorExtractor = null;
-    _sensor?.dispose();
-    _sensor = null;
     _session?.removeListener(_onSessionChanged);
     unawaited(_session?.dispose());
     super.dispose();
@@ -257,52 +247,13 @@ class _HomePageState extends State<HomePage> {
     setState(() => _message = 'Калибровка сброшена. ${session.readiness.why}');
   }
 
-  /// Два режима: 1 — Dart, 2 — только OpenCV. При выборе того же режима
-  /// ничего не меняем: калибровка не сбрасывается зря.
-  Future<void> _setSensor(
-    DetectionSession session, {
-    required bool opencv,
-  }) async {
-    if ((_sensor != null) == opencv) {
-      return;
-    }
-    final bool wasRecording = session.status.recordingCsv;
-    if (wasRecording) {
-      await session.setRecordingCsv(false);
-    }
-    final OpenCvSensorExtractor? current = _sensor;
-    if (current != null) {
-      session.sensorExtractor = null;
-      current.dispose();
-      _sensor = null;
-    }
-    if (opencv) {
-      final OpenCvSensorExtractor next = OpenCvSensorExtractor(
-        config: session.config,
-      );
-      session.sensorExtractor = next;
-      _sensor = next;
-    }
-    session.resetCalibration();
-    if (wasRecording) {
-      await session.setRecordingCsv(true);
-    }
-    if (!mounted) {
-      return;
-    }
-    final String name = opencv ? 'OpenCV' : 'Dart';
-    setState(() => _message = 'Датчик: $name. Жми «1 ФОН»');
-    debugPrint('SENSOR $name');
-  }
-
-  /// Какой датчик меряет — метка в каждой строке лога.
+  /// Что считает прогон — метка в каждой строке лога.
   String get _modeTag {
     final DetectionSession? s = _session;
     if (s == null) {
-      return 'sensor=?';
+      return 'ref=?';
     }
-    return 'ref=${s.config.liveReference ? "live" : "etalon"} '
-        'sensor=${_sensor == null ? "dart" : "opencv"}';
+    return 'ref=${s.config.liveReference ? "live" : "etalon"}';
   }
 
   /// Компактная строка чисел прогона в logcat (тег LAMPDBG), примерно 5 раз/с.
@@ -428,18 +379,6 @@ class _HomePageState extends State<HomePage> {
                   value: 'calreset',
                   child: Text('Сброс калибровки'),
                 ),
-                PopupMenuItem<String>(
-                  value: 'dart',
-                  child: Text(
-                    _sensor == null ? '1 Датчик: Dart ✓' : '1 Считать по Dart',
-                  ),
-                ),
-                PopupMenuItem<String>(
-                  value: 'opencv',
-                  child: Text(
-                    _sensor != null ? '2 Датчик: OpenCV ✓' : '2 Только OpenCV',
-                  ),
-                ),
                 const PopupMenuDivider(),
                 const PopupMenuItem<String>(
                   value: 'log',
@@ -517,10 +456,6 @@ class _HomePageState extends State<HomePage> {
     switch (id) {
       case 'calreset':
         _resetCalibration();
-      case 'dart':
-        await _setSensor(session, opencv: false);
-      case 'opencv':
-        await _setSensor(session, opencv: true);
       case 'log':
         await _sheet(
           'Журнал событий',
