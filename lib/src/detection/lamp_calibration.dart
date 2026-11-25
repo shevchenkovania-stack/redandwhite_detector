@@ -698,6 +698,8 @@ class LampCalibration {
     double meanY = 0;
     double whiteFrac = 0;
     double redFrac = 0;
+    double coolFrac = 0;
+    double warmFrac = 0;
     double p90 = 0;
     double stdDev = 0;
     double clipped = 0;
@@ -706,6 +708,8 @@ class LampCalibration {
       meanY += f.meanY;
       whiteFrac += f.whiteFrac;
       redFrac += f.redFrac;
+      coolFrac += f.coolFrac;
+      warmFrac += f.warmFrac;
       p90 += f.p90Luma;
       stdDev += f.lumaStdDev;
       clipped += f.clippedRatio;
@@ -717,6 +721,8 @@ class LampCalibration {
       sampleCount: (samples / n).round(),
       whiteFrac: whiteFrac / n,
       redFrac: redFrac / n,
+      coolFrac: coolFrac / n,
+      warmFrac: warmFrac / n,
       p90Luma: p90 / n,
       lumaStdDev: stdDev / n,
       clippedRatio: clipped / n,
@@ -729,6 +735,8 @@ class LampCalibration {
     sampleCount: 0,
     whiteFrac: _stdOf(features.map((FrameFeatures f) => f.whiteFrac)),
     redFrac: _stdOf(features.map((FrameFeatures f) => f.redFrac)),
+    coolFrac: _stdOf(features.map((FrameFeatures f) => f.coolFrac)),
+    warmFrac: _stdOf(features.map((FrameFeatures f) => f.warmFrac)),
     p90Luma: _stdOf(features.map((FrameFeatures f) => f.p90Luma)),
     lumaStdDev: _stdOf(features.map((FrameFeatures f) => f.lumaStdDev)),
     clippedRatio: _stdOf(features.map((FrameFeatures f) => f.clippedRatio)),

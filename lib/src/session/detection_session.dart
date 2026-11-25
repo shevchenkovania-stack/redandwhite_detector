@@ -441,6 +441,11 @@ class DetectionSession extends ChangeNotifier {
   double? get whiteOnLevel => _detector.whiteOnLevel;
   double? get redOnLevel => _detector.redOnLevel;
 
+  /// Сколько раз кадр просился сразу в обе корзины и был отдан одной
+  /// (`LampDetector._oneBasket`). Ноль — правило не пригодилось; каждое
+  /// число больше нуля видно в `LAMPDBG both=` и проверяется на прогоне.
+  int get doubleBasketFrames => _detector.doubleBasketFrames;
+
   /// Диагностика окон живого отсчёта для периодического LAMPDBG.
   String get liveDebugTag => _detector.liveDebugTag;
 
@@ -463,8 +468,11 @@ class DetectionSession extends ChangeNotifier {
     if (!_detector.canEvaluate) {
       return (ready: false, why: 'Нет калибровки — начни с «1 ФОН»');
     }
-    // Живому отсчёту нужно окно темноты: до него решения просто нет.
-    final int warmup = _config.liveReference ? _detector.liveWarmupLeft : 0;
+    // Скользящим способам (живому и HSV) нужно окно темноты: до него решения
+    // просто нет.
+    final int warmup = _config.countMode == LampCountMode.etalon
+        ? 0
+        : _detector.liveWarmupLeft;
     if (warmup > 0) {
       return (ready: false, why: 'Жду тёмный фон, осталось значений: $warmup');
     }
@@ -794,7 +802,7 @@ class DetectionSession extends ChangeNotifier {
       return const <HitEvent>[];
     }
     final LampDetector detector = LampDetector(_config);
-    if (!_config.liveReference) {
+    if (_config.countMode == LampCountMode.etalon) {
       detector.setBaseline(baseline ?? _calibrateFrom(rows));
     } else if (baseline != null) {
       detector.setBaseline(baseline);
@@ -807,13 +815,17 @@ class DetectionSession extends ChangeNotifier {
     return events;
   }
 
-  /// Разбор ОДНОЙ записи (CSV v4 и старых форматов): сколько событий
+  /// Разбор ОДНОЙ записи (CSV v5 и старых форматов): сколько событий
   /// она набрала и какие у неё длительности провалов и пауз.
   ///
   /// Главное здесь — второе: по записи измеряются числа, которыми задают
   /// [LampConfig.offConfirmMs]; без записи их придумывать нечем (см. журнал §11).
+  ///
+  /// Разбор идёт тем же режимом, каким считалась сама запись (способ счёта
+  /// текущей конфигурации): HSV-прогон, пересчитанный по яркости, дал бы другой
+  /// счёт, который нельзя сравнить ни с чем (журнал §11.12).
   RunAnalysis analyzeRecording(String csvContent) =>
-      RunAnalyzer.analyze(csvContent, base: _config);
+      RunAnalyzer.analyze(csvContent, base: _config, mode: _config.countMode);
 
   /// Калибровка из CSV по меткам шагов: по три состояния, как на живом стенде.
   LampBaseline _calibrateFrom(List<FeatureCsvRow> rows) {
@@ -908,7 +920,7 @@ class DetectionSession extends ChangeNotifier {
     // и без калибровки, поэтому оператор, наводящий рамки уже после «Пуск»,
     // получал окно, снятое с фона и с чужого места кадра, и единственный способ
     // это починить был «Стоп» → «Пуск» (ЖУРНАЛ §6.21).
-    if (_config.liveReference) {
+    if (_config.countMode != LampCountMode.etalon) {
       relearnLight();
     }
   }
@@ -969,6 +981,74 @@ class DetectionSession extends ChangeNotifier {
     _detector.config = config;
     diagnostics.isolateThresholdMs = config.analysisIsolateThresholdMs;
     _notify(force: true);
+  }
+
+  /// Способ счёта: `etalon` — по калибровке (снять кнопками фон → белая →
+  /// красная, без этого счёт не стартует), `live` — по яркости, `hsv` — по доле
+  /// цветных пикселей; обоим скользящим способам калибровка не нужна, и трёх
+  /// кнопок на экране нет.
+  ///
+  /// Гистерезис и окно «пола» сбрасываются при любом переключении: у способов
+  /// разные единицы (доля отклика, яркость, доля цвета), и окно, набранное в
+  /// одних, не годится для порога в других — тот же дефект, что §6.21, только
+  /// замаскированный переключателем.
+  Future<void> setCountMode(LampCountMode mode) async {
+    if (_config.countMode == mode) {
+      return;
+    }
+    applyConfig(_config.withCountMode(mode));
+    _detector.resetTracking();
+    await saveConfig();
+    _report(switch (mode) {
+      LampCountMode.etalon =>
+        'Счёт по калибровке: сними три шага кнопками, до этого удары не считаются',
+      LampCountMode.live =>
+        'Счёт живой: калибровка не нужна, держи лампы погашенными пару секунд',
+      LampCountMode.hsv =>
+        'Счёт по цвету: калибровка не нужна, держи лампы погашенными пару секунд',
+    }, isError: false);
+  }
+
+  /// Пресеты порога счёта, по которым ходит рубильник в меню.
+  ///
+  /// Различаются ОДНИМ числом — множителем σ окна, то есть тем, насколько
+  /// подъём обязан перевешивать шум фона: `6` — как измерено на стенде, `2` —
+  /// полупрозрачный шум, `0` — «в лоб», любой подъём минимум на
+  /// [LampConfig.referenceMinRise] над «полом». Множитель читают ОБА скользящих
+  /// способа: живой ([LiveReference]) и HSV (её уровень — `referenceNoiseSigmas ×
+  /// σ` того же окна), поэтому пункт живёт в меню и там,
+  /// и там, а не только в «живом». Больше одного фактора за раз менять нельзя:
+  /// непонятно, что именно дало результат.
+  static const List<({String label, double sigmas})> liveSensitivityPresets =
+      <({String label, double sigmas})>[
+        (label: 'строгая · 6σ', sigmas: 6),
+        (label: 'мягкая · 2σ', sigmas: 2),
+        (label: 'в лоб · без σ', sigmas: 0),
+      ];
+
+  /// Имя текущего пресета; «свой», если множитель σ задан вручную.
+  String get liveSensitivityLabel {
+    for (final ({String label, double sigmas}) p in liveSensitivityPresets) {
+      if (_config.referenceNoiseSigmas == p.sigmas) {
+        return p.label;
+      }
+    }
+    return 'свой · ${_config.referenceNoiseSigmas}σ';
+  }
+
+  /// Следующий пресет порога по кругу. Окно не пересобирается: множитель σ
+  /// применяется к каждому кадру, а «пол» от него не зависит.
+  Future<void> cycleLiveSensitivity() async {
+    final List<({String label, double sigmas})> presets =
+        liveSensitivityPresets;
+    final int current = presets.indexWhere(
+      (p) => p.sigmas == _config.referenceNoiseSigmas,
+    );
+    final ({String label, double sigmas}) next =
+        presets[(current + 1) % presets.length];
+    applyConfig(_config.copyWith(referenceNoiseSigmas: next.sigmas));
+    await saveConfig();
+    _report('Порог счёта: ${next.label}', isError: false);
   }
 
   /// Принудительное соответствие превью <-> кадр (если авто-расчёт не угадал
@@ -1211,9 +1291,10 @@ class DetectionSession extends ChangeNotifier {
 
     if (_recordingCsv) {
       // Диагностика привязана к тому же кадру, что и решение. При калибровке
-      // живой отсчёт не вызывался, поэтому его поля остаются пустыми, а не
-      // повторяют устаревшее состояние предыдущего рабочего кадра.
-      final liveReading = evaluation != null && _config.liveReference
+      // скользящие отсчёты не вызывались, поэтому их поля остаются пустыми, а
+      // не повторяют устаревшее состояние предыдущего рабочего кадра.
+      final liveReading =
+          evaluation != null && _config.countMode != LampCountMode.etalon
           ? _detector.liveReading
           : null;
       final reference = liveReading == null ? null : _detector.liveDiagnostics;

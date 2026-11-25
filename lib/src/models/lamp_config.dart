@@ -37,6 +37,20 @@ class LampConfig {
     this.ringScale = 1.7,
     this.lumaPercentile = 0.9,
     this.clipLuma = 248,
+    this.hsvReference = false,
+    this.hsvCoolValueMin = 217,
+    this.hsvCoolSatMax = 64,
+    this.hsvWarmValueMin = 140,
+    this.hsvWarmSatMin = 115,
+    this.hsvWarmHueMax = 45,
+    this.hsvMinRise = 0.06,
+    this.hsvMaxLevel = 0.40,
+    this.hsvGate = 3.0,
+    this.hsvClipValue = 0.97,
+    this.hsvClipOwn = 0.90,
+    this.hsvClipCross = 0.20,
+    this.hsvSignatureNaming = true,
+    this.hsvSignatureMinSigmas = 2.0,
   });
 
   /// Доля измеренного отклика, при которой лампа считается включённой.
@@ -202,6 +216,146 @@ class LampConfig {
   /// пикселей — признак качества кадра, а не признак лампы.
   final double clipLuma;
 
+  /// Считать вспышку по HSV-долям цветных пикселей, а не по яркости области.
+  ///
+  /// Третий способ счёта, отделённый от двух прежних специально: он решает не
+  /// «стало ли в рамке светлее», а «появилась ли в рамке площадь обесцвеченно
+  /// белого или площадь насыщенного красного». Причина в замерах: на 86
+  /// включениях, найденных самой HSV-моделью по 11 видео стенда 23.11.2026
+  /// (`tools/hsv_stats.py`), подъём `p90` яркости равен 0.068…0.753 при пороге
+  /// живого отсчёта 0.062…0.15 — и в 8 случаях из 86 до порога не дотягивает
+  /// (это и есть «не всегда считает вспышку»). Доля цветных пикселей на тех же
+  /// включениях поднимается на 0.061…1.0, а оттенок от выдержки не меняется.
+  ///
+  /// Включённый способ не требует калибровки, как и живой; переключение
+  /// сбрасывает окна, потому что они набраны в других единицах.
+  final bool hsvReference;
+
+  /// Пиксель «белый» в HSV: яркость (0..255) не ниже этого…
+  ///
+  /// 217 = 0.85·255 — нижняя граница той же пары, что у офлайн-модели
+  /// (`hsv_probe.COOL_V_MIN`). Цена измерена на кадрах, где модель посчитала
+  /// белую вспышку (`tools/hsv_bounds.py`, белая зона 49×49): площадь «почти
+  /// без оттенка» при 0.75 равна 881…1908 px/кадр, при 0.85 — 784…1759, при
+  /// 0.95 — 644…1603. Граница стоит 0…29 % площади (в среднем ~11 %), и ровно
+  /// она не даёт тёмной стене и ореолу сойти за лампу.
+  final double hsvCoolValueMin;
+
+  /// …и насыщенность (0..255 по шкале OpenCV) не выше этого.
+  ///
+  /// 64 = 0.25·255 (`hsv_probe.COOL_S_MAX`). Смысл пары в том, что в «белые»
+  /// не попадает ни тёмная стена (яркости нет), ни оранжевый ореол (насыщения
+  /// много). По замерам граница стоит своих процентов: на кадрах белой
+  /// вспышки p50 насыщенности ярких пикселей 0.000…0.35, а окно 0.25 теряет
+  /// 0…13 % площади против 0.15 и набирает 0…11 % против 0.35 — то есть
+  /// правило стоит на месте, а не на выбранном числе. То, что отбор различает
+  /// белый свет и оранжевый ореол, проверено ещё и на синтетике
+  /// `test/hsv_reference_test.dart`.
+  final double hsvCoolSatMax;
+
+  /// Пиксель «красный» в HSV: яркость (0..255) не ниже этого…
+  ///
+  /// 140 = 0.55·255 (`hsv_probe.WARM_V_MIN`) отсекает тёмную тёплую часть кадра
+  /// — по оттенку она совпадает с лампой, но заметно темнее. Цена измерена на
+  /// кадрах красной вспышки (`tools/hsv_bounds.py`, красная зона 49×49): площадь
+  /// оттенокного ядра при 0.45 равна 201…1780 px/кадр, при 0.55 — 128…1716, при
+  /// 0.65 — 44…1631; доля ядра темнее 0.55 доходит до 47 % только на одной
+  /// записи (190707). Перебор той же границы (`hsv_decide.py vmin 0.45 0.55
+  /// 0.65`) даёт 43/36, 46/40 и 43/41 событий — на этих записях граница исход
+  /// не решает, и без разметки «что горело» выбрать её по числам нельзя.
+  final double hsvWarmValueMin;
+
+  /// …и насыщенность (0..255 по шкале OpenCV) не ниже этого.
+  ///
+  /// 115 = 0.45·255 (`hsv_probe.WARM_S_MIN`): не даёт в «красные» ни белой
+  /// лампы, ни выбеленного ею фона. Граница измерена с обеих сторон
+  /// (`tools/hsv_bounds.py`): на кадрах красной вспышки площадь оттенокного
+  /// ядра при S ≥ 0.35 равна 369…1794 px/кадр, при 0.45 — 128…1716, при 0.55 —
+  /// 39…1648; в фоне той же зоны — 1.9…783, 0…765 и 0…672 соответственно.
+  /// Сужать дальше нельзя (на 190707 ядро теряет 70 % площади), расширять
+  /// бессмысленно: на той же записи 0.35 добавляет к ядру +189 %, а к фону
+  /// только +79 %, и там уже фон краснее «горящей» лампы (180 px/кадр против
+  /// 128) — то есть красные события 190707 держатся не на площади лампы, а на
+  /// шуме той же самой зоны.
+  final double hsvWarmSatMin;
+
+  /// Полуокно оттенка вокруг чистого красного, в градусах. Пиксель красный,
+  /// если его оттенок ≤ этого или ≥ 360 − этого.
+  ///
+  /// 45°, а не «красный до 18°», потому что лампа на стенде светит оранжевым.
+  /// Замер на кадрах, где модель сама посчитала красную вспышку (`tools/
+  /// hsv_bounds.py`, красная зона 49×49): медиана оттенка ядра 25.6…34.7° по 11
+  /// записям, p95 33.6…39.8°. Цена окна измерена в пикселях на кадр: при 18°
+  /// остаётся 0…70 px, при 30° — 82…1022, при 45° — 128…1716, при 60°
+  /// прирост меньше 0.4 px. То есть узкое окно убивает признак целиком, а
+  /// шире 45° расширять нечего. Окно обязано быть и не слишком узким по
+  /// площади, и не широким: широкий «красный» начинает ловить дерево и стену.
+  final double hsvWarmHueMax;
+
+  /// Абсолютный минимум подъёма HSV-доли. Порог «k·σ» на ровной сцене равен
+  /// нулю, а единичные пиксели оттенка там есть всегда.
+  ///
+  /// 0.06 — вдвое выше измеренного шума закреплённой камеры (6σ тёмной части по
+  /// 11 записям 0…0.13) и ровно тот подъём, который дают худшие из посчитанных
+  /// включений (0.061): ниже этого порога отличить вспышку от шума уже нельзя.
+  final double hsvMinRise;
+
+  /// Потолок порога HSV-доли. Выше него канал молчит всегда: подъём доли
+  /// физически ограничен единицей, а ушедшая в движение камера раздувает σ окна.
+  ///
+  /// По 11 записям потолок не пригодился ни разу: наибольший «неограниченный»
+  /// 6σ равен 0.776 (белая зона 191508), но раньше срабатывает половина размаха
+  /// — ни один порог замеры не подняли выше 0.395. Число стоит против сцены,
+  /// которой в этих замерах нет (телефон на ходу, лампа тусклая).
+  final double hsvMaxLevel;
+
+  /// Во сколько раз подъём СВОЕГО канала обязан превысить подъём ЧУЖОГО канала
+  /// (его зоны), чтобы вспышка засчиталась.
+  ///
+  /// Нужно потому, что белая лампа заливает и красную зону, и наоборот, а
+  /// спецификация говорит, что одновременно они не горят: при двух подъёмах
+  /// разом прав тот, что больше. Выбрано 3.0 по человеческой разметке 23.11.2026
+  /// (заказчик продиктовал ПОРЯДОК включений б/к для 10 записей, 68 событий).
+  /// Оценщик — `tools/hsv_decide.py cmp`, ошибка = лишние + пропущенные события
+  /// после выравнивания ленты модели с разметкой: 30 при gate 1.0, 23 при 1.5,
+  /// 20 при 2.0, 17 при 3.0, снова рост к 4.0. Худший остаток — не вето, а
+  /// перетекание, которое вето не ловит: `191142` (б к к к -> 4 белых) и
+  /// `191158` (б к б к бк -> 5/5): там чужой канал поднимается на кадр РАНЬШЕ
+  /// своего, а вето сравнивает один и тот же кадр. Память вето (`mem`) по
+  /// разметке лучше не делает — при gate 3.0 ошибок 17, а не меньше.
+  final double hsvGate;
+
+  /// Яркость (p90 зоны в долях 0..1), с которой зона считается стоящей на
+  /// потолке сенсора: запаса яркости там нет, и оттенок перестаёт быть
+  /// измеримым.
+  final double hsvClipValue;
+
+  /// Доля СВОЕГО цвета, при которой вдобавок к потолку цвета уже не видно
+  /// вовсе — зона залита добела или добела-с-оттенком.
+  final double hsvClipOwn;
+
+  /// Заметная (0.20) доля ЧУЖОГО цвета в той же залитой зоне: два цвета в
+  /// одном кадре доказать нельзя, поэтому состояние канала не меняется. Без
+  /// этого кадра пересвеченная белая лампа успевала «погасить» красную.
+  final double hsvClipCross;
+
+  /// Называть вспышки по правилу, выученному калибровкой, а не по догадке «у
+  /// своей лампы поднят свой канал».
+  ///
+  /// Доказано на замерах 25.11.2026: на офисном стенде красная лампа даёт
+  /// больший подъём обесцвеченных пикселей, чем белая, поэтому догадка там не
+  /// просто шумна, а перевернута. Событие ищется по максимуму четырёх рядов, а
+  /// имя ему даёт граница, измеренная на шагах «2 БЕЛАЯ» и «3 КРАСНАЯ»
+  /// (`HsvSignature.learn`, журнал 37: 32 ошибки → 3 на клипах с настоящими
+  /// переключениями). Выключено — прежний путь с вето [hsvGate]; если
+  /// калибровка разделения не дала, детектор откатывается на него сам.
+  final bool hsvSignatureNaming;
+
+  /// Ниже какого разделения двух ламп (в σ) калибровка не даёт права называть
+  /// вспышки и остаётся прежнее правило. 2.0 — тот же смысл, что и у
+  /// [templateMinSeparation]: отклик обязан быть вдвое больше шума шага.
+  final double hsvSignatureMinSigmas;
+
   /// Копия с одним-двумя изменёнными числами. Менять настройку стенда имеет
   /// смысл по одному фактору за раз, иначе непонятно, что именно улучшило или
   /// сломало результат. Перечислять здесь обязано все поля: молча сброшенное
@@ -234,6 +388,20 @@ class LampConfig {
     double? ringScale,
     double? lumaPercentile,
     double? clipLuma,
+    bool? hsvReference,
+    double? hsvCoolValueMin,
+    double? hsvCoolSatMax,
+    double? hsvWarmValueMin,
+    double? hsvWarmSatMin,
+    double? hsvWarmHueMax,
+    double? hsvMinRise,
+    double? hsvMaxLevel,
+    double? hsvGate,
+    double? hsvClipValue,
+    double? hsvClipOwn,
+    double? hsvClipCross,
+    bool? hsvSignatureNaming,
+    double? hsvSignatureMinSigmas,
   }) {
     return LampConfig(
       hitFraction: hitFraction ?? this.hitFraction,
@@ -264,6 +432,21 @@ class LampConfig {
       ringScale: ringScale ?? this.ringScale,
       lumaPercentile: lumaPercentile ?? this.lumaPercentile,
       clipLuma: clipLuma ?? this.clipLuma,
+      hsvReference: hsvReference ?? this.hsvReference,
+      hsvCoolValueMin: hsvCoolValueMin ?? this.hsvCoolValueMin,
+      hsvCoolSatMax: hsvCoolSatMax ?? this.hsvCoolSatMax,
+      hsvWarmValueMin: hsvWarmValueMin ?? this.hsvWarmValueMin,
+      hsvWarmSatMin: hsvWarmSatMin ?? this.hsvWarmSatMin,
+      hsvWarmHueMax: hsvWarmHueMax ?? this.hsvWarmHueMax,
+      hsvMinRise: hsvMinRise ?? this.hsvMinRise,
+      hsvMaxLevel: hsvMaxLevel ?? this.hsvMaxLevel,
+      hsvGate: hsvGate ?? this.hsvGate,
+      hsvClipValue: hsvClipValue ?? this.hsvClipValue,
+      hsvClipOwn: hsvClipOwn ?? this.hsvClipOwn,
+      hsvClipCross: hsvClipCross ?? this.hsvClipCross,
+      hsvSignatureNaming: hsvSignatureNaming ?? this.hsvSignatureNaming,
+      hsvSignatureMinSigmas:
+          hsvSignatureMinSigmas ?? this.hsvSignatureMinSigmas,
     );
   }
 
@@ -295,6 +478,20 @@ class LampConfig {
     'ringScale': ringScale,
     'lumaPercentile': lumaPercentile,
     'clipLuma': clipLuma,
+    'hsvReference': hsvReference,
+    'hsvCoolValueMin': hsvCoolValueMin,
+    'hsvCoolSatMax': hsvCoolSatMax,
+    'hsvWarmValueMin': hsvWarmValueMin,
+    'hsvWarmSatMin': hsvWarmSatMin,
+    'hsvWarmHueMax': hsvWarmHueMax,
+    'hsvMinRise': hsvMinRise,
+    'hsvMaxLevel': hsvMaxLevel,
+    'hsvGate': hsvGate,
+    'hsvClipValue': hsvClipValue,
+    'hsvClipOwn': hsvClipOwn,
+    'hsvClipCross': hsvClipCross,
+    'hsvSignatureNaming': hsvSignatureNaming,
+    'hsvSignatureMinSigmas': hsvSignatureMinSigmas,
   };
 
   /// Сохранённые конфиги могут содержать уже удалённые ключи (`brightY`,
@@ -335,6 +532,59 @@ class LampConfig {
       ringScale: d('ringScale', def.ringScale),
       lumaPercentile: d('lumaPercentile', def.lumaPercentile),
       clipLuma: d('clipLuma', def.clipLuma),
+      hsvReference: b('hsvReference', def.hsvReference),
+      hsvCoolValueMin: d('hsvCoolValueMin', def.hsvCoolValueMin),
+      hsvCoolSatMax: d('hsvCoolSatMax', def.hsvCoolSatMax),
+      hsvWarmValueMin: d('hsvWarmValueMin', def.hsvWarmValueMin),
+      hsvWarmSatMin: d('hsvWarmSatMin', def.hsvWarmSatMin),
+      hsvWarmHueMax: d('hsvWarmHueMax', def.hsvWarmHueMax),
+      hsvMinRise: d('hsvMinRise', def.hsvMinRise),
+      hsvMaxLevel: d('hsvMaxLevel', def.hsvMaxLevel),
+      hsvGate: d('hsvGate', def.hsvGate),
+      hsvClipValue: d('hsvClipValue', def.hsvClipValue),
+      hsvClipOwn: d('hsvClipOwn', def.hsvClipOwn),
+      hsvClipCross: d('hsvClipCross', def.hsvClipCross),
+      hsvSignatureNaming: b('hsvSignatureNaming', def.hsvSignatureNaming),
+      hsvSignatureMinSigmas: d(
+        'hsvSignatureMinSigmas',
+        def.hsvSignatureMinSigmas,
+      ),
     );
   }
+
+  /// Способ счёта, собранный из двух флагов в одно число.
+  ///
+  /// Флаги при этом обязан связывать запрет совпадения: [withCountMode]
+  /// выставляет их ровно одним, а не «ещё одним вариантом true». Иначе
+  /// `hsvReference` и `liveReference` одновременно включили бы в детекторе
+  /// старшинство одного из них, а UI показывал бы оба.
+  LampCountMode get countMode => hsvReference
+      ? LampCountMode.hsv
+      : liveReference
+      ? LampCountMode.live
+      : LampCountMode.etalon;
+
+  /// Копия конфига, переключённая на способ счёта [mode]. Единственный
+  /// разрешённый способ менять эти два флага.
+  LampConfig withCountMode(LampCountMode mode) => copyWith(
+    liveReference: mode == LampCountMode.live,
+    hsvReference: mode == LampCountMode.hsv,
+  );
+}
+
+/// Три способа решить, какая лампа вспыхнула. Выбор — за оператором стенда,
+/// потому что замеры дают каждому своё: эталоны требуют калибровку и молчат при
+/// смене сцены, живой отсчёт не различает цвета (белая лампа, перелившая
+/// красную рамку, для него тоже вспышка красной), HSV-отсчёт не различает
+/// яркости и потому стоит на доле цветных пикселей.
+enum LampCountMode {
+  /// Доля измеренного отклика, набранного на калибровке (фон → белая →
+  /// красная).
+  etalon,
+
+  /// Подъём яркости своей рамки над «полом» последних кадров.
+  live,
+
+  /// Подъём доли пикселей СВОЕГО цвета над «полом» последних кадров.
+  hsv,
 }

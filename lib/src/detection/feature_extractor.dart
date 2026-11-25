@@ -174,9 +174,11 @@ class FeatureExtractor {
 
   /// Признаки одной ROI в координатах самого кадра.
   ///
-  /// Считаются ровно три числа: `whiteFrac`, `redFrac` и контрольный
-  /// [FrameFeatures.meanY]. На пиксель — два сравнения и одна ветка на каждый
-  /// признак, поэтому размер ROI почти не влияет на частоту анализа.
+  /// Считаются `whiteFrac`, `redFrac`, контрольный [FrameFeatures.meanY] и —
+  /// только когда включён режим [LampConfig.hsvReference] — HSV-доли
+  /// [FrameFeatures.coolFrac]/[FrameFeatures.warmFrac]. На пиксель — два
+  /// сравнения и одна ветка на каждый признак, поэтому размер ROI почти не
+  /// влияет на частоту анализа.
   FrameFeatures extractRoi(RawLampFrame frame, LampRoi roi) =>
       _scan(frame, roi);
 
@@ -252,12 +254,23 @@ class FeatureExtractor {
     final _Sample sample = _Sample();
     final int step = config.subsampleStep;
     final double clipLuma = config.clipLuma;
+    // HSV-отбор нужен только режиму [LampConfig.hsvReference]; в двух прежних
+    // режимах эти доли не читаются, а шесть сравнений на пиксель из hot-цикла
+    // никуда не деваются. Поэтому отбор включается здесь, а не считается всегда.
+    final bool hsvOn = config.hsvReference;
+    final double coolValueMin = config.hsvCoolValueMin;
+    final double coolSatMax = config.hsvCoolSatMax;
+    final double warmValueMin = config.hsvWarmValueMin;
+    final double warmSatMin = config.hsvWarmSatMin;
+    final double warmHueMax = config.hsvWarmHueMax;
 
     double sumY = 0;
     double sumY2 = 0;
     int count = 0;
     int whiteCount = 0;
     int redCount = 0;
+    int coolCount = 0;
+    int warmCount = 0;
     int clipCount = 0;
     // Гистограмма яркости по всей области: из неё берутся процентиль и
     // разброс. Максимум одного пикселя как сигнал не годится — это блик или
@@ -319,6 +332,32 @@ class FeatureExtractor {
                 config.redMargin) {
           redCount++;
         }
+        if (hsvOn) {
+          // Дальнейшие проверки — это HSV без единого деления. Обозначения:
+          // `mx` = V (0..255), `d` = mx − mn, тогда S = d / mx, а оттенок при
+          // mx == r равен 60·(g − b)/d со знаком. Умножение на 255 держит
+          // сравнение в целочисленном масштабе, как в `tools/hsv_probe.py`.
+          final double maxChannel = sample.r > sample.g
+              ? (sample.r > sample.b ? sample.r : sample.b)
+              : (sample.g > sample.b ? sample.g : sample.b);
+          final double delta = maxChannel - minChannel;
+          // «Белый свет»: ярко и почти без оттенка. Насыщенность d/mx мала,
+          // поэтому красная лампа в этот отбор не попадает, а пересвеченный
+          // колпак белой — попадает почти весь.
+          if (maxChannel >= coolValueMin &&
+              delta * 255 <= coolSatMax * maxChannel) {
+            coolCount++;
+          }
+          // «Красный свет»: mx == r (иначе оттенка около нуля нет), оттенок не
+          // дальше warmHueMax градусов от нуля, то есть |g − b| ≤ (H/60)·d, и
+          // он достаточно ярок и насыщен — иначе это коричневое дерево стола.
+          if (maxChannel == sample.r &&
+              maxChannel >= warmValueMin &&
+              delta * 255 >= warmSatMin * maxChannel &&
+              (sample.g - sample.b).abs() * 60 <= warmHueMax * delta) {
+            warmCount++;
+          }
+        }
       }
     }
 
@@ -336,6 +375,8 @@ class FeatureExtractor {
       sampleCount: count,
       whiteFrac: whiteCount / count,
       redFrac: redCount / count,
+      coolFrac: coolCount / count,
+      warmFrac: warmCount / count,
       p90Luma: _percentile(lumaHist, count, config.lumaPercentile),
       lumaStdDev: math.sqrt(variance),
       clippedRatio: clipCount / count,

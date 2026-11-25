@@ -105,7 +105,7 @@ void main() {
     });
   });
 
-  group('CSV v4', () {
+  group('CSV v5', () {
     test('новое число колонок и яркость колец переживают запись/чтение', () {
       final FeatureCsvRow row = FeatureCsvRow(
         timestampMs: 1000,
@@ -117,8 +117,15 @@ void main() {
           p90Luma: 210,
           lumaStdDev: 33,
           clippedRatio: 0.25,
+          coolFrac: 0.31,
+          warmFrac: 0.02,
         ),
-        red: const FrameFeatures(meanY: 40, sampleCount: 400),
+        red: const FrameFeatures(
+          meanY: 40,
+          sampleCount: 400,
+          coolFrac: 0.04,
+          warmFrac: 0.27,
+        ),
         whiteRing: const FrameFeatures(
           meanY: 80,
           sampleCount: 100,
@@ -136,6 +143,12 @@ void main() {
       expect(back.white.clippedRatio, 0.25);
       expect(back.whiteRing?.meanY, 80);
       expect(back.whiteRing?.p90Luma, 130);
+      // HSV-доли — то, чем решает режим «по цвету»: они обязаны переживать
+      // запись, иначе пересчитать HSV-прогон по CSV невозможно.
+      expect(back.white.coolFrac, closeTo(0.31, 1e-9));
+      expect(back.white.warmFrac, closeTo(0.02, 1e-9));
+      expect(back.red.coolFrac, closeTo(0.04, 1e-9));
+      expect(back.red.warmFrac, closeTo(0.27, 1e-9));
       // Кольца нет — он и должен остаться нулём, а не выдуманным значением.
       expect(back.redRing, isNull);
     });

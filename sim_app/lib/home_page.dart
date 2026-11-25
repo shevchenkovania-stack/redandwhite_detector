@@ -87,6 +87,12 @@ class _SimHomePageState extends State<SimHomePage> {
   Timer? _autoTimer;
   Timer? _shadowTimer;
 
+  /// Плановый момент СЛЕДУЮЩЕГО переключения панели. Расписание абсолютное:
+  /// таймер всегда опаздывает на задержку планировщика, и в цепочке «следующий
+  /// таймер заводится от уже опоздавшего момента» это опоздание ползло бы шаг за
+  /// шагом. См. `_runCycleStep`.
+  int _cycleDueMs = 0;
+
   // Эталон: сколько раз каждая лампа реально мигнула.
   int _flashWhite = 0;
   int _flashRed = 0;
@@ -259,6 +265,7 @@ class _SimHomePageState extends State<SimHomePage> {
     // сбрасывается без записи в таймлайн, вместе со всеми счётчиками.
     _dropManual();
     _cycleStep = 0;
+    _cycleDueMs = 0;
     _flashWhite = 0;
     _flashRed = 0;
     _timeline.clear();
@@ -275,6 +282,7 @@ class _SimHomePageState extends State<SimHomePage> {
   void _stopScan() {
     _cycleTimer?.cancel();
     _cycleTimer = null;
+    _cycleDueMs = 0;
     // Цикл остановлен, но рука пользователя могла остаться в кадре: закрытый
     // сейчас отрезок попадает в таймлайн, чтобы «правило» не разошлось с
     // «сценами» из-за потерянной вспышки.
@@ -326,32 +334,62 @@ class _SimHomePageState extends State<SimHomePage> {
     _ruleRed = 0;
   }
 
+  /// Идеальная рамка для сигнала панели: 100 образцов, «выключенное» состояние
+  /// — равномерная яркость 200. При горении лампы измеренная доля рамки
+  /// (`_liveWhiteDeltaFrac` / `_liveRedDeltaFrac`) насыщается в 255 — единственная
+  /// идеализация реальной вспышки. Вектор решения детектора (восемь яркостных
+  /// координат, `LampVector`) строится из `meanY` и `p90Luma`: среднее
+  /// поднимается на долю засветившейся части, а p90 упирается в 255, если
+  /// засвечено хотя бы 10% рамки (90-е из 100 отсортированных образцов
+  /// попадает на засветившийся пиксель). Цветовые доли не участвуют в решении
+  /// — они здесь только как запись «каким был этот кадр».
+  FrameFeatures _idealBox({
+    double whiteFrac = 0,
+    double redFrac = 0,
+    double litFrac = 0,
+  }) =>
+      FrameFeatures(
+        meanY: 200.0 + litFrac * (255.0 - 200.0),
+        p90Luma: litFrac >= 0.10 ? 255.0 : 200.0,
+        sampleCount: 100,
+        whiteFrac: whiteFrac,
+        redFrac: redFrac,
+      );
+
   /// Идеальная калибровка панели. Раньше здесь жил «чёрный фон + выдуманные
   /// пороги»; теперь тот же смысл, но в формате детектора: отклик каждой лампы
   /// измерен, а не задан, поэтому счёт панели считает ровно то же правило, что
-  /// и телефон, а не похожее на него.
+  /// и телефон, а не похожее на него. Носитель решения — яркостный вектор
+  /// четырёх областей, поэтому идеальный сигнал тоже построен на яркости
+  /// (см. [_idealBox]): фон — равномерные рамки 200, «держат лампу» — её
+  /// измеренная доля насыщена в 255. Кадр в [_frameFor] собирается той же
+  /// формулой, что и соответствующее состояние калибровки, поэтому амплитуда
+  /// горящего кадра ровно 1.0 — «панель показывает столько же, сколько при
+  /// замере этой лампы».
   LampBaseline _idealBaseline(int calibrationFrames) {
-    FrameFeatures box({double whiteFrac = 0, double redFrac = 0}) => FrameFeatures(
-      meanY: 200,
-      sampleCount: 100,
-      whiteFrac: whiteFrac,
-      redFrac: redFrac,
-    );
     CalibrationState state({
-      double whiteBoxWhiteFrac = 0,
-      double redBoxRedFrac = 0,
+      double whiteFrac = 0,
+      double redFrac = 0,
+      double whiteLit = 0,
+      double redLit = 0,
     }) =>
+        // σ состояний — нули: идеальный сигнал без шума, поэтому ON-уровень
+        // остаётся ровно `hitFraction`. (FrameFeatures хранит σ в полях
+        // meanY/p90Luma, поэтому «та же рамка» здесь означало бы σ = 200.)
         CalibrationState(
-          white: box(whiteFrac: whiteBoxWhiteFrac),
-          red: box(redFrac: redBoxRedFrac),
-          whiteSigma: box(),
-          redSigma: box(),
+          white: _idealBox(whiteFrac: whiteFrac, litFrac: whiteLit),
+          red: _idealBox(redFrac: redFrac, litFrac: redLit),
+          whiteSigma: FrameFeatures.zero,
+          redSigma: FrameFeatures.zero,
           frameCount: calibrationFrames,
         );
     return LampBaseline(
       background: state(),
-      whiteOn: state(whiteBoxWhiteFrac: _liveWhiteDeltaFrac),
-      redOn: state(redBoxRedFrac: _liveRedDeltaFrac),
+      whiteOn: state(
+        whiteFrac: _liveWhiteDeltaFrac,
+        whiteLit: _liveWhiteDeltaFrac,
+      ),
+      redOn: state(redFrac: _liveRedDeltaFrac, redLit: _liveRedDeltaFrac),
       capturedAtMs: _clockMs,
     );
   }
@@ -392,17 +430,18 @@ class _SimHomePageState extends State<SimHomePage> {
   LampFrame _frameFor(SimScene scene, DateTime timestamp) {
     final bool whiteLit = scene == SimScene.white || scene == SimScene.both;
     final bool redLit = scene == SimScene.red || scene == SimScene.both;
+    // Кадр собирается той же формулой, что и соответствующее состояние
+    // идеальной калибровки (_idealBaseline): горящий кадр отличается от фона
+    // ровно на калибровочный эталон, амплитуда — ровно 1.0.
     return LampFrame(
       timestamp: timestamp,
-      white: FrameFeatures(
-        meanY: 200,
-        sampleCount: 100,
+      white: _idealBox(
         whiteFrac: whiteLit ? _liveWhiteDeltaFrac : 0,
+        litFrac: whiteLit ? _liveWhiteDeltaFrac : 0,
       ),
-      red: FrameFeatures(
-        meanY: 200,
-        sampleCount: 100,
+      red: _idealBox(
         redFrac: redLit ? _liveRedDeltaFrac : 0,
+        litFrac: redLit ? _liveRedDeltaFrac : 0,
       ),
     );
   }
@@ -685,8 +724,18 @@ class _SimHomePageState extends State<SimHomePage> {
     }
     _source.setScene(scene);
     final int switchedAt = DateTime.now().millisecondsSinceEpoch;
+    // Отсчёт следующего переключения — от ПЛАНОВОГО момента этого, а не от
+    // фактического: иначе опоздание каждого таймера прибавляется к опозданию
+    // предыдущего, и через полминуты панель переключается на сотни
+    // миллисекунд позже, чем записано в `_timeline`. Правило пересчитывает
+    // именно таймлайн, поэтому расхождение превращалось в «1 включение —
+    // 2 события».
+    final int plannedStart = _cycleDueMs == 0 ? switchedAt : _cycleDueMs;
+    final int driftMs = switchedAt - plannedStart;
+    final int due = plannedStart + hold.inMilliseconds;
+    _cycleDueMs = due;
     debugPrint(
-      'PANEL t=$switchedAt '
+      'PANEL t=$switchedAt plan=$plannedStart drift=${driftMs}ms '
       'step=$_cycleStep scene=${scene.name} hold=${hold.inMilliseconds}ms',
     );
     // Таймер — это намерение, а не событие на экране. Реальный фронт вспышки
@@ -705,10 +754,13 @@ class _SimHomePageState extends State<SimHomePage> {
       _addStep(scene, hold);
     });
     _logCounts();
-    _cycleTimer = Timer(hold, () {
-      _cycleStep++;
-      _runCycleStep();
-    });
+    _cycleTimer = Timer(
+      Duration(milliseconds: max(1, due - switchedAt)),
+      () {
+        _cycleStep++;
+        _runCycleStep();
+      },
+    );
   }
 
   /// Один шаг таймлайна: сцена с её длительностью, и сразу то же самое —

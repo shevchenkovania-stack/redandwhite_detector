@@ -101,7 +101,7 @@ class RunAnalysis {
     ].join('\n');
 }
 
-/// Разбор записанной серии (CSV v4 и старых форматов) нынешним способом решения.
+/// Разбор записанной серии (CSV v5 и старых форматов) нынешним способом решения.
 ///
 /// Здесь когда-то жил `ModeComparator`, прогонявший ОДНУ запись двумя способами
 /// — цветовым и яркостным, — чтобы новое решение не отменяло старую реализацию,
@@ -114,19 +114,28 @@ class RunAnalysis {
 /// строкам измеряются длительности провалов и пауз ([DarkRunTiming]), то есть
 /// правило подтверждения выключения получает числа от записи, а не от догадки.
 ///
-/// Разбор идёт в режиме живого отсчёта: калибровки у записи нет, а живой отсчёт
-/// — именно тот способ, каким демо работает на стенде.
+/// Разбор идёт тем же способом, каким считалась сама запись: [mode] (или
+/// [LampConfig.countMode] в [base]). Прежнее принудительное `liveReference: true`
+/// делало HSV-прогон непроверяемым: запись, решённая по цвету, пересчитывалась
+/// по яркости и давала другой счёт событий, который нельзя было сравнить ни с
+/// чем (ЖУРНАЛ §11.12). Калибровки у записи нет, но живой и HSV отсчёты её не
+/// требуют.
 class RunAnalyzer {
   const RunAnalyzer();
 
-  static RunAnalysis analyze(String csv, {LampConfig base = const LampConfig()}) {
+  static RunAnalysis analyze(
+    String csv, {
+    LampConfig base = const LampConfig(),
+    LampCountMode? mode,
+  }) {
     final List<FeatureCsvRow> rows = FeatureCsv.decode(csv);
     if (rows.length < 2) {
       throw ArgumentError('для разбора нужно минимум два кадра записи');
     }
 
-    final LampDetector detector =
-        LampDetector(base.copyWith(liveReference: true));
+    final LampDetector detector = LampDetector(
+      mode == null ? base : base.withCountMode(mode),
+    );
     final HitStateMachine machine = HitStateMachine(sessionId: 'analysis');
     final _Tracker white = _Tracker();
     final _Tracker red = _Tracker();

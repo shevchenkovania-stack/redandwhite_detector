@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import '../models/frame_features.dart';
 import '../models/hit_event.dart';
 import '../models/lamp_config.dart';
+import 'hsv_reference.dart';
 import 'lamp_calibration.dart';
 import 'live_reference.dart';
 import 'response_model.dart';
@@ -188,6 +189,17 @@ class _LampTracker {
 
   DateTime? get onCandidate => _onCandidateAt;
 
+  /// Принудительно погасить лампу: другая лампа доказанно включилась, а по
+  /// спецификации две лампы одновременно не горят. Состояние сбрасывается
+  /// целиком, чтобы следующее включение этой лампы считалось заново.
+  void forceOff() {
+    lit = false;
+    _onRun = 0;
+    _offRun = 0;
+    _onCandidateAt = null;
+    _resetDark();
+  }
+
   /// Сколько миллисекунд длится текущий интервал «не выше ON-уровня» (0, если
   /// его нет). По этому числу на записи и разбирают, где провал внутри одного
   /// горения, а где настоящая пауза между ударами.
@@ -222,7 +234,8 @@ class _LampTracker {
 class LampDetector {
   LampDetector(this._config)
     : _calibration = LampCalibration(_config),
-      _live = LiveReference(_config);
+      _live = LiveReference(_config),
+      _hsv = HsvReference(_config);
 
   /// Пороги можно менять на лету (подбор по записанным CSV).
   LampConfig get config => _config;
@@ -230,15 +243,28 @@ class LampDetector {
     // Вектор признаков с тех пор один (яркость четырёх областей), и конфиг на
     // него не влияет, поэтому пересобирать модель здесь нечего: пороги
     // уходят калибровке и живому отсчёту.
+    //
+    // Смена СПОСОБА решения окна сбрасывает: «пол» и порог, набранные в
+    // яркости, и «пол», набранный в долях цветных пикселей, — разные величины,
+    // и сравнивать одно с другим нельзя.
+    final bool modeChanged =
+        value.liveReference != _config.liveReference ||
+        value.hsvReference != _config.hsvReference;
     _config = value;
     _calibration.config = value;
     _live.config = value;
+    _hsv.config = value;
+    _applyHsvSignature();
+    if (modeChanged) {
+      resetTracking();
+    }
   }
 
   LampConfig _config;
 
   final LampCalibration _calibration;
   final LiveReference _live;
+  final HsvReference _hsv;
   final _LampTracker _white = _LampTracker();
   final _LampTracker _red = _LampTracker();
 
@@ -246,6 +272,7 @@ class LampDetector {
   LampResponseModel? _model;
   int _ambiguousFrames = 0;
   int _unexplainedFrames = 0;
+  int _doubleBasketFrames = 0;
 
   LampBaseline? get baseline => _baseline;
 
@@ -254,9 +281,11 @@ class LampDetector {
 
   bool get isCalibrated => _model?.isValid ?? false;
 
-  /// Есть чем решать: живой отсчёт работает сразу, режим эталонов — только
-  /// после калибровки. Сессия спрашивает это вместо [isCalibrated].
-  bool get canEvaluate => _config.liveReference || isCalibrated;
+  /// Есть чем решать: живой отсчёт и HSV-отсчёт работают сразу, режим
+  /// эталонов — только после калибровки. Сессия спрашивает это вместо
+  /// [isCalibrated].
+  bool get canEvaluate =>
+      _config.hsvReference || _config.liveReference || isCalibrated;
 
   /// Сколько кадров подряд были неоднозначными (обе амплитуды выше своего уровня).
   int get ambiguousFrames => _ambiguousFrames;
@@ -264,10 +293,17 @@ class LampDetector {
   /// Сколько кадров не похожи ни на одну лампу: рука, тряска, засветка.
   int get unexplainedFrames => _unexplainedFrames;
 
+  /// Сколько раз один кадр просился сразу в обе корзины и был отдан одной
+  /// ([_oneBasket]). Ноль после калибровки — правило не пригодилось; растёт на
+  /// плохих рамках и на засветке чужой лампы, и именно по нему видно, что
+  /// удвоение счёта ловится, а не проходит.
+  int get doubleBasketFrames => _doubleBasketFrames;
+
   /// Восстановление калибровки из настроек.
   void setBaseline(LampBaseline baseline) {
     _baseline = baseline;
     _model = LampResponseModel(baseline);
+    _applyHsvSignature();
     resetTracking();
   }
 
@@ -275,7 +311,28 @@ class LampDetector {
   void clearBaseline() {
     _baseline = null;
     _model = null;
+    _applyHsvSignature();
     resetTracking();
+  }
+
+  /// Выучить у калибровки правило именования вспышек.
+  ///
+  /// Null в трёх случаях: калибровки нет, HSV-отсчёт выключен или флаг
+  /// именования выключен — и тогда остаётся прежнее правило с вето по чужому
+  /// каналу. Отдельно null, когда три состояния не разделяются ни по одному из
+  /// 16 признаков ([LampConfig.hsvSignatureMinSigmas] σ): например, на
+  /// записях iPhone красная лампа выбита в белый, и учиться там нечему.
+  /// Держать детектор на выученном правиле в таком случае значило бы называть
+  /// лампы монеткой.
+  void _applyHsvSignature() {
+    final LampBaseline? base = _baseline;
+    _hsv.signature =
+        base == null || !_config.hsvReference || !_config.hsvSignatureNaming
+        ? null
+        : HsvSignature.learn(
+            base,
+            minSeparation: _config.hsvSignatureMinSigmas,
+          );
   }
 
   /// Сброс гистерезиса и счётчиков (новая сессия, старт, калибровка).
@@ -283,8 +340,58 @@ class LampDetector {
     _white.reset();
     _red.reset();
     _live.reset();
+    _hsv.reset();
     _ambiguousFrames = 0;
     _unexplainedFrames = 0;
+    _doubleBasketFrames = 0;
+  }
+
+  /// Одна вспышка — одна корзина.
+  ///
+  /// Лампы загораются по очереди (спецификация стенда, слово заказчика
+  /// 24.11.2026), поэтому событие не имеет права появиться в обеих корзинах:
+  /// если засчитана белая, красная не получает ничего. Делается ровно две
+  /// вещи, обе — над уже подтверждёнными переходами, чтобы не менять пороги:
+  ///
+  ///  * оба канала подтвердились в одном кадре — остаётся победитель
+  ///    ([winner], а если он не вычислен — канал с большим подъёмом),
+  ///    проигравший гасится через [forceOff] и случай считается в
+  ///    [doubleBasketFrames];
+  ///  * одна лампа включилась, а другая всё ещё числится горящей — вторая
+  ///    гасится принудительно: её залипший «горит» съел бы её следующую
+  ///    вспышку.
+  ///
+  /// Реальные события это не съедает: у вспышки есть пауза, за которую
+  /// проигравший канал успевает упасть к «полу» и набрать свои кадры
+  /// подтверждения заново.
+  ({bool redOff, bool redOn, bool whiteOff, bool whiteOn}) _oneBasket({
+    required bool whiteOn,
+    required bool redOn,
+    required bool whiteOff,
+    required bool redOff,
+    required HitColor? winner,
+    required double whiteAmp,
+    required double redAmp,
+  }) {
+    if (whiteOn && redOn) {
+      _doubleBasketFrames++;
+      final HitColor keep =
+          winner ?? (whiteAmp >= redAmp ? HitColor.white : HitColor.red);
+      if (keep == HitColor.white) {
+        _red.forceOff();
+        return (whiteOn: true, redOn: false, whiteOff: whiteOff, redOff: true);
+      }
+      _white.forceOff();
+      return (whiteOn: false, redOn: true, whiteOff: true, redOff: redOff);
+    }
+    if (whiteOn && _red.lit) {
+      _red.forceOff();
+      redOff = true;
+    } else if (redOn && _white.lit) {
+      _white.forceOff();
+      whiteOff = true;
+    }
+    return (whiteOn: whiteOn, redOn: redOn, whiteOff: whiteOff, redOff: redOff);
   }
 
   /// Шаг, который калибровка набирает сейчас.
@@ -357,27 +464,51 @@ class LampDetector {
 
   /// ON-уровень каждой лампы в долях измеренного отклика. Null до калибровки —
   /// экраны обязаны показывать именно их, а не [LampConfig.hitFraction]:
-  /// при шумной калибровке порог выше. В режиме живого отсчёта — порог из шума
-  /// последних кадров, в тех же единицах, что и амплитуда.
-  double? get whiteOnLevel => _config.liveReference
-      ? (_live.hasReading ? _live.last.whiteLevel : null)
-      : _model?.whiteOnLevel(config.hitFraction);
-  double? get redOnLevel => _config.liveReference
-      ? (_live.hasReading ? _live.last.redLevel : null)
-      : _model?.redOnLevel(config.hitFraction);
+  /// при шумной калибровке порог выше. В режиме живого и HSV-отсчёта — порог из
+  /// шума последних кадров, в тех же единицах, что и амплитуда.
+  double? get whiteOnLevel => _level(white: true);
+  double? get redOnLevel => _level(white: false);
+
+  /// Порог включения одной лампы в том режиме, который сейчас включён. Три
+  /// способа решения считают порог в разных единицах (доля отклика, яркость,
+  /// доля цветных пикселей), поэтому и отдавать наружу каждое число обязан
+  /// ведущий способ, а не общее по всем.
+  double? _level({required bool white}) {
+    if (_config.hsvReference) {
+      final LiveReading reading = _hsv.last;
+      return _hsv.hasReading
+          ? (white ? reading.whiteLevel : reading.redLevel)
+          : null;
+    }
+    if (_config.liveReference) {
+      return _live.hasReading
+          ? (white ? _live.last.whiteLevel : _live.last.redLevel)
+          : null;
+    }
+    return white
+        ? _model?.whiteOnLevel(config.hitFraction)
+        : _model?.redOnLevel(config.hitFraction);
+  }
 
   /// Сколько реальных значений ещё нужно, чтобы окна набрались. Ноль —
-  /// решения уже принимаются.
-  int get liveWarmupLeft => _live.warmupLeft;
+  /// решения уже принимаются. Отдаётся число ведущего сейчас способа: окна
+  /// живого и HSV-отсчёта набираются независимо и по разным признакам.
+  int get liveWarmupLeft =>
+      _config.hsvReference ? _hsv.warmupLeft : _live.warmupLeft;
 
   /// Количество значений, «пол», sigma и причина последнего сброса для LAMPDBG.
-  String get liveDebugTag => _live.debugTag;
+  String get liveDebugTag =>
+      _config.hsvReference ? _hsv.debugTag : _live.debugTag;
 
   /// Решение и состояние окон именно последнего оценённого кадра для CSV.
-  LiveReading get liveReading => _live.last;
-  LiveReferenceDiagnostics get liveDiagnostics => _live.diagnostics;
+  LiveReading get liveReading => _config.hsvReference ? _hsv.last : _live.last;
+  LiveReferenceDiagnostics get liveDiagnostics =>
+      _config.hsvReference ? _hsv.diagnostics : _live.diagnostics;
 
   LampEvaluation evaluate(LampFrame frame) {
+    if (_config.hsvReference) {
+      return _evaluateHsv(frame);
+    }
     if (_config.liveReference) {
       return _evaluateLive(frame);
     }
@@ -412,12 +543,11 @@ class LampDetector {
     // Обе амплитуды выше своего уровня в одном кадре. По спецификации стенда
     // лампы одновременно НЕ загораются, значит такой кадр — симптом: переход
     // «одна погасла, другая включилась» попал в один кадр экспозиции, либо
-    // засветка/наводка. Гасить проигравший канал («winner takes all») всё
-    // равно нельзя: он съедает реальное второе событие на быстром
-    // переключении, а отличить «съесть» от «оставить» по одному кадру нельзя.
-    // Поэтому каналы подтверждаются каждый своим гистерезисом, а `ambiguous`
-    // остался только диагностикой — много таких кадров = плохая геометрия или
-    // медленная смена сцен, а не «две вспышки».
+    // засветка/наводка. Слово заказчика 25.11.2026: в две корзины такое
+    // событие не кладётся — если посчитана белая, красная не получает ничего,
+    // поэтому проигравший канал до гистерезиса не доходит ([_oneBasket]).
+    // Раньше победитель только писался в диагностику, а два трекера шли
+    // независимо и один вспышка давала два удара.
     final bool ambiguous = whiteAboveOn && redAboveOn;
     HitColor? winner;
     if (ambiguous) {
@@ -426,9 +556,12 @@ class LampDetector {
           ? HitColor.white
           : HitColor.red;
     }
+    final bool whiteVeto =
+        whiteAboveOn && (!ambiguous || winner == HitColor.white);
+    final bool redVeto = redAboveOn && (!ambiguous || winner == HitColor.red);
 
     final ({bool becameOn, bool becameOff}) whiteStep = _white.step(
-      aboveOn: whiteAboveOn,
+      aboveOn: whiteVeto,
       belowOff: whiteBelowOff,
       amplitude: response.white,
       timestamp: frame.timestamp,
@@ -438,7 +571,7 @@ class LampDetector {
       floorAmplitude: config.referenceMinRise,
     );
     final ({bool becameOn, bool becameOff}) redStep = _red.step(
-      aboveOn: redAboveOn,
+      aboveOn: redVeto,
       belowOff: redBelowOff,
       amplitude: response.red,
       timestamp: frame.timestamp,
@@ -453,6 +586,17 @@ class LampDetector {
     // за ~10 секунд и «впитывал» вспышки (base white 0.107 → 0.235), из-за чего
     // пороги ездили вместе с ним, а на плохо наведённых рамках дрейф шёл
     // непрерывно. Перестройка фона — только ручная «Калибровка».
+    final ({bool redOff, bool redOn, bool whiteOff, bool whiteOn}) basket =
+        _oneBasket(
+          whiteOn: whiteStep.becameOn,
+          redOn: redStep.becameOn,
+          whiteOff: whiteStep.becameOff,
+          redOff: redStep.becameOff,
+          winner: winner,
+          whiteAmp: response.white,
+          redAmp: response.red,
+        );
+
     return LampEvaluation(
       timestamp: frame.timestamp,
       whiteAmplitude: response.white,
@@ -461,10 +605,10 @@ class LampDetector {
       explained: response.explained,
       residual: response.residual,
       unexplained: unexplained,
-      whiteOn: whiteStep.becameOn,
-      redOn: redStep.becameOn,
-      whiteOff: whiteStep.becameOff,
-      redOff: redStep.becameOff,
+      whiteOn: basket.whiteOn,
+      redOn: basket.redOn,
+      whiteOff: basket.whiteOff,
+      redOff: basket.redOff,
       whiteLit: _white.lit,
       redLit: _red.lit,
       ambiguous: ambiguous,
@@ -503,9 +647,15 @@ class LampDetector {
           ? HitColor.white
           : HitColor.red;
     }
+    // Та же одна корзина, что и в HSV: проигравший канал не доходит до
+    // гистерезиса ([_oneBasket]).
+    final bool whiteVeto =
+        reading.whiteAboveOn && (!ambiguous || winner == HitColor.white);
+    final bool redVeto =
+        reading.redAboveOn && (!ambiguous || winner == HitColor.red);
 
     final ({bool becameOn, bool becameOff}) whiteStep = _white.step(
-      aboveOn: reading.whiteAboveOn,
+      aboveOn: whiteVeto,
       belowOff: reading.whiteBelowOff,
       amplitude: reading.whiteNet,
       timestamp: frame.timestamp,
@@ -516,7 +666,7 @@ class LampDetector {
       valid: reading.whiteValid,
     );
     final ({bool becameOn, bool becameOff}) redStep = _red.step(
-      aboveOn: reading.redAboveOn,
+      aboveOn: redVeto,
       belowOff: reading.redBelowOff,
       amplitude: reading.redNet,
       timestamp: frame.timestamp,
@@ -531,6 +681,17 @@ class LampDetector {
       reading.whiteRise * reading.whiteRise + reading.redRise * reading.redRise,
     );
 
+    final ({bool redOff, bool redOn, bool whiteOff, bool whiteOn}) basket =
+        _oneBasket(
+          whiteOn: whiteStep.becameOn,
+          redOn: redStep.becameOn,
+          whiteOff: whiteStep.becameOff,
+          redOff: redStep.becameOff,
+          winner: winner,
+          whiteAmp: reading.whiteRise,
+          redAmp: reading.redRise,
+        );
+
     return LampEvaluation(
       timestamp: frame.timestamp,
       whiteAmplitude: reading.whiteRise,
@@ -539,10 +700,109 @@ class LampDetector {
       explained: change,
       residual: 0,
       unexplained: false,
-      whiteOn: whiteStep.becameOn,
-      redOn: redStep.becameOn,
-      whiteOff: whiteStep.becameOff,
-      redOff: redStep.becameOff,
+      whiteOn: basket.whiteOn,
+      redOn: basket.redOn,
+      whiteOff: basket.whiteOff,
+      redOff: basket.redOff,
+      whiteLit: _white.lit,
+      redLit: _red.lit,
+      whiteNet: reading.whiteNet,
+      redNet: reading.redNet,
+      ambiguous: ambiguous,
+      ambiguousWinner: winner,
+      whiteOnCandidateAt: _white.onCandidate,
+      redOnCandidateAt: _red.onCandidate,
+      whiteDarkMs: _white.darkMs,
+      redDarkMs: _red.darkMs,
+    );
+  }
+
+  /// HSV-отсчёт: амплитуда = подъём ДОЛИ СВОЕГО ЦВЕТА над «полом» своей зоны,
+  /// а «какая это лампа» решает не корзина и не место рамки, а перевес своего
+  /// подъёма над чужим ([LampConfig.hsvGate]). Гистерезис тот же самый
+  /// ([_LampTracker]), только в долях цветных пикселей.
+  ///
+  /// Отличий от [_evaluateLive] два, и оба из замеров: здесь нет ореола (модель
+  /// проверялась по одной зоне) и нет правила «смена сцены» — его роль играет
+  /// стоп на потолке сенсора внутри [HsvReference], потому что белая лампа,
+  /// залившая всю сцену, по яркости неотличима от включённого света в зале, а
+  /// по цвету — отличима почти всегда.
+  LampEvaluation _evaluateHsv(LampFrame frame) {
+    final LiveReading reading = _hsv.step(frame);
+
+    final bool ambiguous = reading.whiteAboveOn && reading.redAboveOn;
+    HitColor? winner;
+    if (ambiguous) {
+      _ambiguousFrames++;
+      winner =
+          reading.whiteRise / _positive(reading.whiteLevel) >=
+              reading.redRise / _positive(reading.redLevel)
+          ? HitColor.white
+          : HitColor.red;
+    }
+
+    // При неоднозначности проигравший канал не получает «выше ON»: раньше
+    // победитель только писался в диагностику, а оба трекера шли независимо.
+    final bool whiteAbove =
+        reading.whiteAboveOn && (!ambiguous || winner == HitColor.white);
+    final bool redAbove =
+        reading.redAboveOn && (!ambiguous || winner == HitColor.red);
+
+    final ({bool becameOn, bool becameOff}) whiteStep = _white.step(
+      aboveOn: whiteAbove,
+      belowOff: reading.whiteBelowOff,
+      amplitude: reading.whiteRise,
+      timestamp: frame.timestamp,
+      onConfirmFrames: config.onConfirmFrames,
+      offConfirmFrames: config.offConfirmFrames,
+      offConfirmMs: config.offConfirmMs,
+      floorAmplitude: config.hsvMinRise,
+      valid: reading.whiteValid,
+    );
+    final ({bool becameOn, bool becameOff}) redStep = _red.step(
+      aboveOn: redAbove,
+      belowOff: reading.redBelowOff,
+      amplitude: reading.redRise,
+      timestamp: frame.timestamp,
+      onConfirmFrames: config.onConfirmFrames,
+      offConfirmFrames: config.offConfirmFrames,
+      offConfirmMs: config.offConfirmMs,
+      floorAmplitude: config.hsvMinRise,
+      valid: reading.redValid,
+    );
+
+    // Одна вспышка — одна корзина ([_oneBasket]): залипший «горит» проигравшей
+    // лампы съел бы её следующую вспышку, а событие, попавшее в обе корзины,
+    // удваивает счёт.
+    final ({bool redOff, bool redOn, bool whiteOff, bool whiteOn}) basket =
+        _oneBasket(
+          whiteOn: whiteStep.becameOn,
+          redOn: redStep.becameOn,
+          whiteOff: whiteStep.becameOff,
+          redOff: redStep.becameOff,
+          winner: winner,
+          whiteAmp: reading.whiteRise,
+          redAmp: reading.redRise,
+        );
+    // Горящему каналу «пол» не двигается — см. [HsvReference.hold].
+    _hsv.hold(white: _white.lit, red: _red.lit);
+
+    final double change = math.sqrt(
+      reading.whiteRise * reading.whiteRise + reading.redRise * reading.redRise,
+    );
+
+    return LampEvaluation(
+      timestamp: frame.timestamp,
+      whiteAmplitude: reading.whiteRise,
+      redAmplitude: reading.redRise,
+      change: change,
+      explained: change,
+      residual: 0,
+      unexplained: false,
+      whiteOn: basket.whiteOn,
+      redOn: basket.redOn,
+      whiteOff: basket.whiteOff,
+      redOff: basket.redOff,
       whiteLit: _white.lit,
       redLit: _red.lit,
       whiteNet: reading.whiteNet,

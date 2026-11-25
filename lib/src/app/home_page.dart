@@ -7,13 +7,15 @@ import 'package:lamp_detection/lamp_detection.dart';
 import 'widgets/event_log.dart';
 import 'widgets/roi_editor.dart';
 
-/// Демо детекции. На экране только главное: превью, «Пуск», три кнопки
-/// калибровки и строка «готов ли я считать». Рамки наводятся пальцем.
+/// Демо детекции. На экране только главное: превью, «Пуск», строка «готов ли я
+/// считать», а в режиме эталонов ещё и три кнопки калибровки. Рамки наводятся
+/// пальцем.
 ///
-/// В меню «⋮» ровно то, без чего прогона не сделать: журнал
-/// событий, ошибки и сброс калибровки. Отладочные переключатели (запись CSV и
-/// поток чисел) отсюда убраны и работают по умолчанию всегда: разбираться с
-/// прогоном без чисел нечем, а в меню они мешали оператору у лампы.
+/// В меню «⋮» ровно то, без чего прогона не сделать: переключатель способа
+/// счёта, журнал событий, ошибки и сброс калибровки. Отладочные переключатели
+/// (запись CSV и поток чисел) отсюда убраны и работают по умолчанию всегда:
+/// разбираться с прогоном без чисел нечем, а в меню они мешали оператору у
+/// лампы.
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -32,6 +34,46 @@ class _HomePageState extends State<HomePage> {
   StreamSubscription<String>? _errorsSub;
   bool _staleLogged = false;
   Timer? _logTimer;
+
+  /// Способы счёта в меню. Отдельным списком, а не разбросанными `if`:
+  /// оператор обязан видеть разом все варианты и какой из них включён, иначе
+  /// переключатель превращается в угадывание.
+  ///
+  /// Живого (яркостного) способа здесь больше нет: на 16 записях стенда
+  /// (108 событий) HSV даёт 54 ошибки против 73…85 у живого отсчёта
+  /// (ЖУРНАЛ §11.12, `tools/hsv_decide.py matrix`), а два почти одинаковых
+  /// пункта «…без калибровки» только открывают возможность выбрать худший.
+  /// Сам режим в перечислении остаётся — старые сохранённые настройки с ним
+  /// встречаются, и [_menuModes] обязан показать включённый способ, даже когда
+  /// он выпал из выбора: иначе прогон выглядит как будто выбран верхний пункт,
+  /// а переключить его вслепую нельзя.
+  static const List<({LampCountMode mode, String label, IconData icon})>
+  _countModes = <({LampCountMode mode, String label, IconData icon})>[
+    (
+      mode: LampCountMode.hsv,
+      label: 'по цвету HSV (без калибровки)',
+      icon: Icons.palette_outlined,
+    ),
+    (
+      mode: LampCountMode.etalon,
+      label: 'по калибровке',
+      icon: Icons.straighten,
+    ),
+  ];
+
+  /// Пункты меню способа счёта: выбор плюс текущий режим, если он в выбор не
+  /// входит (переключённый на «живой» сохранённой старой настройкой).
+  static List<({LampCountMode mode, String label, IconData icon})> _menuModes(
+    LampCountMode current,
+  ) => <({LampCountMode mode, String label, IconData icon})>[
+    ..._countModes,
+    if (current == LampCountMode.live)
+      (
+        mode: LampCountMode.live,
+        label: 'живой (без калибровки)',
+        icon: Icons.wifi_tethering,
+      ),
+  ];
 
   /// Сколько ждём подъёма камеры. Больше — и первый запуск выглядит зависшим:
   /// плагин `camera` на части устройств не отвечает вовсе, а оператор обязан
@@ -253,7 +295,7 @@ class _HomePageState extends State<HomePage> {
     if (s == null) {
       return 'ref=?';
     }
-    return 'ref=${s.config.liveReference ? "live" : "etalon"}';
+    return 'ref=${s.config.countMode.name}';
   }
 
   /// Компактная строка чисел прогона в logcat (тег LAMPDBG), примерно 5 раз/с.
@@ -288,6 +330,35 @@ class _HomePageState extends State<HomePage> {
     // съеден чужой рамкой или краем кадра и решать по нему нельзя.
     final FrameFeatures? whiteRing = f.whiteRing;
     final FrameFeatures? redRing = f.redRing;
+    if (s.config.countMode == LampCountMode.hsv) {
+      // HSV-прогон: `cf`/`wr` — доли «белых» и «красных» пикселей в колпаке;
+      // решают не они сами, а их подъём `aW`/`aR` над «полом». `p90` — яркость
+      // зоны (по ней видно стоп на потолке сенсора), `onW`/`onR` — порог этого
+      // же прогона. Ореолы не печатаются: модель решает по одной зоне.
+      // В режиме выученного правила (`sign=…` в хвосте строки) `aW` и `aR` —
+      // ОДНО число, подъём общего канала: событие ищется без догадки о том,
+      // какой канал «свой», а лампу называет `имя=`.
+      debugPrint(
+        'LAMPDBG hsv $_modeTag '
+        'W cf=${f.white.coolFrac.toStringAsFixed(3)} '
+        'wr=${f.white.warmFrac.toStringAsFixed(3)} '
+        '| R cf=${f.red.coolFrac.toStringAsFixed(3)} '
+        'wr=${f.red.warmFrac.toStringAsFixed(3)} '
+        '| aW=${(e?.whiteAmplitude ?? 0).toStringAsFixed(3)} '
+        'aR=${(e?.redAmplitude ?? 0).toStringAsFixed(3)} '
+        'onW=${(s.whiteOnLevel ?? 0).toStringAsFixed(3)} '
+        'onR=${(s.redOnLevel ?? 0).toStringAsFixed(3)} '
+        '| lit W=${e?.whiteLit ?? false} R=${e?.redLit ?? false} '
+        'amb=${s.diagnostics.snapshot.ambiguousFrames} '
+        'both=${s.doubleBasketFrames} '
+        '| p90 w=${f.white.p90Luma.toStringAsFixed(0)} '
+        'r=${f.red.p90Luma.toStringAsFixed(0)} '
+        'dark W=${e?.whiteDarkMs ?? 0}ms R=${e?.redDarkMs ?? 0}ms '
+        'exp=${s.exposureLocked ? "lock" : "auto"} '
+        '| hits W=${s.whiteHits} R=${s.redHits} ${s.liveDebugTag}',
+      );
+      return;
+    }
     if (s.config.liveReference) {
       debugPrint(
         'LAMPDBG live $_modeTag '
@@ -303,6 +374,7 @@ class _HomePageState extends State<HomePage> {
         'onR=${(s.redOnLevel ?? 0).toStringAsFixed(3)} '
         '| lit W=${e?.whiteLit ?? false} R=${e?.redLit ?? false} '
         'amb=${s.diagnostics.snapshot.ambiguousFrames} '
+        'both=${s.doubleBasketFrames} '
         // Яркость обеих рамок и состояние лока: без этого не отличить вспышку
         // лампы от того, как автоэкспозиция пересчитала свет, и не увидеть
         // пересвет (Y упирается в 255).
@@ -339,6 +411,7 @@ class _HomePageState extends State<HomePage> {
       '| lit W=${e?.whiteLit ?? false} R=${e?.redLit ?? false} '
       '| unexp=${s.diagnostics.snapshot.unexplainedFrames} '
       'amb=${s.diagnostics.snapshot.ambiguousFrames} '
+      'both=${s.doubleBasketFrames} '
       '| hits W=${s.whiteHits} R=${s.redHits}',
     );
   }
@@ -363,90 +436,212 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     final DetectionSession? session = _session;
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(
-          session == null
-              ? 'Lamp detection'
-              : 'Lamp detection · ${_shortSession(session.sessionId)}',
-        ),
-        actions: <Widget>[
-          if (session != null)
-            PopupMenuButton<String>(
-              onSelected: (String id) => _onMenu(id, session),
-              itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
-                const PopupMenuItem<String>(
-                  value: 'calreset',
-                  child: Text('Сброс калибровки'),
-                ),
-                const PopupMenuDivider(),
-                const PopupMenuItem<String>(
-                  value: 'log',
-                  child: Text('Журнал событий'),
-                ),
-                const PopupMenuItem<String>(
-                  value: 'errors',
-                  child: Text('Ошибки'),
-                ),
-              ],
+    // Шапка стоит 56 пунктов высоты, а величину кадра в ландшафте задаёт
+    // именно высота: кадр 4:3 упирается в неё, ширина остаётся запасом. И по
+    // этой же высоте считаются рамки. Поэтому в ландшафте шапки нет, а её меню
+    // переезжает в правую панель — плюс 56 пунктов к картинке.
+    final bool landscape =
+        MediaQuery.orientationOf(context) == Orientation.landscape;
+    final Widget menu = switch (session) {
+      final DetectionSession s => PopupMenuButton<String>(
+        onSelected: (String id) => _onMenu(id, s),
+        // Компактно и без внутренних отступов: в правой панели ландшафта
+        // кнопка по умолчанию (48×48 + padding) залезала на «Пуск».
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+        itemBuilder: (BuildContext context) => <PopupMenuEntry<String>>[
+          for (final ({LampCountMode mode, String label, IconData icon}) option
+              in _menuModes(s.config.countMode))
+            PopupMenuItem<String>(
+              value: 'mode:${option.mode.name}',
+              child: Row(
+                children: <Widget>[
+                  Icon(
+                    option.icon,
+                    size: 18,
+                    color: s.config.countMode == option.mode
+                        ? Colors.tealAccent
+                        : Colors.white38,
+                  ),
+                  const SizedBox(width: 10),
+                  // Flexible, а не голый Text: длина пункта («Счёт: по
+                  // цвету HSV (без калибровки)») уже ширины всплывающего
+                  // меню на узком телефоне, и без ограничения строка
+                  // залезала за край (Right overflowed by 41 pixels).
+                  Flexible(
+                    child: Text(
+                      (s.config.countMode == option.mode
+                              ? '▪ Счёт: '
+                              : '   Счёт: ') +
+                          option.label,
+                      style: const TextStyle(fontSize: 14),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
             ),
+          if (s.config.countMode != LampCountMode.etalon)
+            PopupMenuItem<String>(
+              value: 'sens',
+              child: Row(
+                children: <Widget>[
+                  const Icon(Icons.speed, size: 18, color: Colors.tealAccent),
+                  const SizedBox(width: 10),
+                  Flexible(
+                    child: Text(
+                      'Порог: ${s.liveSensitivityLabel}',
+                      style: const TextStyle(fontSize: 14),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          const PopupMenuItem<String>(
+            value: 'calreset',
+            child: Text('Сброс калибровки'),
+          ),
+          const PopupMenuDivider(),
+          const PopupMenuItem<String>(
+            value: 'log',
+            child: Text('Журнал событий'),
+          ),
+          const PopupMenuItem<String>(value: 'errors', child: Text('Ошибки')),
         ],
       ),
+      null => const SizedBox.shrink(),
+    };
+    return Scaffold(
+      appBar: landscape
+          ? null
+          : AppBar(
+              title: Text(
+                session == null
+                    ? 'Lamp detection'
+                    : 'Lamp detection · ${_shortSession(session.sessionId)}',
+              ),
+              actions: <Widget>[menu],
+            ),
       body: session == null
           ? Center(child: Text(_message))
           : SafeArea(
-              child: Column(
-                children: <Widget>[
-                  _PrimaryControls(session: session, onRun: _toggleRun),
-                  _CalibrationSteps(session: session, onStep: _calibrateStep),
-                  Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.all(8),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: _AspectStage(
-                          previewSize: session.source.previewSize,
-                          child: Stack(
-                            fit: StackFit.expand,
-                            children: <Widget>[
-                              session.source.buildPreview(),
-                              RoiEditor(
-                                layout: session.roi,
-                                onChanged: (RoiLayout layout) =>
-                                    session.updateRoi(layout),
-                                onCommit: () {
-                                  unawaited(session.saveRoi());
-                                  setState(() => _message = 'ROI сохранены');
-                                },
-                              ),
-                              // Счётчик набора поверх камеры. Он ничего не
-                              // перехватывает: панель рисует только текст, а
-                              // текст и ColoredBox под тапом подписок на жесты
-                              // не имеют — рамки правятся прямо во время набора.
-                              // Кнопки шагов живут над превью, в _CalibrationSteps.
-                              _CollectionOverlay(session: session),
-                            ],
-                          ),
+              child: OrientationBuilder(
+                builder: (BuildContext context, Orientation orientation) {
+                  // Колонка «панель → кадр → счётчики» в ландшафте оставляет
+                  // от экрана полосу: лампы в ней мельчают, и рамки правится
+                  // вслепую. Здесь панель уезжает на правый край, а кадр берёт
+                  // всю высоту — на 18:9 он становится крупнее примерно вдвое.
+                  final bool landscape = orientation == Orientation.landscape;
+                  final Widget controls = _PrimaryControls(
+                    session: session,
+                    onRun: _toggleRun,
+                    dense: orientation == Orientation.landscape,
+                  );
+                  // Кнопки калибровки — только режиму эталонов. Слово
+                  // заказчика 25.11.2026: «если делаем счёт по цвету — три
+                  // кнопки убирать». Цена решения, и её надо помнить:
+                  // `HsvSignature.learn` учится ровно по этим трём состояниям,
+                  // поэтому в цветовом режиме граница не выучивается никогда
+                  // (`sign=нет`), а имя вспышки решает прежнее правило —
+                  // перевес своего подъёма над чужим ([LampConfig.hsvGate]).
+                  // Сам счёт по цвету от калибровки не зависит: там «пол»
+                  // скользит по последним кадрам.
+                  final Widget steps =
+                      session.config.countMode != LampCountMode.etalon
+                      ? const SizedBox.shrink()
+                      : _CalibrationSteps(
+                          session: session,
+                          onStep: _calibrateStep,
+                          vertical: landscape,
+                        );
+                  final Widget stage = Padding(
+                    padding: EdgeInsets.all(landscape ? 0 : 8),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: _AspectStage(
+                        previewSize: session.source.previewSize,
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: <Widget>[
+                            session.source.buildPreview(),
+                            RoiEditor(
+                              layout: session.roi,
+                              onChanged: (RoiLayout layout) =>
+                                  session.updateRoi(layout),
+                              onCommit: () {
+                                unawaited(session.saveRoi());
+                                setState(() => _message = 'ROI сохранены');
+                              },
+                            ),
+                            // Счётчик набора поверх камеры. Он ничего не
+                            // перехватывает: панель рисует только текст, а
+                            // текст и ColoredBox под тапом подписок на жесты
+                            // не имеют — рамки правятся прямо во время набора.
+                            // Кнопки шагов живут над превью, в _CalibrationSteps.
+                            _CollectionOverlay(session: session),
+                          ],
                         ),
                       ),
                     ),
-                  ),
-                  _StatusRow(
+                  );
+                  final Widget status = _StatusRow(
                     session: session,
                     onReset: () {
                       session.resetCounters();
                       setState(() => _message = 'Сброшено');
                     },
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+                    dense: landscape,
+                  );
+                  final Widget note = Padding(
+                    padding: EdgeInsets.fromLTRB(
+                      landscape ? 4 : 16,
+                      4,
+                      landscape ? 4 : 16,
+                      landscape ? 2 : 12,
+                    ),
                     child: Text(
                       _message,
                       textAlign: TextAlign.center,
-                      style: const TextStyle(fontSize: 12, color: Colors.grey),
+                      maxLines: landscape ? 1 : 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: landscape ? 10 : 12,
+                        color: Colors.grey,
+                      ),
                     ),
-                  ),
-                ],
+                  );
+                  if (!landscape) {
+                    return Column(
+                      children: <Widget>[
+                        controls,
+                        steps,
+                        Expanded(child: stage),
+                        status,
+                        note,
+                      ],
+                    );
+                  }
+                  // Правая панель — ровно под кнопку, три шага калибровки и
+                  // счётчики; всё, что можно отдать картинке, отдано ей.
+                  return Row(
+                    children: <Widget>[
+                      Expanded(child: stage),
+                      SizedBox(
+                        width: 156,
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: <Widget>[
+                            Row(children: <Widget>[controls, menu]),
+                            steps,
+                            Expanded(child: status),
+                            note,
+                          ],
+                        ),
+                      ),
+                    ],
+                  );
+                },
               ),
             ),
     );
@@ -454,8 +649,26 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _onMenu(String id, DetectionSession session) async {
     switch (id) {
+      case String() when id.startsWith('mode:'):
+        // Пункт меню назван способом счёта: выбирается он прямо по имени, а не
+        // угадывается по прежнему состоянию — «рубильник» из двух положений
+        // всегда оставлял вопрос, что было включено. Ищется по перечислению, а
+        // не по списку меню: включённый способ обязан переключаться, даже
+        // когда самого пункта в меню уже нет.
+        final String picked = id.substring('mode:'.length);
+        for (final LampCountMode mode in LampCountMode.values) {
+          if (mode.name == picked) {
+            await session.setCountMode(mode);
+            break;
+          }
+        }
+        setState(() => _message = session.readiness.why);
       case 'calreset':
         _resetCalibration();
+      case 'sens':
+        // Три пресета порога по кругу: меняется одно число, множитель σ.
+        await session.cycleLiveSensitivity();
+        setState(() => _message = 'Порог: ${session.liveSensitivityLabel}');
       case 'log':
         await _sheet(
           'Журнал событий',
@@ -478,14 +691,41 @@ class _HomePageState extends State<HomePage> {
 }
 
 class _PrimaryControls extends StatelessWidget {
-  const _PrimaryControls({required this.session, required this.onRun});
+  const _PrimaryControls({
+    required this.session,
+    required this.onRun,
+    this.dense = false,
+  });
 
   final DetectionSession session;
   final VoidCallback onRun;
 
+  /// Кнопка в правой панели ландшафта: рядом с ней ещё меню, поэтому отступы
+  /// и шрифт срезаны — «Пуск» обязан влезать в 90 пунктов.
+  final bool dense;
+
   @override
   Widget build(BuildContext context) {
     final LampStatus status = session.status;
+    if (dense) {
+      // В правой панели ландшафта подпись только мешала: «Стоп» с текстом
+      // переносилось в столбик и лезло на меню. Состояние видно по цвету и
+      // значку (красный с квадратом = идёт набор, бирюзовый с треугольником =
+      // стоит), имя кнопки — в подсказке.
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(0, 0, 2, 0),
+        child: FilledButton(
+          onPressed: onRun,
+          style: FilledButton.styleFrom(
+            backgroundColor: status.running ? Colors.redAccent : Colors.teal,
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            minimumSize: const Size(56, 36),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+          child: Icon(status.running ? Icons.stop : Icons.play_arrow, size: 22),
+        ),
+      );
+    }
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
       child: Row(
@@ -520,25 +760,38 @@ class _PrimaryControls extends StatelessWidget {
 /// — ещё не снят. Подсказка «что делать» остаётся на экране всё время, а не
 /// только во время прогона: у лампы читают именно её.
 class _CalibrationSteps extends StatelessWidget {
-  const _CalibrationSteps({required this.session, required this.onStep});
+  const _CalibrationSteps({
+    required this.session,
+    required this.onStep,
+    this.vertical = false,
+  });
 
   final DetectionSession session;
   final Future<void> Function(CalibrationStep step) onStep;
 
+  /// Кнопки в столбик — для правой панели ландшафта: в ряд шириной 184 они
+  /// не читаются.
+  final bool vertical;
+
   @override
   Widget build(BuildContext context) {
     final LampStatus s = session.status;
+    final List<Widget> buttons = CalibrationStep.values
+        .map((CalibrationStep step) => _button(step, s))
+        .toList(growable: false);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+      padding: vertical
+          ? const EdgeInsets.fromLTRB(6, 0, 6, 4)
+          : const EdgeInsets.fromLTRB(12, 0, 12, 6),
       child: Column(
         children: <Widget>[
-          Row(
-            children: CalibrationStep.values
-                .map(
-                  (CalibrationStep step) => Expanded(child: _button(step, s)),
-                )
-                .toList(growable: false),
-          ),
+          vertical
+              ? Column(children: <Widget>[for (final Widget b in buttons) b])
+              : Row(
+                  children: <Widget>[
+                    for (final Widget b in buttons) Expanded(child: b),
+                  ],
+                ),
           Padding(
             padding: const EdgeInsets.only(top: 4),
             child: Text(
@@ -547,7 +800,7 @@ class _CalibrationSteps extends StatelessWidget {
                   : s.calibrationHint,
               textAlign: TextAlign.center,
               style: TextStyle(
-                fontSize: 13,
+                fontSize: vertical ? 11 : 13,
                 fontWeight: FontWeight.bold,
                 color: s.calibrationError.isNotEmpty
                     ? Colors.redAccent
@@ -736,43 +989,80 @@ class _CollectionOverlayState extends State<_CollectionOverlay> {
 }
 
 class _StatusRow extends StatelessWidget {
-  const _StatusRow({required this.session, required this.onReset});
+  const _StatusRow({
+    required this.session,
+    required this.onReset,
+    this.dense = false,
+  });
 
   final DetectionSession session;
   final VoidCallback onReset;
 
+  /// Плотная раскладка для ландшафта: счётчики встают в правую панель, где
+  /// цифра в 40 пунктов заняла бы треть высоты.
+  final bool dense;
+
   @override
   Widget build(BuildContext context) {
     final LampStatus status = session.status;
+    final Widget white = _counter(
+      'БЕЛАЯ',
+      status.whiteHits,
+      status.whiteLit,
+      Colors.white,
+    );
+    final Widget red = _counter(
+      'КРАСНАЯ',
+      status.redHits,
+      status.redLit,
+      Colors.redAccent,
+    );
+    final Widget reset = IconButton(
+      onPressed: onReset,
+      icon: Icon(Icons.restart_alt, size: dense ? 22 : 24),
+      tooltip: 'Сбросить счётчики',
+      color: Colors.grey,
+      visualDensity: VisualDensity.compact,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 40, minHeight: 36),
+    );
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-        children: <Widget>[
-          _counter('БЕЛАЯ', status.whiteHits, status.whiteLit, Colors.white),
-          IconButton(
-            onPressed: onReset,
-            icon: const Icon(Icons.restart_alt),
-            tooltip: 'Сбросить счётчики',
-            color: Colors.grey,
-          ),
-          _counter('КРАСНАЯ', status.redHits, status.redLit, Colors.redAccent),
-        ],
-      ),
+      padding: EdgeInsets.symmetric(horizontal: 12, vertical: dense ? 0 : 4),
+      child: dense
+          ? Center(
+              // scaleDown, а не голая колонка: когда в панели ещё и шаги
+              // калибровки, места остаётся меньше, чем просят два счётчика с
+              // подписями, — и вместо переполнения цифры чуть уменьшаются.
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[white, reset, red],
+                ),
+              ),
+            )
+          : Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: <Widget>[white, reset, red],
+            ),
     );
   }
 
   Widget _counter(String label, int value, bool lit, Color color) => Column(
+    mainAxisSize: MainAxisSize.min,
     children: <Widget>[
       Text(
         '$value',
         style: TextStyle(
-          fontSize: 40,
+          fontSize: dense ? 20 : 32,
           fontWeight: FontWeight.bold,
           color: lit ? color : Colors.grey,
         ),
       ),
-      Text(label, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+      Text(
+        label,
+        style: TextStyle(fontSize: dense ? 10 : 12, color: Colors.grey),
+      ),
     ],
   );
 }

@@ -11,6 +11,8 @@ class FrameFeatures {
     required this.sampleCount,
     this.whiteFrac = 0,
     this.redFrac = 0,
+    this.coolFrac = 0,
+    this.warmFrac = 0,
     this.p90Luma = 0,
     this.lumaStdDev = 0,
     this.clippedRatio = 0,
@@ -38,6 +40,32 @@ class FrameFeatures {
   /// (R − max(G,B) ≥ redMargin при R ≥ redMinValue): «настоящий красный».
   final double redFrac;
 
+  /// Доля пикселей ROI, которые в HSV выглядят «белым светом»: ярко
+  /// ([LampConfig.hsvCoolValueMin]) и почти без оттенка
+  /// ([LampConfig.hsvCoolSatMax]). Это рабочий признак белой лампы в HSV-счёте.
+  ///
+  /// Отличие от [whiteFrac] принципиальное: `whiteFrac` порождает абсолютное
+  /// число каналов, поэтому при уехавшей автоэкспозиции «белым» становится
+  /// полсцены, а `coolFrac` смотрит на ОТТЕНОК — белая лампа при любой
+  /// выдержке остаётся обесцвеченной. Замер по 11 видео стенда 23.11.2026: на
+  /// 46 включениях, которые модель нашла сама, подъём этой доли 0.061…1.0
+  /// (`tools/hsv_stats.py`), а насыщенность ярких пикселей зоны стоит на p50
+  /// 0.000…0.35 (`tools/hsv_bounds.py`).
+  final double coolFrac;
+
+  /// Доля пикселей ROI «красного света» в HSV: оттенок в окне
+  /// [LampConfig.hsvWarmHueMax] градусов вокруг нуля, насыщенность не ниже
+  /// [LampConfig.hsvWarmSatMin], яркость не ниже [LampConfig.hsvWarmValueMin].
+  /// Рабочий признак красной лампы.
+  ///
+  /// Окно оттенка шире «чистого красного», потому что лампа на стенде светит
+  /// оранжевым: медиана оттенка ядра красной зоны на посчитанных включениях
+  /// 25.6…34.7°, p95 33.6…39.8° (`tools/hsv_bounds.py`). При окне 18° признак
+  /// почти пуст — 0…70 пикселей на кадр против 128…1716 при 45°, — так что
+  /// узкое «красное» окно просто не видело бы лампы. Нижняя граница яркости
+  /// отсекает тёмные тёплые пиксели фона — по оттенку они совпадают с лампой.
+  final double warmFrac;
+
   /// Верхний процентиль яркости области ([LampConfig.lumaPercentile], по
   /// умолчанию p90), 0..255. В отличие от максимума одного пикселя не является
   /// бликом: показывает, насколько яркая ВЕРХНЯЯ часть колпака. В паре с
@@ -58,6 +86,7 @@ class FrameFeatures {
   @override
   String toString() =>
       'Features(wf=${whiteFrac.toStringAsFixed(3)}, rf=${redFrac.toStringAsFixed(3)}, '
+      'cf=${coolFrac.toStringAsFixed(3)}, wr=${warmFrac.toStringAsFixed(3)}, '
       'Y=${meanY.toStringAsFixed(1)}, p90=${p90Luma.toStringAsFixed(1)}, '
       'sd=${lumaStdDev.toStringAsFixed(1)}, clip=${clippedRatio.toStringAsFixed(3)}, '
       'n=$sampleCount)';
@@ -172,12 +201,19 @@ class CalibrationState {
     'meanY': mean.meanY,
     'whiteFrac': mean.whiteFrac,
     'redFrac': mean.redFrac,
+    // HSV-доли пишутся рядом, но версию не поднимают: решение по эталонам их
+    // не читает, а старая запись без них — это «не измерялись», что для
+    // эталонного режима верно.
+    'coolFrac': mean.coolFrac,
+    'warmFrac': mean.warmFrac,
     'p90Luma': mean.p90Luma,
     'lumaStdDev': mean.lumaStdDev,
     'clippedRatio': mean.clippedRatio,
     'meanY_sigma': sigma.meanY,
     'whiteFrac_sigma': sigma.whiteFrac,
     'redFrac_sigma': sigma.redFrac,
+    'coolFrac_sigma': sigma.coolFrac,
+    'warmFrac_sigma': sigma.warmFrac,
     'p90Luma_sigma': sigma.p90Luma,
     'lumaStdDev_sigma': sigma.lumaStdDev,
     'clippedRatio_sigma': sigma.clippedRatio,
@@ -215,13 +251,15 @@ class CalibrationState {
     );
   }
 
-  /// Шесть признаков одного блока состояния. `suffix` — `_sigma` для σ.
+  /// Признаки одного блока состояния. `suffix` — `_sigma` для σ.
   static FrameFeatures _features(Map<dynamic, dynamic> m, String suffix) =>
       FrameFeatures(
         meanY: (m['meanY$suffix'] as num?)?.toDouble() ?? 0,
         sampleCount: 0,
         whiteFrac: (m['whiteFrac$suffix'] as num?)?.toDouble() ?? 0,
         redFrac: (m['redFrac$suffix'] as num?)?.toDouble() ?? 0,
+        coolFrac: (m['coolFrac$suffix'] as num?)?.toDouble() ?? 0,
+        warmFrac: (m['warmFrac$suffix'] as num?)?.toDouble() ?? 0,
         p90Luma: (m['p90Luma$suffix'] as num?)?.toDouble() ?? 0,
         lumaStdDev: (m['lumaStdDev$suffix'] as num?)?.toDouble() ?? 0,
         clippedRatio: (m['clippedRatio$suffix'] as num?)?.toDouble() ?? 0,

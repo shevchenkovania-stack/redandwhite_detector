@@ -6,8 +6,12 @@ import '../models/frame_features.dart';
 
 /// Одна строка CSV диагностики.
 ///
-/// Формат v4 (65 колонок). Колонки 0–40 — формат v3 без изменений,
-/// колонки 41–64 сохраняют внутреннее состояние живого отсчёта: `net`,
+/// Формат v5 (69 колонок). Колонки 0–64 — формат v4 без изменений, колонки
+/// 65–68 добавляют HSV-доли, которыми решает режим «по цвету»: `white_cool_frac,
+/// white_warm_frac, red_cool_frac, red_warm_frac`. Без них запись с телефона не
+/// воспроизводит HSV-решение и сверить его с разметкой было нечем.
+///
+/// Колонки 41–64 — формат v4: внутреннее состояние живого отсчёта — `net`,
 /// длительность провала, готовность каналов, значения/«пол»/σ окон, счётчик
 /// общего света и номер с причиной последнего сброса.
 ///
@@ -89,10 +93,12 @@ class FeatureCsvRow {
       'white_below_off,red_below_off,white_core_samples,white_ring_samples,'
       'red_core_samples,red_ring_samples,white_core_floor,white_ring_floor,'
       'red_core_floor,red_ring_floor,white_core_sigma,white_ring_sigma,'
-      'red_core_sigma,red_ring_sigma,warmup_left,common_run,reset_seq,reset_reason';
+      'red_core_sigma,red_ring_sigma,warmup_left,common_run,reset_seq,reset_reason,'
+      'white_cool_frac,white_warm_frac,red_cool_frac,red_warm_frac';
 
-  /// Число колонок формата v4: короче строка — записана старой сборкой.
-  static const int currentColumnCount = 65;
+  /// Число колонок формата v5: короче строка — записана старой сборкой.
+  static const int currentColumnCount = 69;
+  static const int columnsV4 = 65;
   static const int columnsV3 = 41;
 
   /// Число колонок формата v2: яркость областей в нём ещё не писалась, но
@@ -216,6 +222,13 @@ class FeatureCsvRow {
     reference?.commonRun ?? '',
     reference?.resetSequence ?? '',
     reference?.resetReason ?? '',
+    // HSV-доли: то, чем реально решает режим «по цвету». Без них запись с
+    // телефона не воспроизводит решение HSV-модели, и сверить её с разметкой
+    // было нечем — только смотреть на счётчик в UI.
+    _frac(white.coolFrac),
+    _frac(white.warmFrac),
+    _frac(red.coolFrac),
+    _frac(red.warmFrac),
   ].join(',');
 
   static String _frac(double? v) => v?.toStringAsFixed(5) ?? '';
@@ -240,26 +253,32 @@ class FeatureCsvRow {
     if (c.length < 6) {
       throw FormatException('Строка CSV должна содержать не меньше 6 полей: "$line"');
     }
-    final bool v4 = c.length >= currentColumnCount;
-    final bool v3 = !v4 && c.length >= columnsV3;
+    final bool v5 = c.length >= currentColumnCount;
+    final bool v4 = !v5 && c.length >= columnsV4;
+    final bool v3 = !v5 && !v4 && c.length >= columnsV3;
     // Индексы 0–26 у всех современных форматов совпадают, поэтому всё, что
     // записано до `sensitivity`, читается одним условием `modern`.
-    final bool v2 = !v4 && !v3 && c.length >= columnsV2;
-    final bool modern = v4 || v3 || v2;
+    final bool v2 = !v5 && !v4 && !v3 && c.length >= columnsV2;
+    final bool modern = v5 || v4 || v3 || v2;
+    // Всё, что появилось в v4 (состояние живого отсчёта, колонки 41–64), есть и
+    // в v5: здесь обязано быть `v5 || v4`, иначе строка нового формата
+    // распарсилась бы как старая и молча потеряла весь разбор решений.
+    final bool hasV4 = v5 || v4;
     final bool legacy = !modern && c.length >= 10;
     final bool v0 = !modern && !legacy && c.length >= 9;
     double d(int i) => double.parse(c[i]);
-    // Недостаток колонок = признак не записывался: 0 честнее, чем догадка.
-    double opt(int i) => i < c.length ? double.parse(c[i]) : 0;
+    // Пустая колонка = признак не записывался: 0 честнее, чем догадка.
+    double opt(int i) =>
+        i < c.length && c[i].isNotEmpty ? double.parse(c[i]) : 0;
     double? num(int i) => modern && c[i].isNotEmpty ? double.parse(c[i]) : null;
-    double? num4(int i) => v4 && c[i].isNotEmpty ? double.parse(c[i]) : null;
+    double? num4(int i) => hasV4 && c[i].isNotEmpty ? double.parse(c[i]) : null;
     double? lum(int i) =>
-        (v4 || v3) && c[i].isNotEmpty ? double.parse(c[i]) : null;
+        (hasV4 || v3) && c[i].isNotEmpty ? double.parse(c[i]) : null;
     double val(int i) => lum(i) ?? 0;
     int? int_(int i) => modern && c[i].isNotEmpty ? int.parse(c[i]) : null;
-    int? int4(int i) => v4 && c[i].isNotEmpty ? int.parse(c[i]) : null;
+    int? int4(int i) => hasV4 && c[i].isNotEmpty ? int.parse(c[i]) : null;
     bool bit(int i) => modern && c[i] == '1';
-    bool? bit4(int i) => v4 && c[i].isNotEmpty ? c[i] == '1' : null;
+    bool? bit4(int i) => hasV4 && c[i].isNotEmpty ? c[i] == '1' : null;
     FrameFeatures? ring(int w, int r, int y, int p, int s, int cl) =>
         modern && (c[w].isNotEmpty || c[r].isNotEmpty)
             ? FrameFeatures(
@@ -282,6 +301,8 @@ class FeatureCsvRow {
         p90Luma: val(27),
         lumaStdDev: val(28),
         clippedRatio: val(29),
+        coolFrac: opt(65),
+        warmFrac: opt(66),
       ),
       red: FrameFeatures(
         meanY: legacy ? d(4) : d(2),
@@ -291,6 +312,8 @@ class FeatureCsvRow {
         p90Luma: val(30),
         lumaStdDev: val(31),
         clippedRatio: val(32),
+        coolFrac: opt(67),
+        warmFrac: opt(68),
       ),
       state: legacy ? c[7] : c[3],
       whiteRing: ring(9, 10, 33, 34, 35, 36),
@@ -318,7 +341,7 @@ class FeatureCsvRow {
       redValid: bit4(46),
       whiteBelowOff: bit4(47),
       redBelowOff: bit4(48),
-      reference: v4
+      reference: hasV4
           ? LiveReferenceDiagnostics(
               whiteCoreSamples: int4(49) ?? 0,
               whiteRingSamples: int4(50) ?? 0,
