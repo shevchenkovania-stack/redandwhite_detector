@@ -28,7 +28,7 @@ class LampConfig {
     this.whiteMinChannel = 170,
     this.redMargin = 60,
     this.redMinValue = 110,
-    this.liveReference = true,
+    this.liveReference = false,
     this.referenceWindowFrames = 20,
     this.referencePercentile = 0.2,
     this.referenceNoiseSigmas = 6,
@@ -37,7 +37,13 @@ class LampConfig {
     this.ringScale = 1.7,
     this.lumaPercentile = 0.9,
     this.clipLuma = 248,
-    this.hsvReference = false,
+    // Рабочий способ по умолчанию — HSV плюс калибровка (слово заказчика
+    // 25.11.2026: «совмести наработку hsv и калибровку всё в одно, будем только
+    // с калибровкой работать»). Число не вкусовое: по разметке координат рукой
+    // заказчика (`tools/hsv_decide.py sign 0.06 3.0 auto manual`, журнал 46) на
+    // размеченных записях это 60 ошибок против 100 у того же автомата без
+    // выученной границы.
+    this.hsvReference = true,
     this.hsvCoolValueMin = 217,
     this.hsvCoolSatMax = 64,
     this.hsvWarmValueMin = 140,
@@ -227,8 +233,13 @@ class LampConfig {
   /// (это и есть «не всегда считает вспышку»). Доля цветных пикселей на тех же
   /// включениях поднимается на 0.061…1.0, а оттенок от выдержки не меняется.
   ///
-  /// Включённый способ не требует калибровки, как и живой; переключение
-  /// сбрасывает окна, потому что они набраны в других единицах.
+  /// Включённый способ ищет событие по скользящему «полу» последних
+  /// [referenceWindowFrames] кадров — то есть само включение считается и без
+  /// калибровки. Но работает этот способ теперь только вместе с калибровкой:
+  /// имя вспышки выучивается по трём её состояниям ([hsvSignatureNaming]), и без
+  /// них детектор не запускается (журнал 46, слово заказчика «будем только с
+  /// калибровкой работать»). Переключение способа сбрасывает окна, потому что
+  /// они набраны в других единицах.
   final bool hsvReference;
 
   /// Пиксель «белый» в HSV: яркость (0..255) не ниже этого…
@@ -323,6 +334,12 @@ class LampConfig {
   /// `191158` (б к б к бк -> 5/5): там чужой канал поднимается на кадр РАНЬШЕ
   /// своего, а вето сравнивает один и тот же кадр. Память вето (`mem`) по
   /// разметке лучше не делает — при gate 3.0 ошибок 17, а не меньше.
+  ///
+  /// Число проверено заново 25.11.2026, после того как центры рамок стали
+  /// ручными (журнал 45, 46): по всей разметке `truth 3.0` даёт 121 ошибку
+  /// против 130 при `truth 1.5`, и по корпусам это
+  /// `стенд 54 / pixel 63 / pixel-стена 2 / iphone 2` против
+  /// `56 / 70 / 2 / 2`. Значит подбор не устарел от перестановки рамок.
   final double hsvGate;
 
   /// Яркость (p90 зоны в долях 0..1), с которой зона считается стоящей на
@@ -349,6 +366,14 @@ class LampConfig {
   /// (`HsvSignature.learn`, журнал 37: 32 ошибки → 3 на клипах с настоящими
   /// переключениями). Выключено — прежний путь с вето [hsvGate]; если
   /// калибровка разделения не дала, детектор откатывается на него сам.
+  ///
+  /// С 25.11.2026 это не опция рабочего пути, а сам путь: HSV-счёт запущен
+  /// только после трёх состояний калибровки (журнал 46). Проверено на разметке
+  /// координат рукой заказчика, leave-one-out, обнаружение тем же автоматом:
+  /// `sign 0.06 3.0 auto manual` даёт 60 ошибок вместо 100 у автомата с вето,
+  /// по корпусам pixel 63 → 28 (признак `зона1/cool`, порог 0.217, разделение
+  /// 15σ), стенд 33 → 32, а iphone и pixel-стена остаются без второго класса —
+  /// там учиться нечему, и имена решает там прежнее вето.
   final bool hsvSignatureNaming;
 
   /// Ниже какого разделения двух ламп (в σ) калибровка не даёт права называть
@@ -405,15 +430,18 @@ class LampConfig {
   }) {
     return LampConfig(
       hitFraction: hitFraction ?? this.hitFraction,
-      templateMinSeparation: templateMinSeparation ?? this.templateMinSeparation,
+      templateMinSeparation:
+          templateMinSeparation ?? this.templateMinSeparation,
       offRatio: offRatio ?? this.offRatio,
       onConfirmFrames: onConfirmFrames ?? this.onConfirmFrames,
       offConfirmFrames: offConfirmFrames ?? this.offConfirmFrames,
       offConfirmMs: offConfirmMs ?? this.offConfirmMs,
       calibrationFrames: calibrationFrames ?? this.calibrationFrames,
       calibrationMaxNoise: calibrationMaxNoise ?? this.calibrationMaxNoise,
-      calibrationNoiseRatio: calibrationNoiseRatio ?? this.calibrationNoiseRatio,
-      baselineMaxAgeMinutes: baselineMaxAgeMinutes ?? this.baselineMaxAgeMinutes,
+      calibrationNoiseRatio:
+          calibrationNoiseRatio ?? this.calibrationNoiseRatio,
+      baselineMaxAgeMinutes:
+          baselineMaxAgeMinutes ?? this.baselineMaxAgeMinutes,
       subsampleStep: subsampleStep ?? this.subsampleStep,
       analysisIsolateThresholdMs:
           analysisIsolateThresholdMs ?? this.analysisIsolateThresholdMs,
@@ -424,7 +452,8 @@ class LampConfig {
       redMargin: redMargin ?? this.redMargin,
       redMinValue: redMinValue ?? this.redMinValue,
       liveReference: liveReference ?? this.liveReference,
-      referenceWindowFrames: referenceWindowFrames ?? this.referenceWindowFrames,
+      referenceWindowFrames:
+          referenceWindowFrames ?? this.referenceWindowFrames,
       referencePercentile: referencePercentile ?? this.referencePercentile,
       referenceNoiseSigmas: referenceNoiseSigmas ?? this.referenceNoiseSigmas,
       referenceMinRise: referenceMinRise ?? this.referenceMinRise,
@@ -500,23 +529,36 @@ class LampConfig {
   /// `spatialVectors`) — они игнорируются.
   factory LampConfig.fromJson(Map<String, Object?> json) {
     const LampConfig def = LampConfig();
-    double d(String key, double fallback) => (json[key] as num?)?.toDouble() ?? fallback;
+    double d(String key, double fallback) =>
+        (json[key] as num?)?.toDouble() ?? fallback;
     int i(String key, int fallback) => (json[key] as num?)?.toInt() ?? fallback;
     bool b(String key, bool fallback) => json[key] as bool? ?? fallback;
 
     return LampConfig(
       hitFraction: d('hitFraction', def.hitFraction),
-      templateMinSeparation: d('templateMinSeparation', def.templateMinSeparation),
+      templateMinSeparation: d(
+        'templateMinSeparation',
+        def.templateMinSeparation,
+      ),
       offRatio: d('offRatio', def.offRatio),
       onConfirmFrames: i('onConfirmFrames', def.onConfirmFrames),
       offConfirmFrames: i('offConfirmFrames', def.offConfirmFrames),
       offConfirmMs: i('offConfirmMs', def.offConfirmMs),
       calibrationFrames: i('calibrationFrames', def.calibrationFrames),
       calibrationMaxNoise: d('calibrationMaxNoise', def.calibrationMaxNoise),
-      calibrationNoiseRatio: d('calibrationNoiseRatio', def.calibrationNoiseRatio),
-      baselineMaxAgeMinutes: i('baselineMaxAgeMinutes', def.baselineMaxAgeMinutes),
+      calibrationNoiseRatio: d(
+        'calibrationNoiseRatio',
+        def.calibrationNoiseRatio,
+      ),
+      baselineMaxAgeMinutes: i(
+        'baselineMaxAgeMinutes',
+        def.baselineMaxAgeMinutes,
+      ),
       subsampleStep: i('subsampleStep', def.subsampleStep),
-      analysisIsolateThresholdMs: d('analysisIsolateThresholdMs', def.analysisIsolateThresholdMs),
+      analysisIsolateThresholdMs: d(
+        'analysisIsolateThresholdMs',
+        def.analysisIsolateThresholdMs,
+      ),
       yuvFullRange: b('yuvFullRange', def.yuvFullRange),
       scoreHistoryPoints: i('scoreHistoryPoints', def.scoreHistoryPoints),
       csvFlushLines: i('csvFlushLines', def.csvFlushLines),
@@ -524,7 +566,10 @@ class LampConfig {
       redMargin: d('redMargin', def.redMargin),
       redMinValue: d('redMinValue', def.redMinValue),
       liveReference: b('liveReference', def.liveReference),
-      referenceWindowFrames: i('referenceWindowFrames', def.referenceWindowFrames),
+      referenceWindowFrames: i(
+        'referenceWindowFrames',
+        def.referenceWindowFrames,
+      ),
       referencePercentile: d('referencePercentile', def.referencePercentile),
       referenceNoiseSigmas: d('referenceNoiseSigmas', def.referenceNoiseSigmas),
       referenceMinRise: d('referenceMinRise', def.referenceMinRise),
@@ -577,6 +622,11 @@ class LampConfig {
 /// смене сцены, живой отсчёт не различает цвета (белая лампа, перелившая
 /// красную рамку, для него тоже вспышка красной), HSV-отсчёт не различает
 /// яркости и потому стоит на доле цветных пикселей.
+///
+/// Рабочим с 25.11.2026 считается только [hsv], и он обязан идти с калибровкой:
+/// по замерам на ручной разметке координат это 60 ошибок против 100 без
+/// выученного имени (журнал 46). [live] в перечислении остался молча — старые
+/// сохранённые настройки с ним встречаются, но в меню его больше нет.
 enum LampCountMode {
   /// Доля измеренного отклика, набранного на калибровке (фон → белая →
   /// красная).
@@ -585,6 +635,7 @@ enum LampCountMode {
   /// Подъём яркости своей рамки над «полом» последних кадров.
   live,
 
-  /// Подъём доли пикселей СВОЕГО цвета над «полом» последних кадров.
+  /// Подъём доли пикселей СВОЕГО цвета над «полом» последних кадров; имя
+  /// вспышки берётся у тех же трёх состояний калибровки.
   hsv,
 }

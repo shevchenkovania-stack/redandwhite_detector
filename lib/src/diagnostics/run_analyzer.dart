@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import '../detection/hit_state_machine.dart';
 import '../detection/lamp_detector.dart';
+import '../models/frame_features.dart';
 import '../models/hit_event.dart';
 import '../models/lamp_config.dart';
 import 'feature_csv_recorder.dart';
@@ -93,12 +94,12 @@ class RunAnalysis {
   final int offConfirmMs;
 
   String describe() => <String>[
-      'кадров $frames за ${span.inMilliseconds} мс · медианный кадр $medianFrameMs мс',
-      'событий: белая $whiteEvents · красная $redEvents '
-          '(подтверждение выключения было $offConfirmMs мс)',
-      whiteTiming.describe(),
-      redTiming.describe(),
-    ].join('\n');
+    'кадров $frames за ${span.inMilliseconds} мс · медианный кадр $medianFrameMs мс',
+    'событий: белая $whiteEvents · красная $redEvents '
+        '(подтверждение выключения было $offConfirmMs мс)',
+    whiteTiming.describe(),
+    redTiming.describe(),
+  ].join('\n');
 }
 
 /// Разбор записанной серии (CSV v5 и старых форматов) нынешним способом решения.
@@ -118,8 +119,15 @@ class RunAnalysis {
 /// [LampConfig.countMode] в [base]). Прежнее принудительное `liveReference: true`
 /// делало HSV-прогон непроверяемым: запись, решённая по цвету, пересчитывалась
 /// по яркости и давала другой счёт событий, который нельзя было сравнить ни с
-/// чем (ЖУРНАЛ §11.12). Калибровки у записи нет, но живой и HSV отсчёты её не
-/// требуют.
+/// чем (ЖУРНАЛ §11.12).
+///
+/// Калибровка разбору нужна ровно та же, что и живому прогону. HSV-счёт
+/// называется по выученному правилу, а оно учится по трём состояниям калибровки;
+/// без [baseline] тот же CSV решился бы перевесом канала — то есть способом,
+/// который с 25.11.2026 рабочим не считается (журнал 46). Разбор обязан назвать
+/// число ошибок того способа, которым считали, а не подменять его другим, поэтому
+/// без калибровки он не запускается вовсе. [baseline] берут из сессии, чей это
+/// CSV.
 class RunAnalyzer {
   const RunAnalyzer();
 
@@ -127,15 +135,26 @@ class RunAnalyzer {
     String csv, {
     LampConfig base = const LampConfig(),
     LampCountMode? mode,
+    LampBaseline? baseline,
   }) {
     final List<FeatureCsvRow> rows = FeatureCsv.decode(csv);
     if (rows.length < 2) {
       throw ArgumentError('для разбора нужно минимум два кадра записи');
     }
 
-    final LampDetector detector = LampDetector(
-      mode == null ? base : base.withCountMode(mode),
-    );
+    final LampConfig effective = mode == null ? base : base.withCountMode(mode);
+    if (effective.countMode == LampCountMode.hsv && baseline == null) {
+      throw ArgumentError(
+        'HSV-разбор без калибровки: удары назвали бы перевесом канала, а не '
+        'выученным правилом — это другой способ, а не тот, которым считали '
+        'запись (журнал 46). Передайте baseline сессии.',
+      );
+    }
+
+    final LampDetector detector = LampDetector(effective);
+    if (baseline != null) {
+      detector.setBaseline(baseline);
+    }
     final HitStateMachine machine = HitStateMachine(sessionId: 'analysis');
     final _Tracker white = _Tracker();
     final _Tracker red = _Tracker();

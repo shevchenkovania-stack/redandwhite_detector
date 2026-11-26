@@ -59,10 +59,13 @@ void main() {
       capturedAtMs: 0,
     );
 
+    // Способ назван прямо: по умолчанию он теперь HSV (журнал 46), а проверка
+    // именно про эталонный режим.
     final LampConfig config = LampConfig(
       onConfirmFrames: 2,
       offConfirmFrames: 3,
       liveReference: false,
+      hsvReference: false,
     );
     final LampDetector detector = LampDetector(config)..setBaseline(baseline);
     // До фикса здесь было isCalibrated=false и evaluate кидал StateError.

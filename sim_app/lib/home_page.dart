@@ -126,7 +126,12 @@ class _SimHomePageState extends State<SimHomePage> {
   static const double _liveWhiteDeltaFrac = 0.12;
   static const double _liveRedDeltaFrac = 0.42;
 
-  LampDetector _ruleDetector = LampDetector(const LampConfig(liveReference: false));
+  /// Способ счёта панели назван прямо: рабочим по умолчанию теперь считается
+  /// HSV (журнал 46), а панель эмулирует идеальную калибровку по яркости —
+  /// цветовых рядов в ней нет, и HSV-детектор такой baseline не читает.
+  LampDetector _ruleDetector = LampDetector(
+    const LampConfig(liveReference: false, hsvReference: false),
+  );
   final HitStateMachine _ruleMachine = HitStateMachine(
     sessionId: 'panel-rule',
     idGenerator: () => 'rule',
@@ -326,6 +331,9 @@ class _SimHomePageState extends State<SimHomePage> {
       // Панель проверяет тайминг правила, а не фотометрию: у неё идеальная
       // калибровка, и «ноль» обязана давать она, а не окно последних кадров.
       liveReference: false,
+      // Не по умолчанию, а прямо: идеальный яркостной baseline панели в HSV-
+      // способе не читается цветовыми рядами (журнал 46).
+      hsvReference: false,
     );
     _ruleDetector = LampDetector(config)
       ..setBaseline(_idealBaseline(config.calibrationFrames));
@@ -894,7 +902,10 @@ class _SimHomePageState extends State<SimHomePage> {
     });
     final OpenCvShadowRunner runner = _shadow ??= OpenCvShadowRunner(
       source: _source,
-      config: const LampConfig(),
+      // Тень меряет яркость, а не цвет: способ здесь назван прямо, чтобы
+      // рабочий HSV по умолчанию (журнал 46) не добавлял в сравнение лишнего
+      // отсчёта, который ничего не проверяет.
+      config: const LampConfig(hsvReference: false),
       roi: simPictureRoi,
       setScene: (String scene) =>
           _source.setScene(SimScene.values.byName(scene)),

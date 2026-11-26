@@ -8,6 +8,11 @@ import 'support/session_fakes.dart';
 /// стенд: ни второго прогона, ни другой выборки. Заодно по тем же строкам
 /// измеряются длительности провалов и пауз — единственные числа, которыми
 /// задают `offConfirmMs` вместо догадки.
+///
+/// Способ счёта здесь назван прямо. Синтетические кадры ниже измеряют только
+/// яркость (`whiteFrac`/`redFrac`), цветовых рядов в них нет, а рабочий способ
+/// по умолчанию теперь HSV (журнал 46): без явного `mode` разбор не увидел бы
+/// ни одного удара и проверял бы не то правило.
 void main() {
   FrameFeatures field(
     double meanY, {
@@ -65,7 +70,10 @@ void main() {
         ...List<FeatureCsvRow>.generate(6, (int i) => row(16 + i)),
       ];
 
-      final RunAnalysis a = RunAnalyzer.analyze(FeatureCsv.encode(rows));
+      final RunAnalysis a = RunAnalyzer.analyze(
+        FeatureCsv.encode(rows),
+        mode: LampCountMode.live,
+      );
 
       expect(a.frames, rows.length);
       expect(a.medianFrameMs, 33);
@@ -95,7 +103,10 @@ void main() {
         ...List<FeatureCsvRow>.generate(6, (int i) => row(31 + i)),
       ];
 
-      final RunAnalysis a = RunAnalyzer.analyze(FeatureCsv.encode(rows));
+      final RunAnalysis a = RunAnalyzer.analyze(
+        FeatureCsv.encode(rows),
+        mode: LampCountMode.live,
+      );
 
       expect(a.redEvents, 2);
       expect(a.whiteEvents, 0);

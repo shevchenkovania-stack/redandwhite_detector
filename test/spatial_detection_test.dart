@@ -79,9 +79,12 @@ LampFrame _whiteSpill() =>
     _scene(whiteCore: 200, whiteRing: 120, redCore: 85, redRing: 52, whiteWf: 0.5);
 
 /// Конфиг режима эталонов: решение по измеренным откликам, набор шага
-/// короткий — синтетика шума не имеет.
+/// короткий — синтетика шума не имеет. `hsvReference: false` назван прямо:
+/// рабочий способ по умолчанию теперь HSV (журнал 46), а здесь проверяется
+/// геометрический отклик, цветовых рядов в сцене нет.
 LampConfig _cfg({bool rings = true, double ringScale = 1.7}) => LampConfig(
   liveReference: false,
+  hsvReference: false,
   calibrationFrames: 3,
   ringScale: rings ? ringScale : 1,
 );

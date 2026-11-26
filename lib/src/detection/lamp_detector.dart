@@ -279,13 +279,30 @@ class LampDetector {
   /// Измеренная модель отклика. Null до завершённой калибровки.
   LampResponseModel? get model => _model;
 
-  bool get isCalibrated => _model?.isValid ?? false;
+  /// Яркая модель калибровки годна: эталоны nonzero и лампы разделяются.
+  ///
+  /// Именно её проверяет режим эталонов; HSV-счёт на неё не опирается, ему
+  /// нужен отдельный ответ ([isCalibrated]).
+  bool get modelValid => _model?.isValid ?? false;
 
-  /// Есть чем решать: живой отсчёт и HSV-отсчёт работают сразу, режим
-  /// эталонов — только после калибровки. Сессия спрашивает это вместо
-  /// [isCalibrated].
-  bool get canEvaluate =>
-      _config.hsvReference || _config.liveReference || isCalibrated;
+  /// Калибровка принята ТЕМ способом счёта, который включён.
+  ///
+  /// Разные способы измеряют калибровку разными числами, и требование к ней
+  /// обязано быть тем же: HSV-счёт решает по долям цветных пикселей, и
+  /// яркостная модель в его правилах не участвует ни в одном месте —
+  /// отвергать из-за неё съёмку значило бы гонять оператора по кругу
+  /// (журнал 46: имя вспышки там учится по HSV-рядам и даёт 60 ошибок вместо
+  /// 100, а яркостное перетекание на него не влияет).
+  bool get isCalibrated =>
+      _config.hsvReference ? (_baseline?.isCalibrated ?? false) : modelValid;
+
+  /// Есть чем решать: живой отсчёт работает сразу, HSV и режим эталонов —
+  /// только после калибровки. Слово заказчика 25.11.2026: «будем только с
+  /// калибровкой работать», и за ним число, а не настроение: на разметке
+  /// координат рукой заказчика HSV без выученного имени даёт 100 ошибок вместо
+  /// 60 (`tools/hsv_decide.py sign 0.06 3.0 auto manual`, журнал 46). Сессия
+  /// спрашивает это вместо [isCalibrated].
+  bool get canEvaluate => _config.liveReference || isCalibrated;
 
   /// Сколько кадров подряд были неоднозначными (обе амплитуды выше своего уровня).
   int get ambiguousFrames => _ambiguousFrames;
@@ -298,6 +315,42 @@ class LampDetector {
   /// плохих рамках и на засветке чужой лампы, и именно по нему видно, что
   /// удвоение счёта ловится, а не проходит.
   int get doubleBasketFrames => _doubleBasketFrames;
+
+  /// Правило именования вспышек, выученное калибровкой. Null — решает прежнее
+  /// правило перевеса ([LampConfig.hsvGate]).
+  HsvSignature? get hsvSignature => _hsv.signature;
+
+  /// Отчёт калибровки на вопрос «как она называет вспышки» — одна строка для
+  /// оператора. Числом, а не словом: «не выучилось» без разделения в σ
+  /// неотличимо от «снято плохо, пересними» и от «на этой сцене разделить
+  /// нельзя» (замер 25.11.2026: на iphone красная лампа выбита в белый, и там
+  /// второго класса нет ни при каком пороге).
+  String get hsvNaming {
+    if (!_config.hsvReference) {
+      return '';
+    }
+    final LampBaseline? base = _baseline;
+    if (base == null || !base.isCalibrated) {
+      return 'калибровки нет — счёт по цвету не запускается';
+    }
+    final HsvSignature? best = HsvSignature.probe(base);
+    if (best == null) {
+      return 'HSV-ряды в калибровке пустые: шаги сняты не цветовым способом';
+    }
+    final double need = _config.hsvSignatureMinSigmas;
+    if (!_config.hsvSignatureNaming) {
+      return 'именование по калибровке выключено, решает перевес канала '
+          '(gate ${_config.hsvGate.toStringAsFixed(1)})';
+    }
+    if (best.separation < need) {
+      return 'имя НЕ выучено: разделение ${best.separation.toStringAsFixed(1)}σ '
+          'при нужных ${need.toStringAsFixed(1)}σ '
+          '(${best.feature.name} Б=${best.whiteValue.toStringAsFixed(3)} '
+          'К=${best.redValue.toStringAsFixed(3)}); решает перевес канала '
+          '(gate ${_config.hsvGate.toStringAsFixed(1)})';
+    }
+    return 'имя выучено: ${best.describe}';
+  }
 
   /// Восстановление калибровки из настроек.
   void setBaseline(LampBaseline baseline) {
@@ -728,6 +781,11 @@ class LampDetector {
   /// залившая всю сцену, по яркости неотличима от включённого света в зале, а
   /// по цвету — отличима почти всегда.
   LampEvaluation _evaluateHsv(LampFrame frame) {
+    // Калибровка этому способу нужна, но требует её не здесь, а сессия:
+    // [canEvaluate] без трёх состояний ложна, и кадры в HSV-счёте не оцениваются
+    // вовсе (журнал 46). Сам детектор остаётся годным к вызову без калибровки:
+    // он находит удар и называет его перевесом канала, а не молчит, — иначе
+    // любой офлайн-разбор файла, снятого до калибровки, падал бы вместо чисел.
     final LiveReading reading = _hsv.step(frame);
 
     final bool ambiguous = reading.whiteAboveOn && reading.redAboveOn;

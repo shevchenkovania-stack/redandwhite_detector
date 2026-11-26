@@ -136,13 +136,20 @@ class Scene {
 
 /// Прогон кадров через детектор + автомат, как это делает живая сессия.
 ///
-/// По умолчанию режим эталонов (`liveReference: false`): эти тесты проверяют
-/// разложение отклика на измеренные эталоны и калибровку. Живой отсчёт
-/// проверяется отдельно в `live_reference_test.dart` — он намеренно не требует
-/// калибровки, и мешать два режима в одном сценарии значит не проверить ни один.
+/// По умолчанию режим эталонов (`liveReference: false, hsvReference: false`):
+/// эти тесты проверяют разложение отклика на измеренные эталоны и калибровку.
+/// Живой отсчёт проверяется отдельно в `live_reference_test.dart` — он
+/// намеренно не требует калибровки, и мешать два режима в одном сценарии значит
+/// не проверить ни один.
+///
+/// `hsvReference: false` здесь обязателен, хотя раньше его не писали: рабочий
+/// способ по умолчанию теперь HSV (журнал 46), а синтетическая сцена измеряет
+/// только яркость — в цветовом режиме эти кадры ничего не дают.
 class Harness {
   Harness({LampConfig? config, Scene? scene})
-    : config = config ?? const LampConfig(liveReference: false),
+    : config =
+          config ??
+          const LampConfig(liveReference: false, hsvReference: false),
       scene = scene ?? const Scene() {
     detector = LampDetector(this.config);
     machine = HitStateMachine(sessionId: 'test-session', idGenerator: _ids.next);

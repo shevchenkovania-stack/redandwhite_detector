@@ -16,7 +16,12 @@ import 'response_model.dart';
 enum CalibrationStep {
   background('фон', 'Держите обе лампы выключенными', 'bg', 'ФОН'),
   whiteOn('белая горит', 'Зажгите белую лампу и держите', 'white_on', 'БЕЛАЯ'),
-  redOn('красная горит', 'Белую погасите, зажгите красную и держите', 'red_on', 'КРАСНАЯ');
+  redOn(
+    'красная горит',
+    'Белую погасите, зажгите красную и держите',
+    'red_on',
+    'КРАСНАЯ',
+  );
 
   const CalibrationStep(this.label, this.prompt, this.csvTag, this.button);
 
@@ -148,18 +153,19 @@ class CalibrationReport {
         'Фон: $frameCount кадров, шум ${noise.toStringAsFixed(4)}',
       CalibrationStep.whiteOn =>
         'Белая увидена: отклик ${response?.toStringAsFixed(4)} = '
-        '${separationSigmas?.toStringAsFixed(1)}σ шума',
+            '${separationSigmas?.toStringAsFixed(1)}σ шума',
       CalibrationStep.redOn =>
         'Красная увидена: отклик ${response?.toStringAsFixed(4)} = '
-        '${separationSigmas?.toStringAsFixed(1)}σ шума; перетекание '
-        '${((crosstalk ?? 0) * 100).toStringAsFixed(0)}%, шум амплитуды '
-        'W ${((whiteAmplitudeNoise ?? 0) * 100).toStringAsFixed(1)}% / '
-        'R ${((redAmplitudeNoise ?? 0) * 100).toStringAsFixed(1)}%',
+            '${separationSigmas?.toStringAsFixed(1)}σ шума; перетекание '
+            '${((crosstalk ?? 0) * 100).toStringAsFixed(0)}%, шум амплитуды '
+            'W ${((whiteAmplitudeNoise ?? 0) * 100).toStringAsFixed(1)}% / '
+            'R ${((redAmplitudeNoise ?? 0) * 100).toStringAsFixed(1)}%',
     };
     // Дальше обязана идти одна короткая команда: что жечь и что нажать.
     // Длинный текст оператор у экрана не читает, он держит лампу рукой.
     final String nextStep = switch (step) {
-      CalibrationStep.background => '. Дальше: включи белую и жми «${CalibrationStep.whiteOn.key}»',
+      CalibrationStep.background =>
+        '. Дальше: включи белую и жми «${CalibrationStep.whiteOn.key}»',
       CalibrationStep.whiteOn =>
         '. Дальше: гаси белую, включай красную и жми «${CalibrationStep.redOn.key}»',
       CalibrationStep.redOn => '. Готово, можно считать',
@@ -282,7 +288,9 @@ class LampCalibration {
     );
     // Шум своей области: и ядра, и кольца, если кольцо мерилось.
     final FrameFeatures sigma = white ? bg.whiteSigma : bg.redSigma;
-    final FrameFeatures? ringSigma = white ? bg.whiteRingSigma : bg.redRingSigma;
+    final FrameFeatures? ringSigma = white
+        ? bg.whiteRingSigma
+        : bg.redRingSigma;
     double gate = math.max(sigma.meanY, sigma.p90Luma);
     if (ringSigma != null) {
       gate = math.max(gate, math.max(ringSigma.meanY, ringSigma.p90Luma));
@@ -360,8 +368,10 @@ class LampCalibration {
     // Подставленные состояния сняты при экспозиции из baseline: сверка
     // начинается с неё, иначе переснятый шаг сошёлся бы с прежним молча, хотя
     // свет между ними уже разный.
-    final ({int? ns, double? gain}) adopted =
-        (ns: baseline.exposureTimeNs, gain: baseline.sensorSensitivity);
+    final ({int? ns, double? gain}) adopted = (
+      ns: baseline.exposureTimeNs,
+      gain: baseline.sensorSensitivity,
+    );
     for (final CalibrationStep step in CalibrationStep.values) {
       _stepExposure[step] ??= adopted;
     }
@@ -381,14 +391,20 @@ class LampCalibration {
     int? ns;
     double? gain;
     for (final LampFrame frame in frames) {
-      if (!ExposureGuard.same(ns, frame.exposureTimeNs, gain, frame.sensorSensitivity)) {
+      if (!ExposureGuard.same(
+        ns,
+        frame.exposureTimeNs,
+        gain,
+        frame.sensorSensitivity,
+      )) {
         throw CalibrationException(
           'Экспозиция менялась прямо во время набора «${_step.label}»: '
           '${ExposureGuard.describe(aNs: ns, aGain: gain, bNs: frame.exposureTimeNs, bGain: frame.sensorSensitivity)}. '
           'Свет должен быть заперт до старта шага — пересними шаг, когда камера '
           'успокоится.',
           step: _step,
-          brief: 'Свет плыл во время «${_step.label}»: жди секунду после «Пуск» шага',
+          brief:
+              'Свет плыл во время «${_step.label}»: жди секунду после «Пуск» шага',
         );
       }
       ns ??= frame.exposureTimeNs;
@@ -399,19 +415,15 @@ class LampCalibration {
       if (entry.key == _step) {
         continue;
       }
-      if (!ExposureGuard.same(
-        entry.value.ns,
-        ns,
-        entry.value.gain,
-        gain,
-      )) {
+      if (!ExposureGuard.same(entry.value.ns, ns, entry.value.gain, gain)) {
         throw CalibrationException(
           '«${entry.key.label}» снят при другом свете, чем «${_step.label}»: '
           '${ExposureGuard.describe(aNs: entry.value.ns, aGain: entry.value.gain, bNs: ns, bGain: gain)}. '
           'Все три состояния обязаны быть набраны на одной запертой экспозиции — '
           'пересними «${entry.key.label}» тоже.',
           step: _step,
-          brief: 'Разный свет: пересними «${entry.key.key}» на той же экспозиции',
+          brief:
+              'Разный свет: пересними «${entry.key.key}» на той же экспозиции',
         );
       }
     }
@@ -457,8 +469,9 @@ class LampCalibration {
       response: againstBackground && bg != null
           ? vector.norm(vector.ofResponse(state, bg))
           : null,
-      separationSigmas:
-          againstBackground && bg != null ? _separationAgainstBackground(state, bg) : null,
+      separationSigmas: againstBackground && bg != null
+          ? _separationAgainstBackground(state, bg)
+          : null,
     );
 
     // Модель сборная: её можно отвергнуть только когда есть все три состояния,
@@ -480,7 +493,8 @@ class LampCalibration {
     // шага обязаны сойтись на ней, поэтому неважно, чья именно запись. Нужна
     // она не калибровке, а рабочему прогону: по ней сессия поймёт, что свет
     // сменился и эталон больше не описывает кадр.
-    final ({int? ns, double? gain}) shot = _stepExposure[CalibrationStep.background] ??
+    final ({int? ns, double? gain}) shot =
+        _stepExposure[CalibrationStep.background] ??
         (_stepExposure.isEmpty
             ? (ns: null, gain: null)
             : _stepExposure.values.first);
@@ -493,30 +507,64 @@ class LampCalibration {
       sensorSensitivity: shot.gain,
     );
     final LampResponseModel model = LampResponseModel(baseline);
-    if (baseline.background.whiteRing == null) {
-      // Вектор без колец — это те же два колпака и ничего больше: отличить
-      // засветку от своей лампы становится нечем, и модель начала бы решать по
-      // обрезанному вектору, не сказав об этом.
-      throw CalibrationException(
-        'Калибровка не измеряла ореолы: кольцо вокруг рамок выключено '
-        '(ringScale = 1). Включи измерение кольца и повтори все три шага — без '
-        'ореолов восьмимерный вектор вырождается в яркость двух колпаков.',
-        brief: 'Нет колец: включи ringScale > 1 и повтори шаги 1–3.',
-      );
-    }
-    final String? reason = model.invalidReason(config.templateMinSeparation);
-    if (reason != null) {
-      // Виноват тот шаг, эталон которого и не годится: переснимать всегда
-      // последний («красная») — значит гонять оператора по кругу, когда
-      // отклика не дала белая лампа.
-      final CalibrationStep step = model.failingStep(config.templateMinSeparation);
-      _states.remove(step);
-      _step = step;
-      throw CalibrationException(
-        reason,
-        step: step,
-        brief: '«${step.key}»: ${_clip(reason)}. Пересними этот шаг',
-      );
+    if (config.hsvReference) {
+      // Цветовой счёт. Его правила читают доли цветных пикселей, и яркостная
+      // модель в них не участвует ни в одном месте, поэтому проверки годностью
+      // модели (ореолы, перетекание, разделение яркости) отвергали бы съёмку по
+      // числам, которые этот способ никогда не спросит. Слово заказчика
+      // 25.11.2026 — «совмести наработку hsv и калибровку в одно»: калибровка
+      // здесь нужна, чтобы НАЗЫВАТЬ вспышки (`HsvSignature`), и ровно это за
+      // ней и проверяется.
+      //
+      // Проверяется, однако, не разделение: отказывать съёмке из-за низкого
+      // разделения нельзя, потому что на iphone красная лампа выбита в белый и
+      // второго класса там нет ни при каком пороге (замер 25.11.2026,
+      // `tools/hsv_decide.py sign`: корпуса iphone и pixel-стена — «граница не
+      // именуется»). Такие сцены считаются, а имя им даёт перевес канала; то,
+      // что калибровка ничему не научила, оператор видит в отчёте
+      // (`LampDetector.hsvNaming`), а не в запрете.
+      //
+      // Остаётся единственная проверка, у которой нет порога: цвет обязан быть
+      // ИЗМЕРЕН. Нулевые приращения всех четырёх рядов означают, что три
+      // состояния сняты сборкой, которая цветовые доли не считала вовсе (это
+      // старые сохранённые калибровки и съёмка в другом способе), и учиться по
+      // ней не по чему.
+      if (_hsvResponseIsZero(baseline)) {
+        throw CalibrationException(
+          'Калибровка не измеряла цвет: доли «белых» и «красных» пикселей во '
+          'всех трёх состояниях одинаковые. Начни «1 ФОН» в цветовом счёте — '
+          'по этой базе называть вспышки нечем.',
+          brief: 'Нет цветовых рядов: повтори шаги 1–3 в HSV-счёте',
+        );
+      }
+    } else {
+      if (baseline.background.whiteRing == null) {
+        // Вектор без колец — это те же два колпака и ничего больше: отличить
+        // засветку от своей лампы становится нечем, и модель начала бы решать по
+        // обрезанному вектору, не сказав об этом.
+        throw CalibrationException(
+          'Калибровка не измеряла ореолы: кольцо вокруг рамок выключено '
+          '(ringScale = 1). Включи измерение кольца и повтори все три шага — без '
+          'ореолов восьмимерный вектор вырождается в яркость двух колпаков.',
+          brief: 'Нет колец: включи ringScale > 1 и повтори шаги 1–3.',
+        );
+      }
+      final String? reason = model.invalidReason(config.templateMinSeparation);
+      if (reason != null) {
+        // Виноват тот шаг, эталон которого и не годится: переснимать всегда
+        // последний («красная») — значит гонять оператора по кругу, когда
+        // отклика не дала белая лампа.
+        final CalibrationStep step = model.failingStep(
+          config.templateMinSeparation,
+        );
+        _states.remove(step);
+        _step = step;
+        throw CalibrationException(
+          reason,
+          step: step,
+          brief: '«${step.key}»: ${_clip(reason)}. Пересними этот шаг',
+        );
+      }
     }
     // Успех: состояния превратились в baseline, детектору больше нечего
     // набирать. Забываем их, чтобы следующее нажатие «Калибровка» честно
@@ -535,7 +583,42 @@ class LampCalibration {
     );
   }
 
-  double _separationAgainstBackground(CalibrationState state, CalibrationState bg) {
+  /// Приращения четырёх HSV-рядов относительно фона, снятые в обоих шагах
+  /// горящей лампы, — ровно те четыре числа, по которым `HsvSignature` учит
+  /// имя вспышки.
+  ///
+  /// Ноль во всех них — не «лампа слабая», а «цвет не измерялся»: это
+  /// `FeatureExtractor` считает HSV-доли только при [LampConfig.hsvReference], и
+  /// baseline, собранный в другом способе, несёт по ним нули. Порога здесь нет
+  /// специально: любое число выше нуля уже значит, что ряды живые и учиться по
+  /// ним на что.
+  static bool _hsvResponseIsZero(LampBaseline baseline) {
+    final CalibrationState bg = baseline.background;
+    double maxDelta = 0;
+    for (final CalibrationState on in <CalibrationState>[
+      baseline.whiteOn,
+      baseline.redOn,
+    ]) {
+      final List<double> deltas = <double>[
+        on.white.coolFrac - bg.white.coolFrac,
+        on.white.warmFrac - bg.white.warmFrac,
+        on.red.coolFrac - bg.red.coolFrac,
+        on.red.warmFrac - bg.red.warmFrac,
+      ];
+      for (final double delta in deltas) {
+        final double abs = delta.abs();
+        if (abs > maxDelta) {
+          maxDelta = abs;
+        }
+      }
+    }
+    return maxDelta < 1e-6;
+  }
+
+  double _separationAgainstBackground(
+    CalibrationState state,
+    CalibrationState bg,
+  ) {
     final LampVector v = vector;
     final double response = v.norm(v.ofResponse(state, bg));
     final Float64List a = v.ofSigma(state);
@@ -572,8 +655,14 @@ class LampCalibration {
     // Кольца набираются только если их измеряли. Отсутствие кольца в состоянии
     // обязано остаться null: подставить туда ноль означало бы «эта область
     // всегда была чёрной», и модель начала бы решать по выдуманному ореолу.
-    final List<FrameFeatures>? whiteRing = _ringFrames(frames, (LampFrame f) => f.whiteRing);
-    final List<FrameFeatures>? redRing = _ringFrames(frames, (LampFrame f) => f.redRing);
+    final List<FrameFeatures>? whiteRing = _ringFrames(
+      frames,
+      (LampFrame f) => f.whiteRing,
+    );
+    final List<FrameFeatures>? redRing = _ringFrames(
+      frames,
+      (LampFrame f) => f.redRing,
+    );
     final CalibrationState state = CalibrationState(
       white: whiteMean,
       red: redMean,
@@ -593,8 +682,9 @@ class LampCalibration {
     final LampVector vector = const LampVector();
     final Float64List mean = vector.ofState(state);
     final Float64List sigma = _robustSigma(frames, vector);
-    final Float64List? from =
-        reference == null ? null : vector.ofState(reference);
+    final Float64List? from = reference == null
+        ? null
+        : vector.ofState(reference);
     double worstRatio = 0;
     int worstIndex = -1;
     double worstAllowed = 0;
@@ -658,7 +748,8 @@ class LampCalibration {
     final List<double> sorted = List<double>.of(values)..sort();
     final double med = _medianOf(sorted);
     final List<double> deviations =
-        values.map((double v) => (v - med).abs()).toList(growable: false)..sort();
+        values.map((double v) => (v - med).abs()).toList(growable: false)
+          ..sort();
     return _medianOf(deviations);
   }
 
@@ -672,7 +763,8 @@ class LampCalibration {
   }
 
   /// Короткая версия длинного текста ошибки: у экрана читают одну строку.
-  static String _clip(String s) => s.length <= 90 ? s : '${s.substring(0, 90)}…';
+  static String _clip(String s) =>
+      s.length <= 90 ? s : '${s.substring(0, 90)}…';
 
   /// Кадры шага, в которых кольцо этой рамки реально измерялось. Null, если ни
   /// в одном кадре его не было: состояние обязано сказать «область не
@@ -747,7 +839,8 @@ class LampCalibration {
     if (list.length < 2) {
       return 0;
     }
-    final double mean = list.reduce((double a, double b) => a + b) / list.length;
+    final double mean =
+        list.reduce((double a, double b) => a + b) / list.length;
     double sq = 0;
     for (final double v in list) {
       sq += (v - mean) * (v - mean);

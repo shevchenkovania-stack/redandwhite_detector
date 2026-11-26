@@ -309,8 +309,14 @@ class DetectionSession extends ChangeNotifier {
   bool get isRunning => _running;
   bool get isCalibrated => _detector.isCalibrated;
 
-  /// Считаются ли события: в режиме живого отсчёта калибровка не обязательна.
+  /// Считаются ли события: живому отсчёту калибровка не нужна, HSV и режиму
+  /// эталонов — нужна (журнал 46).
   bool get canEvaluate => _detector.canEvaluate;
+
+  /// Чему калибровка научила цветовой счёт: одна строка с правилом именования и
+  /// разделением в σ, пусто в другом способе. Печатается в отчёте шага и в
+  /// LAMPDBG, чтобы «прошло» не выглядело как «научилось».
+  String get hsvNaming => _detector.hsvNaming;
   String get sessionId => _machine.sessionId;
   int get whiteHits => _whiteHits;
   int get redHits => _redHits;
@@ -466,7 +472,15 @@ class DetectionSession extends ChangeNotifier {
       );
     }
     if (!_detector.canEvaluate) {
-      return (ready: false, why: 'Нет калибровки — начни с «1 ФОН»');
+      // При цветовом счёте калибровка нужна не для порога, а для имени: без
+      // трёх состояний детектор нашёл бы вспышку, но не имел бы права сказать,
+      // чья она (журнал 46).
+      return (
+        ready: false,
+        why: _config.countMode == LampCountMode.hsv
+            ? 'HSV-счёт ждёт калибровку: «1 ФОН» → «2 БЕЛАЯ» → «3 КРАСНАЯ»'
+            : 'Нет калибровки — начни с «1 ФОН»',
+      );
     }
     // Скользящим способам (живому и HSV) нужно окно темноты: до него решения
     // просто нет.
@@ -791,8 +805,12 @@ class DetectionSession extends ChangeNotifier {
   ///
   /// В режиме эталонов три состояния собираются из строк с меткой шага
   /// калибровки (колонка `calibration_step`) — так запись и ведётся; можно
-  /// передать готовый [baseline]. В режиме живого отсчёта калибровка не нужна,
-  /// поэтому воспроизводится любой файл: «ноль» берётся из тех же строк.
+  /// передать готовый [baseline]. В живом отсчёте калибровка не нужна, поэтому
+  /// воспроизводится любой файл: «ноль» берётся из тех же строк.
+  ///
+  /// HSV-счёту калибровка нужна: без неё не выучено правило, и имена вспышек
+  /// взяться не откуда (журнал 46). Поэтому [baseline] по умолчанию — калибровка
+  /// текущей сессии; файл, снятый до неё, воспроизведётся без имён.
   Future<List<HitEvent>> replayCsv(
     String csvContent, {
     LampBaseline? baseline,
@@ -804,8 +822,13 @@ class DetectionSession extends ChangeNotifier {
     final LampDetector detector = LampDetector(_config);
     if (_config.countMode == LampCountMode.etalon) {
       detector.setBaseline(baseline ?? _calibrateFrom(rows));
-    } else if (baseline != null) {
-      detector.setBaseline(baseline);
+    } else {
+      final LampBaseline? use =
+          baseline ??
+          (_config.countMode == LampCountMode.hsv ? _detector.baseline : null);
+      if (use != null) {
+        detector.setBaseline(use);
+      }
     }
     final HitStateMachine machine = HitStateMachine(sessionId: 'replay');
     final List<HitEvent> events = <HitEvent>[];
@@ -823,9 +846,15 @@ class DetectionSession extends ChangeNotifier {
   ///
   /// Разбор идёт тем же режимом, каким считалась сама запись (способ счёта
   /// текущей конфигурации): HSV-прогон, пересчитанный по яркости, дал бы другой
-  /// счёт, который нельзя сравнить ни с чем (журнал §11.12).
-  RunAnalysis analyzeRecording(String csvContent) =>
-      RunAnalyzer.analyze(csvContent, base: _config, mode: _config.countMode);
+  /// счёт, который нельзя сравнить ни с чем (журнал §11.12). Калибровка берётся
+  /// у сессии: HSV-счёт называется именно по ней, и без неё разбор не
+  /// запускается вовсе ([RunAnalyzer.analyze] бросает [ArgumentError]).
+  RunAnalysis analyzeRecording(String csvContent) => RunAnalyzer.analyze(
+    csvContent,
+    base: _config,
+    mode: _config.countMode,
+    baseline: _detector.baseline,
+  );
 
   /// Калибровка из CSV по меткам шагов: по три состояния, как на живом стенде.
   LampBaseline _calibrateFrom(List<FeatureCsvRow> rows) {
@@ -985,8 +1014,9 @@ class DetectionSession extends ChangeNotifier {
 
   /// Способ счёта: `etalon` — по калибровке (снять кнопками фон → белая →
   /// красная, без этого счёт не стартует), `live` — по яркости, `hsv` — по доле
-  /// цветных пикселей; обоим скользящим способам калибровка не нужна, и трёх
-  /// кнопок на экране нет.
+  /// цветных пикселей. Живому калибровка не нужна; HSV с 25.11.2026 нужна
+  /// ровно так же, как режиму эталонов: по трём состояниям называется имя
+  /// вспышки (слово заказчика «будем только с калибровкой работать», журнал 46).
   ///
   /// Гистерезис и окно «пола» сбрасываются при любом переключении: у способов
   /// разные единицы (доля отклика, яркость, доля цвета), и окно, набранное в
@@ -1005,7 +1035,8 @@ class DetectionSession extends ChangeNotifier {
       LampCountMode.live =>
         'Счёт живой: калибровка не нужна, держи лампы погашенными пару секунд',
       LampCountMode.hsv =>
-        'Счёт по цвету: калибровка не нужна, держи лампы погашенными пару секунд',
+        'Счёт по цвету: сними три шага калибровки — по ним называется, какая '
+            'лампа вспыхнула; до «3 КРАСНАЯ» удары не считаются',
     }, isError: false);
   }
 
@@ -1244,6 +1275,16 @@ class DetectionSession extends ChangeNotifier {
             _stepError = '';
             if (report.baseline != null) {
               unawaited(saveCalibration());
+              // Для цветового счёта калибровка — не «разрешение работать», а
+              // учитель имён: без неё детектор стоит ([readiness]), а с ней
+              // оператор обязан увидеть, ЧЕМУ она научилась. Строка
+              // `hsvNaming` — единственное место, где видно разделение в σ:
+              // без неё «калибровка прошла» и «калибровка ничему не научила»
+              // выглядят одинаково (журнал 46).
+              final String naming = _detector.hsvNaming;
+              if (naming.isNotEmpty) {
+                _stepResult = '$_stepResult · $naming';
+              }
             }
             _report(_stepResult, isError: false);
             _calibrationCompleter?.complete(report);

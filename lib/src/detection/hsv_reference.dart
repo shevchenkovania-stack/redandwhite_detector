@@ -146,14 +146,13 @@ final class HsvFeature {
   /// Все 16 кандидатов: 4 ряда и 12 упорядоченных разностей. Перебираются все,
   /// потому что заранее не знать, какой из них на этом стенде разделит лампы,
   /// — в этом и состоит отказ от догадки.
-  static final List<HsvFeature> candidates = List<HsvFeature>.unmodifiable(
-    <HsvFeature>[
-      for (int i = 0; i < 4; i++) HsvFeature(i, -1),
-      for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++)
-          if (i != j) HsvFeature(i, j),
-    ],
-  );
+  static final List<HsvFeature> candidates =
+      List<HsvFeature>.unmodifiable(<HsvFeature>[
+        for (int i = 0; i < 4; i++) HsvFeature(i, -1),
+        for (int i = 0; i < 4; i++)
+          for (int j = 0; j < 4; j++)
+            if (i != j) HsvFeature(i, j),
+      ]);
 
   double of(List<double> rows) => b < 0 ? rows[a] : rows[a] - rows[b];
 
@@ -207,8 +206,8 @@ final class HsvSignature {
       ? HitColor.white
       : HitColor.red;
 
-  /// Лучшее разделение из 16 кандидатов или null, если ни один признак не
-  /// отделяет белую лампу от красной.
+  /// Лучший из 16 кандидатов или null, если ни один признак не отделяет белую
+  /// лампу от красной.
   ///
   /// Ноль сигм на ровной сцене — не «шума нет», а «шаг снят слишком коротко»,
   /// поэтому в знаменатель добавлен [noiseFloor] — минимальная доля пикселей
@@ -216,6 +215,21 @@ final class HsvSignature {
   static HsvSignature? learn(
     LampBaseline baseline, {
     required double minSeparation,
+    double noiseFloor = 0.002,
+  }) {
+    final HsvSignature? best = probe(baseline, noiseFloor: noiseFloor);
+    if (best == null || best.separation < minSeparation) {
+      return null;
+    }
+    return best;
+  }
+
+  /// То же лучшее правило, но БЕЗ проверки [learn.minSeparation]. Нужно отчёту
+  /// калибровки: оператор обязан увидеть, НА СКОЛЬКО не хватило разделения, а
+  /// не слово «не выучилось» — иначе он переснимает шаг, который снять нельзя
+  /// (на iphone красная лампа выбита в белый, и никакого порога там не будет).
+  static HsvSignature? probe(
+    LampBaseline baseline, {
     double noiseFloor = 0.002,
   }) {
     if (!baseline.isCalibrated) {
@@ -230,8 +244,8 @@ final class HsvSignature {
     for (final HsvFeature f in HsvFeature.candidates) {
       final double w = f.of(white);
       final double r = f.of(red);
-      final double spread = (f.sigmaOf(whiteSigma) + f.sigmaOf(redSigma)) / 2 +
-          noiseFloor;
+      final double spread =
+          (f.sigmaOf(whiteSigma) + f.sigmaOf(redSigma)) / 2 + noiseFloor;
       final double separation = (w - r).abs() / spread;
       if (best != null && separation <= best.separation) {
         continue;
@@ -244,9 +258,6 @@ final class HsvSignature {
         whiteValue: w,
         redValue: r,
       );
-    }
-    if (best == null || best.separation < minSeparation) {
-      return null;
     }
     return best;
   }
@@ -313,11 +324,17 @@ final class HsvSignature {
 ///    канала не меняется ([LampConfig.hsvClipValue], [LampConfig.hsvClipOwn],
 ///    [LampConfig.hsvClipCross]).
 ///
-/// Калибровка этому режиму не нужна. Ореолы не нужны тоже: офлайн-модель
-/// проверялась одним квадратным окном 49×49 вокруг колпака (`half = 24` в
-/// `tools/hsv_decide.py`), и второй области с отдельными правилами в этих
-/// замерах просто нет — добавлять её означало бы придумывать правило, которого
-/// данные не видели.
+/// 4. **Имя берётся у калибровки.** Событие ищется по максимуму четырёх
+///    рядов, а какую это лампу — решает граница, выученная по трём состояниям
+///    ([signature], [LampConfig.hsvSignatureNaming]). Нужно потому, что
+///    догадка «у своей лампы поднят свой канал» на офисном стенде перевёрнута,
+///    и правило 2 по одному ей не лечится. Без калибровки этот способ не
+///    запускается вовсе (журнал 46).
+///
+/// Орео́лы не нужны: офлайн-модель проверялась одним квадратным окном 49×49
+/// вокруг колпака (`half = 24` в `tools/hsv_decide.py`), и второй области с
+/// отдельными правилами в этих замерах просто нет — добавлять её означало бы
+/// придумывать правило, которого данные не видели.
 class HsvReference {
   HsvReference(LampConfig config) : _config = config {
     _build();
@@ -414,8 +431,7 @@ class HsvReference {
   bool get hasReading => _frames > 0;
 
   /// Сколько реальных значений ещё нужно обеим зонам. Ноль — решения идут.
-  int get warmupLeft =>
-      _signature == null
+  int get warmupLeft => _signature == null
       ? math.max(_whiteCool.missing, _redWarm.missing)
       : math.max(_all.missing, _whiteCool.missing);
 
@@ -595,7 +611,10 @@ class HsvReference {
           whiteFloor != null &&
           whiteCool <= whiteFloor + off * whiteLevel,
       redBelowOff:
-          redValid && !redClip && redFloor != null && redWarm <= redFloor + off * redLevel,
+          redValid &&
+          !redClip &&
+          redFloor != null &&
+          redWarm <= redFloor + off * redLevel,
       warm: warm,
       whiteValid: whiteValid,
       redValid: redValid,

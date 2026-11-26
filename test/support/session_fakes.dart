@@ -166,10 +166,16 @@ LampFrame lit(LampFrame frame, {int? exposureNs, double? gain}) => LampFrame(
 
 /// Калибровка в три состояния, снятая при свете [exposureNs]/[gain] — ровно так,
 /// как её набирает стенд, только без камеры.
+///
+/// Способ счёта назван прямо: по умолчанию конфиг был бы HSV, а рабочий
+/// способ по умолчанию теперь именно он (журнал 46). Синтетическая сцена
+/// измеряет только яркость, цветовых рядов в ней нет, и HSV-калибровка такой
+/// набор отвергает.
 LampBaseline calibratedBaseline({
   int exposureNs = 20000000,
   double gain = 100,
-  LampConfig config = const LampConfig(liveReference: false),
+  LampConfig config =
+      const LampConfig(liveReference: false, hsvReference: false),
 }) {
   const Scene scene = Scene();
   final LampDetector detector = LampDetector(config);
@@ -199,7 +205,15 @@ class TestRig {
 
   /// Калибровка [baseline] лежит в настройках, сессия её загружает и стартует —
   /// ровно так, как на стенде, только без камеры и без диска.
-  static Future<TestRig> withCalibration(LampBaseline baseline) async {
+  ///
+  /// [config] по умолчанию — режим эталонов: под подставную калибровку
+  /// (`calibratedBaseline`) годится только он, а способ по умолчанию теперь HSV
+  /// (журнал 46), поэтому его приходится называть здесь прямо.
+  static Future<TestRig> withCalibration(
+    LampBaseline baseline, {
+    LampConfig config =
+        const LampConfig(liveReference: false, hsvReference: false),
+  }) async {
     SharedPreferences.setMockInitialValues(<String, Object>{});
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     await SettingsStore(prefs).writeBaseline(baseline);
@@ -212,6 +226,7 @@ class TestRig {
       sender: MockHitEventSender(),
       settings: SettingsStore(prefs),
       csvRecorder: FeatureCsvRecorder(directory: Directory.systemTemp),
+      config: config,
     );
     await session.loadSettings();
     await session.start();

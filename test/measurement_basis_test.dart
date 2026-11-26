@@ -35,8 +35,11 @@ void main() {
     });
 
     test('шаги калибровки при разном свете не складываются в один эталон', () {
-      final LampDetector detector =
-          LampDetector(const LampConfig(liveReference: false));
+      // Режим эталонов назван прямо: по умолчанию способ теперь HSV (журнал 46),
+      // а здесь проверяется яркостной вектор без цветовых рядов.
+      final LampDetector detector = LampDetector(
+        const LampConfig(liveReference: false, hsvReference: false),
+      );
       int index = 0;
       for (int k = 0; k < 30; k++, index++) {
         detector.addCalibrationFrame(

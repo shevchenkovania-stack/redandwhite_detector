@@ -6,6 +6,11 @@ import 'package:lamp_detection/lamp_detection.dart';
 int _ids = 0;
 String _nextId() => 'live-${++_ids}';
 
+/// Живой (яркостный) способ, которым раньше был включён дефолт конфига. Теперь
+/// рабочий способ по умолчанию — HSV (журнал 46), а весь этот файл проверяет
+/// яркостной «пол» и ореолы, поэтому способ назван прямо.
+const LampConfig _live = LampConfig(hsvReference: false, liveReference: true);
+
 /// Область кадра: `lit` — подъём яркости над тёмным фоном, в долях полного
 /// света; `white`/`red` — доли «своих» цветных пикселей (измеряются, но не
 /// решают).
@@ -28,8 +33,7 @@ FrameFeatures _box({double white = 0, double red = 0, double lit = 0}) =>
 /// только колпак — ровно то положение, в котором стенд и остался бы, выключи
 /// он ringScale.
 class _Bench {
-  _Bench({LampConfig? config})
-    : detector = LampDetector(config ?? const LampConfig());
+  _Bench({LampConfig? config}) : detector = LampDetector(config ?? _live);
 
   final LampDetector detector;
   final HitStateMachine machine = HitStateMachine(
@@ -140,7 +144,7 @@ void main() {
       );
 
       final LampFrame live = FeatureExtractor(
-        const LampConfig(),
+        _live,
       ).extract(frame, roi, FrameMapping.identity);
       expect(live.white.whiteFrac, 0, reason: 'колпак чёрный');
       expect(live.whiteRing, isNotNull);
@@ -150,7 +154,7 @@ void main() {
       // Режим эталонов обязан мерить кольца точно так же: восьмимерный вектор
       // из одних колпаков не собирается, и калибровка без ореолов отвергается.
       final LampFrame etalon = FeatureExtractor(
-        const LampConfig(liveReference: false),
+        const LampConfig(liveReference: false, hsvReference: false),
       ).extract(frame, roi, FrameMapping.identity);
       expect(etalon.whiteRing, isNotNull);
       expect(etalon.redRing, isNotNull);
@@ -166,13 +170,13 @@ void main() {
         red: const LampRoi(left: 0.45, top: 0.45, width: 0.25, height: 0.25),
       );
       final LampFrame live = FeatureExtractor(
-        const LampConfig(),
+        _live,
       ).extract(_spotRect(15, 15, 32, 32), roi, FrameMapping.identity);
       expect(live.whiteRing!.whiteFrac, 0, reason: 'чужой ореол вычтен');
     });
 
     test('ореол сам по себе канал не решает — это чужой свет, а не лампа', () {
-      final LampDetector detector = LampDetector(const LampConfig());
+      final LampDetector detector = LampDetector(_live);
       final HitStateMachine machine = HitStateMachine(
         sessionId: 'halo',
         idGenerator: _nextId,
@@ -201,7 +205,7 @@ void main() {
     });
 
     test('ореол усиливает свою лампу: колпак сдвинулся — событие есть', () {
-      final LampDetector detector = LampDetector(const LampConfig());
+      final LampDetector detector = LampDetector(_live);
       final HitStateMachine machine = HitStateMachine(
         sessionId: 'halo-own',
         idGenerator: _nextId,
@@ -234,7 +238,7 @@ void main() {
       // канал. Яркость так не умеет: падение яркости вспышкой быть не может по
       // определению, поэтому здесь подъём колпака — единственное, что даёт
       // ореолу голос, и этот кадр обязан остаться пустым.
-      final LampDetector detector = LampDetector(const LampConfig());
+      final LampDetector detector = LampDetector(_live);
       final HitStateMachine machine = HitStateMachine(
         sessionId: 'halo-pale',
         idGenerator: _nextId,
@@ -265,7 +269,7 @@ void main() {
     test(
       'чужой красный свет в кольце белой лампы не входит в её амплитуду',
       () {
-        final LampDetector detector = LampDetector(const LampConfig());
+        final LampDetector detector = LampDetector(_live);
 
         for (int i = 0; i < 12; i++) {
           detector.evaluate(_haloOnly(ring: 0.02, index: i));
@@ -286,7 +290,7 @@ void main() {
     // Единицы фикстур согласованы с прежним цветовым измерением, поэтому
     // подъёмы над «полом» и пороги окна здесь — те же числа, что и в старых
     // проверках: ожидаемое поведение от смены вектора не поехало.
-    LampConfig cfg() => const LampConfig();
+    LampConfig cfg() => _live;
 
     test('считает вспышку без калибровки, каждая — в свою корзину', () {
       final _Bench bench = _Bench(config: cfg());

@@ -153,16 +153,48 @@ void main() {
     });
 
     test('в прежних режимах доли не считаются', () {
-      final FrameFeatures f = FeatureExtractor(
-        const LampConfig(),
-      ).extractRoi(_mixedFrame(), _quarterLeftTop);
-      expect(f.coolFrac, 0);
-      expect(f.warmFrac, 0);
-      expect(f.whiteFrac, 1, reason: 'обычный белый признак остался');
+      // Оба прежних режима названы прямо: рабочий способ по умолчанию теперь
+      // HSV (журнал 46), и без этого контроль проверял бы сам рабочий способ,
+      // а не то, что он ничего не ломает в прежних.
+      for (final LampConfig config in <LampConfig>[
+        const LampConfig(liveReference: false, hsvReference: false),
+        const LampConfig(liveReference: true, hsvReference: false),
+      ]) {
+        final FrameFeatures f = FeatureExtractor(
+          config,
+        ).extractRoi(_mixedFrame(), _quarterLeftTop);
+        expect(f.coolFrac, 0, reason: 'доли не должны считаться в ${config.countMode}');
+        expect(f.warmFrac, 0);
+        expect(f.whiteFrac, 1, reason: 'обычный белый признак остался');
+      }
     });
   });
 
   group('HSV-отсчёт', () {
+    test('без трёх состояний счёт не запускается, и это сказано словами', () {
+      // С 25.11.2026 цветовой счёт работает только с калибровкой (журнал 46), и
+      // опирается сессия ровно на эти два числа: [LampDetector.canEvaluate] без
+      // трёх состояний ложен, а [LampDetector.hsvNaming] обязана объяснить
+      // оператору, чего не хватает, вместо молчаливого нуля событий.
+      final LampDetector d = LampDetector(
+        const LampConfig(hsvReference: true, liveReference: false),
+      );
+      expect(d.isCalibrated, isFalse);
+      expect(d.canEvaluate, isFalse);
+      expect(d.hsvNaming, contains('калибровки нет'));
+
+      // Один снятый шаг — ещё не калибровка: решать по фону нечем.
+      final LampFrame dark = LampFrame(
+        timestamp: DateTime.fromMillisecondsSinceEpoch(0),
+        white: _zone(),
+        red: _zone(),
+      );
+      for (int i = 0; i < d.config.calibrationFrames; i++) {
+        d.addCalibrationFrame(dark);
+      }
+      expect(d.canEvaluate, isFalse, reason: 'одного «фона» не хватает');
+    });
+
     test('до warmup решения нет', () {
       final _HsvBench bench = _HsvBench();
       bench.feed(whiteCool: 0.9);

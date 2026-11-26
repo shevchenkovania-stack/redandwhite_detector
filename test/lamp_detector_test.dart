@@ -84,14 +84,19 @@ void _state(LampDetector d, LampFrame Function() frame) {
 /// 0.3 в своей. Отдельно от «перетекания» — картины изменения не пересекаются.
 ///
 /// Режим эталонов включён явно: эти тесты проверяют разложение отклика на
-/// измеренные эталоны, а не живой отсчёт.
+/// измеренные эталоны, а не живой отсчёт. `hsvReference: false` теперь тоже
+/// часть этого явного выбора — рабочий способ по умолчанию стал HSV (журнал 46),
+/// а синтетические кадры здесь измеряют только яркость.
 LampDetector _calibrated({
   double whiteOn = 0.4,
   double redOn = 0.3,
   double backgroundWhite = 0,
   double backgroundRed = 0,
 }) {
-  final LampConfig config = LampConfig(liveReference: false);
+  final LampConfig config = LampConfig(
+    liveReference: false,
+    hsvReference: false,
+  );
   final LampDetector d = LampDetector(config);
   _state(d, () => _frame(white: backgroundWhite, red: backgroundRed));
   _state(d, () => _frame(white: whiteOn, red: backgroundRed));
@@ -122,7 +127,9 @@ void main() {
     });
 
     test('лампа, которая горела уже на шаге «фон», отвергается с именем шага', () {
-      final LampDetector d = LampDetector(LampConfig(liveReference: false));
+      final LampDetector d = LampDetector(
+        LampConfig(liveReference: false, hsvReference: false),
+      );
       // Красная горит всё время: её «отклик относительно фона» равен нулю, и
       // именно это раньше убивало канал молча — детектор считал её фоном.
       expect(

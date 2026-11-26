@@ -296,7 +296,11 @@ void main() {
     test('без калибровки в три состояния evaluate бросает StateError', () {
       // Режим эталонов: решать нечем, пока не набраны три состояния. Живой
       // отсчёт калибровки не требует — это проверяет live_reference_test.
-      final LampDetector detector = LampDetector(const LampConfig(liveReference: false));
+      // Способ назван прямо: по умолчанию он теперь HSV (журнал 46), а там
+      // без калибровки счёт не запускает сессия, а не детектор.
+      final LampDetector detector = LampDetector(
+        const LampConfig(liveReference: false, hsvReference: false),
+      );
       // Одно состояние (так было раньше) эталонов не даёт — решать нечем.
       for (int i = 0; i < 30; i++) {
         detector.addCalibrationFrame(scene.off(index: i));
