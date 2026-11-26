@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io' as io;
 
 import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
@@ -14,6 +16,7 @@ import '../detection/response_model.dart';
 import '../diagnostics/diagnostics_collector.dart';
 import '../diagnostics/feature_csv_recorder.dart';
 import '../diagnostics/run_analyzer.dart';
+import '../diagnostics/run_mailer.dart';
 import '../models/frame_features.dart';
 import '../models/hit_event.dart';
 import '../models/lamp_config.dart';
@@ -175,6 +178,7 @@ class DetectionSession extends ChangeNotifier {
     required this.sender,
     required this.settings,
     required this.csvRecorder,
+    this.mailer,
     LampConfig config = const LampConfig(),
     RoiLayout roi = RoiLayout.defaults,
     DiagnosticsCollector? diagnostics,
@@ -222,6 +226,11 @@ class DetectionSession extends ChangeNotifier {
   final FeatureCsvRecorder csvRecorder;
   final DiagnosticsCollector diagnostics;
 
+  /// Отправка готового прогона на почту стенда. `null` — прогоны лежат только
+  /// на устройстве, ровно как было до этой возможности: ящик не обязателен
+  /// для работы, он обязателен для того, чтобы прогон увидели без кабеля.
+  final RunMailer? mailer;
+
   /// Измеритель признаков текущего кадра. Не final: ветка сравнения датчиков
   /// подменяет его на лету (см. [sensorExtractor]). Штатный Dart-измеритель
   /// хранится отдельно, чтобы возврат к нему не зависел от порядка правок.
@@ -249,6 +258,10 @@ class DetectionSession extends ChangeNotifier {
   /// Начало набора текущего шага: по нему считается и конец стабилизации, и
   /// счётчик секунд на экране.
   DateTime? _phaseStartedAt;
+
+  /// Момент последнего «Пуск» — по нему письмо прогона говорит длительность.
+  /// `null` между стопом и пуском: прогона, о котором есть что сказать, нет.
+  DateTime? _runStartedAt;
   int _settleLeft = 0;
   bool _overexposed = false;
   int _clipCorrectionsLeft = maxClipCorrections;
@@ -647,10 +660,14 @@ class DetectionSession extends ChangeNotifier {
     try {
       await source.start();
       _running = true;
+      _runStartedAt = DateTime.now();
       _notify(force: true);
     } on Object catch (e) {
       _report('Старт камеры: $e');
     }
+    // Что не дошло в прошлый раз, уходит при первом же контакте с сетью: не
+    // раньше и не позже, чем сам запуск.
+    unawaited(mailer?.resendPending() ?? Future<void>.value());
     // Стоп закрывает файл, но не отменяет выбор оператора «писать CSV».
     if (_running && _csvEnabled && !_recordingCsv) {
       await setRecordingCsv(true);
@@ -672,6 +689,15 @@ class DetectionSession extends ChangeNotifier {
       await csvRecorder.stop();
       _recordingCsv = false;
     }
+    // Файл закрыт, всё на месте — прогон уходит на почту сам. Не ждём: сеть
+    // может лежать, а «Стоп» обязан вернуть экран человеку у лампы.
+    // Прогон считается законченным ровно один раз: повторный «Стоп» не должен
+    // присылать второе письмо о том же самом.
+    final DateTime? runStartedAt = _runStartedAt;
+    _runStartedAt = null;
+    if (mailer != null && runStartedAt != null) {
+      unawaited(_sendRunPackage(runStartedAt));
+    }
     // Кадров больше не будет, поэтому незавершённый набор закрывается ошибкой,
     // а не остаётся висеть навсегда.
     if (_calibrating) {
@@ -685,6 +711,156 @@ class DetectionSession extends ChangeNotifier {
       _calibrationCompleter = null;
     }
     _notify(force: true);
+  }
+
+  /// Письмо готового прогона на почту стенда.
+  ///
+  /// Делается после «Стоп», когда CSV закрыт и в нём есть всё. Ошибка сети —
+  /// не ошибка прогона: пакет остаётся в очереди и дойдёт при следующем
+  /// пуске (см. [RunMailer]), поэтому у лампы человек ничего не жмёт и ничего
+  /// не теряет.
+  Future<void> _sendRunPackage(DateTime started) async {
+    final RunMailer? mailer = this.mailer;
+    final String? csvPath = csvRecorder.filePath;
+    if (mailer == null || csvPath == null) {
+      return;
+    }
+    try {
+      final io.File csv = io.File(csvPath);
+      final String csvText = csv.existsSync() ? await csv.readAsString() : '';
+      final DateTime stopped = DateTime.now();
+      final LampBaseline? shot = baseline;
+      await mailer.submit(
+        assembleRunPackage(
+          runId: '${sessionId}_${_stamp(stopped)}',
+          subject: _runSubject(stopped),
+          body: _runBody(started, stopped, csvText),
+          textFiles: <String, String>{
+            'features.csv': csvText,
+            'config.json': jsonEncode(_config.toJson()),
+            'roi.json': jsonEncode(_roi.toJson()),
+            'log.txt': lastErrors.reversed.join('\n'),
+            if (shot != null) 'baseline.json': jsonEncode(shot.toJson()),
+          },
+        ),
+      );
+    } on Object catch (e) {
+      _report('Отправка прогона: $e');
+    }
+  }
+
+  /// Тема письма: по ней прогон находится в почте, не открывая вложений.
+  String _runSubject(DateTime stopped) {
+    final DiagnosticsSnapshot d = diagnostics.snapshot;
+    return 'LAMP ${_stampHuman(stopped)} | $_modeShort | '
+        'W=$whiteHits R=$redHits | rej $refusedFrames/$reflectionRefusals '
+        'unk $unknownFrames | ${d.framesProcessed} кадр. | sess $sessionId';
+  }
+
+  /// Что это за прогон, словами. Сюда кладётся и сверка ОБОИХ режимов по этой
+  /// же записи: на стенде её никто не пересчитает, а вопрос «не потеряли ли
+  /// новый способ что-нибудь» должен быть виден в письме, а не после
+  /// скачивания.
+  String _runBody(DateTime started, DateTime stopped, String csvText) {
+    final DiagnosticsSnapshot d = diagnostics.snapshot;
+    final LampBaseline? shot = baseline;
+    final List<String> lines = <String>[
+      'Прогон $sessionId',
+      '  старт ${_stampHuman(started)}, стоп ${_stampHuman(stopped)}, '
+          'длительность ${stopped.difference(started).inSeconds} с',
+      '  файл: ${csvRecorder.filePath ?? 'не известен'}',
+      '',
+      'Чем считали: $_modeShort',
+      '  калибровка: ${isCalibrated ? 'есть' : 'НЕТ'}'
+          '${shot == null ? '' : ', версия ${shot.version} '
+                  '(профили распределений — с версии 4)'}',
+      '  снятые шаги: ${_detector.completedCalibrationSteps.map((CalibrationStep s) => s.label).join(', ')}',
+      '  шаг «обе горят»: ${_detector.hasBothOnProfile ? 'снят' : 'не снят'}',
+      '',
+      'Кадры: всего ${d.framesProcessed}, потеряно ${d.droppedFrames}, '
+          'fps камеры ${d.cameraFps.toStringAsFixed(1)}, '
+          'анализ ${d.avgAnalysisMs.toStringAsFixed(2)} мс '
+          '(макс ${d.maxAnalysisMs.toStringAsFixed(1)} мс)',
+      '  спорные кадры ${d.ambiguousFrames}, необъяснённые ${d.unexplainedFrames}',
+      '',
+      'События за прогон: белая $whiteHits, красная $redHits',
+      'Профили (v6): отвергнуто подъёмов $refusedFrames, из них как '
+          'отражение соседней лампы $reflectionRefusals, кадров без '
+          'доказательства $unknownFrames, кадров «в обе корзины» '
+          '$doubleBasketFrames',
+      '  чем решил последний кадр: ${profileDecision.isEmpty ? '—' : profileDecision}',
+      '',
+      _abLines(csvText),
+      '',
+      'Отличия порогов от значений по умолчанию: $_configDelta',
+      '',
+      'Как читать: features.csv открывается Excel; колонки 87…90 — уверенность '
+          'и подозрение обеих ламп (v6), 69…86 — новые признаки света. '
+          'baseline.json обязателен, чтобы пересчитать режим с профилими '
+          'офлайн: без него письмо описывает решение, но не повторяет его.',
+      'Чего в письме нет: разметки истины — какие лампы горели на самом деле '
+          'знает только человек или панель. Пока её нет, прогон годится на '
+          '«сколько отказов и где», но не на приёмку v6.',
+    ];
+    return lines.join('\r\n');
+  }
+
+  /// Та же запись, решённая обоими цветовыми режимами — то, чем принимается
+  /// v6 §7. Не считается, если CSV пустой или кривой: письмо обязано уйти и
+  /// без этой строчки.
+  String _abLines(String csvText) {
+    if (csvText.isEmpty) {
+      return 'Сверка режимов по этой записи: CSV пуст — считать нечего.';
+    }
+    try {
+      final RunAb ab = RunAnalyzer.analyzeBothModes(
+        csvText,
+        base: _config,
+        baseline: baseline,
+      );
+      return <String>[
+        'Пересчёт этой же записи двумя способами (офлайн, тем же кодом):',
+        '  hsv (прежний измеренный): белая ${ab.plain.whiteEvents}, '
+            'красная ${ab.plain.redEvents}',
+        '  hsv + профили (v6)        : белая ${ab.profiled.whiteEvents}, '
+            'красная ${ab.profiled.redEvents}',
+        '  ${ab.verdict}',
+      ].join('\r\n');
+    } on Object catch (e) {
+      return 'Сверка режимов по этой записи не посчиталась: $e';
+    }
+  }
+
+  /// Имя пакета в очереди: метка времени без разделителей.
+  static String _stamp(DateTime at) =>
+      at.toIso8601String().replaceAll(RegExp(r'[:.TZ]'), '');
+
+  /// Человекочитаемая метка «26.11.2026 14:32:05».
+  static String _stampHuman(DateTime at) {
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${two(at.day)}.${two(at.month)}.${at.year} '
+        '${two(at.hour)}:${two(at.minute)}:${two(at.second)}';
+  }
+
+  /// Короткое имя способа — то же, что в `LAMPDBG mode=`.
+  String get _modeShort => switch (_config.countMode) {
+    LampCountMode.hsv => 'hsv',
+    LampCountMode.hsvCalibration => 'hsv+prof',
+    LampCountMode.etalon => 'etalon',
+    LampCountMode.live => 'live',
+  };
+
+  /// Только те числа, которые стенд менял относительно сборки: по ним видно,
+  /// что решение принималось не на дефолтах.
+  String get _configDelta {
+    final Map<String, Object?> base = const LampConfig().toJson();
+    final List<String> diff = <String>[];
+    for (final MapEntry<String, Object?> e in _config.toJson().entries) {
+      if (base.containsKey(e.key) && base[e.key] != e.value) {
+        diff.add('${e.key}=${e.value}');
+      }
+    }
+    return diff.isEmpty ? 'нет' : diff.join(', ');
   }
 
   /// Снять один шаг калибровки — по его собственной кнопке.

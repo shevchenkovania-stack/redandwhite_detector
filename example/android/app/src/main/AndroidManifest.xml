@@ -1,6 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Демо смотрит на сигнальные лампы через камеру. -->
     <uses-permission android:name="android.permission.CAMERA"/>
+    <!-- Прогон уходит на почту стенда сам, без кабеля и без оператора. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <uses-feature android:name="android.hardware.camera" android:required="true"/>
     <application
         android:label="lamp_detection_example"

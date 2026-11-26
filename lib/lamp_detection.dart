@@ -18,6 +18,7 @@ export 'src/detection/v6_profile.dart';
 export 'src/diagnostics/diagnostics_collector.dart';
 export 'src/diagnostics/feature_csv_recorder.dart';
 export 'src/diagnostics/run_analyzer.dart';
+export 'src/diagnostics/run_mailer.dart';
 export 'src/models/frame_features.dart';
 export 'src/models/feature_profile.dart';
 export 'src/models/hit_event.dart';

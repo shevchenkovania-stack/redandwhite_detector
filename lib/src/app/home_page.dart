@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io' show Directory;
+import 'dart:io' show Directory, Platform;
 
 import 'package:flutter/material.dart';
 import 'package:lamp_detection/lamp_detection.dart';
@@ -104,12 +104,25 @@ class _HomePageState extends State<HomePage> {
       final SettingsStore settings = await SettingsStore.open();
       final MockHitEventSender sender = MockHitEventSender();
       final CameraFrameSource source = CameraFrameSource();
+      // Ящик для прогонов приходит сборкой (--dart-define=LAMP_MAIL_USER=…).
+      // Пусто — отправки нет, и поведение экрана остаётся ровно прежним.
+      final MailConfig mail = MailConfig.fromBuild();
+      final RunMailer? mailer = mail.isEnabled
+          ? RunMailer(
+              directory: Directory(
+                '${directory.path}${Platform.pathSeparator}${RunMailer.folderName}',
+              ),
+              config: mail,
+              onLog: _onMailLog,
+            )
+          : null;
       final DetectionSession session = DetectionSession(
         source: source,
         repository: repository,
         sender: sender,
         settings: settings,
         csvRecorder: FeatureCsvRecorder(directory: directory),
+        mailer: mailer,
       );
       await session.loadSettings().timeout(_bringUpTimeout);
       session.addListener(_onSessionChanged);
@@ -135,6 +148,19 @@ class _HomePageState extends State<HomePage> {
     } on Object catch (e) {
       setState(() => _message = 'Сбой: ${_short(e)}');
     }
+  }
+
+  /// Что стряслось с отправкой прогона. Строка попадает туда же, куда и
+  /// сообщения сессии: оператор у лампы ничего не читает, но «не дошло»
+  /// обязано быть видно на экране, а не только в logcat.
+  void _onMailLog(String message) {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _errors.insert(0, message);
+      _message = message;
+    });
   }
 
   /// Пускает сессию и всегда возвращает управление экрану: зависший насовсем
