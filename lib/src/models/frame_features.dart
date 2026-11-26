@@ -1,10 +1,16 @@
+import 'dart:typed_data';
+
+import 'feature_profile.dart';
+
 /// Признаки одной ROI, вычисленные по подвыборке пикселей одного кадра.
 ///
-/// Полей ровно столько, сколько нужно: два рабочих (`whiteFrac`, `redFrac`),
-/// один контрольный (`sampleCount`) и признаки яркости (`meanY`, `p90Luma`,
-/// `lumaStdDev`, `clippedRatio`). Наследие v1 — `brightFrac`, `sat`, `redDom`,
-/// `coreEdgeDiff` — удалено: на решение они не влияли, а `sat` и сравнение
-/// ядра с кольцом стоили деления и ветки на каждый опрошенный пиксель.
+/// С v6 здесь два набора. Первый — прежние рабочие доли (`whiteFrac`,
+/// `redFrac`, `coolFrac`, `warmFrac`) и контроль качества кадра (`meanY`,
+/// `p90Luma`, `lumaStdDev`, `clippedRatio`, `sampleCount`). Второй — то, чего в
+/// v5 не было и что требует спецификация v6 §2: медианы V и S, доля и геометрия
+/// яркого ядра, связные bright-области, «центр поверхности vs остальная ROI» и
+/// распределение оттенка. Решение по одному максимальному пикселю здесь не
+/// вычисляется нигде.
 class FrameFeatures {
   const FrameFeatures({
     required this.meanY,
@@ -16,6 +22,15 @@ class FrameFeatures {
     this.p90Luma = 0,
     this.lumaStdDev = 0,
     this.clippedRatio = 0,
+    this.medianV = 0,
+    this.medianS = 0,
+    this.brightFrac = 0,
+    this.coreAreaFrac = 0,
+    this.coreIntensity = 0,
+    this.coreRegions = 0,
+    this.coreCenterFrac = 0,
+    this.centerContrast = 0,
+    this.hueHist,
   });
 
   /// Пустой набор — используется как заглушка до калибровки.
@@ -83,13 +98,171 @@ class FrameFeatures {
   /// ни запаса яркости там уже нет, и решение по этой области ненадёжно.
   final double clippedRatio;
 
+  /// Медиана V (максимум каналов, 0..255) по области. v6 §2 требует медиану, а
+  /// не среднее и не максимум: медиана стоит на том же месте, когда половина
+  /// колпака залита бликом, и не падает, когда половина ушла в тень.
+  final double medianV;
+
+  /// Медиана S (0..255 в шкале OpenCV, `S = 255·(mx−mn)/mx`) по области. По ней
+  /// видно, что свет стал цветным, даже когда доля «цветных пикселей» ещё мала:
+  /// засветка соседней лампы поднимает медиану слабее, чем своё включение.
+  final double medianS;
+
+  /// Доля пикселей ярче [LampConfig.v6BrightValueMin] — «bright pixel ratio»
+  /// v6 §2. Отличается от [coolFrac]/[warmFrac] тем, что цвета не спрашивает:
+  /// это сколько области стало светлой вообще.
+  final double brightFrac;
+
+  /// Доля пикселей ярче [LampConfig.v6CoreValueMin] — площадь яркого ядра
+  /// источника. У настоящей лампы ядро есть всегда, у равномерной засветки от
+  /// соседней — нет: свет ложится плоским пятном без пика.
+  final double coreAreaFrac;
+
+  /// Средняя V среди пикселей ядра (0..255), 0 если ядра нет — «bright core
+  /// intensity» v6 §2. Ядро может быть маленьким и очень ярким (лампа вблизи)
+  /// или широким и тусклым (засветка), и эти два случая надо различать.
+  final double coreIntensity;
+
+  /// Сколько отдельных связных яркостей (4-связность по сетке подвыборки) в
+  /// области — «connected bright regions» v6 §2. Одна лампа даёт одно ядро; два
+  /// и больше — это блик на колпаке плюс отражение, либо чужая лампа в рамке.
+  final double coreRegions;
+
+  /// Какая часть пикселей ядра лежит в центральном окне ROI (сторона
+  /// [LampConfig.v6CenterSpan] от стороны рамки). Включение лампы бьёт из центра
+  /// светящейся поверхности, reflection же ложится по краю и по фону — поэтому
+  /// малое число здесь означает «кадр не похож на включение этой лампы».
+  final double coreCenterFrac;
+
+  /// Разность средней V центра и средней V остальной области, в долях 0..1
+  /// (может быть отрицательной). Это «spatial brightness distribution across
+  /// ROI»: локальная вспышка даёт положительный пик, общее освещение зала —
+  /// число около нуля, потому что поднимается и центр, и всё вокруг него.
+  final double centerContrast;
+
+  /// Распределение оттенка по насыщенным пикселям: [LampConfig.hueBins] корзин
+  /// по 360/N градусов, доли 0..1, сумма ≈ 1 (null, если насыщенных пикселей не
+  /// было). Нужна именно корзинами, а не средним: красный в HSV стоит на обоих
+  /// концах шкалы (0° и 360°), и среднее по такому распределению равно зелёному.
+  final Float64List? hueHist;
+
+  /// Доля насыщенных пикселей с оттенком около нуля — красное v6 §4. Красный в
+  /// шкале оттенка занимает корзину 0 и последнюю, поэтому суммируются именно
+  /// они: среднее по такому распределению показало бы зелёный.
+  double get hueRedFrac {
+    final Float64List? h = hueHist;
+    if (h == null || h.isEmpty) {
+      return 0;
+    }
+    return h[0] + h[h.length - 1];
+  }
+
+  /// Вектор признаков в каноническом порядке [V6Feature]: ровно то, что
+  /// ложится в профиль калибровки и с чем сравнивается кадр.
+  Float64List toVector() {
+    final Float64List v = Float64List(V6Feature.count);
+    for (int i = 0; i < V6Feature.count; i++) {
+      v[i] = V6Feature.values[i].of(this);
+    }
+    return v;
+  }
+
   @override
   String toString() =>
       'Features(wf=${whiteFrac.toStringAsFixed(3)}, rf=${redFrac.toStringAsFixed(3)}, '
       'cf=${coolFrac.toStringAsFixed(3)}, wr=${warmFrac.toStringAsFixed(3)}, '
       'Y=${meanY.toStringAsFixed(1)}, p90=${p90Luma.toStringAsFixed(1)}, '
       'sd=${lumaStdDev.toStringAsFixed(1)}, clip=${clippedRatio.toStringAsFixed(3)}, '
+      'mv=${medianV.toStringAsFixed(0)}, ms=${medianS.toStringAsFixed(0)}, '
+      'bf=${brightFrac.toStringAsFixed(3)}, core=${coreAreaFrac.toStringAsFixed(3)}/'
+      '${coreIntensity.toStringAsFixed(0)}/n${coreRegions.toStringAsFixed(0)}, '
+      'ctr=${coreCenterFrac.toStringAsFixed(2)}/${centerContrast.toStringAsFixed(3)}, '
       'n=$sampleCount)';
+}
+
+/// Канонический порядок признаков вектора v6: одно место, где перечислено, ЧЕМ
+/// описывается область.
+///
+/// Профили калибровки, расстояние до профиля, уверенность и колонки CSV строятся
+/// по этому списку, поэтому признак, которого здесь нет, в решении участвовать
+/// не может — и молча не забудется: число признаков профиля проверяется по
+/// [V6Feature.count].
+enum V6Feature {
+  /// Медиана V (0..255).
+  medianV,
+
+  /// Медиана S (0..255).
+  medianS,
+
+  /// Доля пикселей «почти без оттенка и ярко» (белый свет).
+  coolFrac,
+
+  /// Доля пикселей «тёплый оттенок, насыщенно, ярко» (красный свет).
+  warmFrac,
+
+  /// Доля ярких пикселей любого цвета.
+  brightFrac,
+
+  /// Площадь яркого ядра.
+  coreAreaFrac,
+
+  /// Интенсивность яркого ядра.
+  coreIntensity,
+
+  /// Число связных bright-областей.
+  coreRegions,
+
+  /// Доля ядра в центре поверхности.
+  coreCenterFrac,
+
+  /// Центр против остальной ROI по яркости.
+  centerContrast,
+
+  /// Доля насыщенного света с оттенком около нуля — «красного».
+  ///
+  /// В вектор берётся именно это число, а не вся гистограмма: профиль обязан
+  /// хранить по одному распределению на признак, и распределение оттенка
+  /// уже лежит внутри [FrameFeatures.hueHist] как отдельный измеренный факт.
+  /// Среднее по шкале оттенка здесь не при чём и быть не может: красный стоит
+  /// на обоих концах шкалы.
+  hueRedFrac,
+
+  /// Верхний процентиль яркости.
+  p90Luma,
+
+  /// Разброс яркости.
+  lumaStdDev,
+
+  /// Доля пересвеченных пикселей.
+  clippedRatio,
+
+  /// Средняя яркость.
+  meanY;
+
+  static const int count = 15;
+
+  /// Значение этого признака в кадре.
+  double of(FrameFeatures f) => switch (this) {
+    V6Feature.medianV => f.medianV,
+    V6Feature.medianS => f.medianS,
+    V6Feature.coolFrac => f.coolFrac,
+    V6Feature.warmFrac => f.warmFrac,
+    V6Feature.brightFrac => f.brightFrac,
+    V6Feature.coreAreaFrac => f.coreAreaFrac,
+    V6Feature.coreIntensity => f.coreIntensity,
+    V6Feature.coreRegions => f.coreRegions,
+    V6Feature.coreCenterFrac => f.coreCenterFrac,
+    V6Feature.centerContrast => f.centerContrast,
+    V6Feature.hueRedFrac => f.hueRedFrac,
+    V6Feature.p90Luma => f.p90Luma,
+    V6Feature.lumaStdDev => f.lumaStdDev,
+    V6Feature.clippedRatio => f.clippedRatio,
+    V6Feature.meanY => f.meanY,
+  };
+
+  /// Имя для логов, отчётов и колонок CSV — одно и то же число везде называется
+  /// одинаково.
+  String get label => name;
 }
 
 /// Признаки обеих ламп одного кадра.
@@ -133,6 +306,12 @@ class LampFrame {
 /// состояний — это и есть измеренный отклик лампы, поэтому σ нужна по каждому
 /// признаку, а не только по «рабочему»: решение принимается по вектору.
 ///
+/// [whiteProfile] и [redProfile] — то, чего в v5 не было: вместо одного
+/// среднего по состоянию там лежит РАСПРЕДЕЛЕНИЕ каждого признака (v6 §8).
+/// Среднее и σ остаются, потому что по ним калибровка отбраковывает шумный шаг
+/// и считает отклик; профиль же нужен решению, которому мало «стало светлее»,
+/// ему нужно «стало похоже на включение этой лампы».
+///
 /// Кольца (`whiteRing`, `redRing`) — четвёртая и шестая измеряемые области
 /// пространственной модели: без них калибровка описывает только два колпака и
 /// отличить вспышку своей лампы от засветки чужой может лишь по цвету. Null,
@@ -148,6 +327,8 @@ class CalibrationState {
     this.redRing,
     this.whiteRingSigma,
     this.redRingSigma,
+    this.whiteProfile = FeatureProfile.empty,
+    this.redProfile = FeatureProfile.empty,
   });
 
   /// Пустое состояние — шаг калибровки ещё не набран.
@@ -176,6 +357,12 @@ class CalibrationState {
   final FrameFeatures? whiteRingSigma;
   final FrameFeatures? redRingSigma;
 
+  /// Распределения признаков каждой рамки по кадрам этого состояния (v6 §8).
+  /// Empty — состояние снято сборкой, которая профили не писала; это не
+  /// «признаки не менялись», и решение по профилям обязано это различать.
+  final FeatureProfile whiteProfile;
+  final FeatureProfile redProfile;
+
   /// Сколько кадров усреднено (0 = состояние не набрано).
   final int frameCount;
 
@@ -192,6 +379,11 @@ class CalibrationState {
       ),
     if (redRing != null)
       'red_ring': _stateToJson(redRing!, redRingSigma ?? FrameFeatures.zero),
+    // Профили пишутся только когда они реально набраны: пустой блок в старой
+    // записи означал бы «состояние измерено нулём кадров», а его-то как раз и
+    // нельзя отличить от «профилей нет».
+    if (!whiteProfile.isEmpty) 'white_profile': whiteProfile.toJson(),
+    if (!redProfile.isEmpty) 'red_profile': redProfile.toJson(),
   };
 
   static Map<String, Object?> _stateToJson(
@@ -247,6 +439,8 @@ class CalibrationState {
       redRing: rRing == null ? null : readMean(rRing),
       whiteRingSigma: wRing == null ? null : readSigma(wRing),
       redRingSigma: rRing == null ? null : readSigma(rRing),
+      whiteProfile: FeatureProfile.fromJson(raw['white_profile']),
+      redProfile: FeatureProfile.fromJson(raw['red_profile']),
       frameCount: (raw['frame_count'] as num?)?.toInt() ?? 0,
     );
   }
@@ -271,10 +465,12 @@ class CalibrationState {
       'σ white=${whiteSigma.whiteFrac.toStringAsFixed(4)}/'
       '${whiteSigma.redFrac.toStringAsFixed(4)}, '
       'σ red=${redSigma.whiteFrac.toStringAsFixed(4)}/'
-      '${redSigma.redFrac.toStringAsFixed(4)})';
+      '${redSigma.redFrac.toStringAsFixed(4)}, '
+      'prof=${whiteProfile.frameCount}/${redProfile.frameCount})';
 }
 
-/// Калибровка в три состояния: фон, горящая белая, горящая красная.
+/// Калибровка в три состояния: фон, горящая белая, горящая красная — и
+/// опциональное четвёртое (обе лампы горят).
 ///
 /// Прежде состояние было одно («обе выключены»), и отличить одну лампу от
 /// другой было нечем, кроме цвета пикселя, — поэтому пересвеченная красная
@@ -288,6 +484,7 @@ class LampBaseline {
     required this.redOn,
     required this.capturedAtMs,
     this.version = currentVersion,
+    this.bothOn,
     this.exposureTimeNs,
     this.sensorSensitivity,
   });
@@ -299,7 +496,18 @@ class LampBaseline {
   /// Прежняя v2 содержит только доли цветных пикселей двух ядер, из неё
   /// пространственный вектор не собрать даже частично: молча додумывать ноль
   /// вместо измеренного ореола значит решить, что кольцо всегда было тёмным.
-  static const int currentVersion = 3;
+  /// v4 — состояния с профилями распределений (v6 §8). Профиль — не новый
+  /// обязательный блок данных, а то, что стало возможно записать: кадры шага
+  /// уже лежали в памяти целиком.
+  ///
+  /// [minSupportedVersion] остаётся 3, и это не экономия на строгости, а
+  /// измеренная цена: калибровка v3 содержит три состояния и все ряды, по
+  /// которым работает нынешнее решение, а профилей в ней нет. Отвергнуть её —
+  /// значит заставить стенд перекалиброваться из-за числа, которое решение ещё
+  /// не спросило. Вместо этого `LampProfiles.canDecide` честно отвечает «чем
+  /// сравнивать нет», и счёт идёт проверенным путём.
+  static const int currentVersion = 4;
+  static const int minSupportedVersion = 3;
 
   final int version;
 
@@ -311,6 +519,13 @@ class LampBaseline {
 
   /// Держится зажжённой красная лампа.
   final CalibrationState redOn;
+
+  /// Держатся зажжёнными ОБЕ лампы — шаг 4 спецификации v6 §7, опциональный.
+  /// Null означает «шаг не снимался», и это законно: simultaneous activation
+  /// на стенде может быть невозможно. Пустое состояние вместо null сюда
+  /// попадать не должно — решение по профилям читает отсутствие как отсутствие,
+  /// а не как «обе лампы горят по нулям».
+  final CalibrationState? bothOn;
 
   /// Метка времени последнего завершённого шага (мс с эпохи). Нужна, чтобы не
   /// грузить устаревшую калибровку при другом освещении.
@@ -326,10 +541,12 @@ class LampBaseline {
   final int? exposureTimeNs;
   final double? sensorSensitivity;
 
-  /// Калибровка считается готовой только когда набраны все три состояния:
-  /// двух не хватает, чтобы разложить изменение на две лампы.
+  /// Калибровка считается готовой только когда набраны все три обязательных
+  /// состояния: двух не хватает, чтобы разложить изменение на две лампы.
+  /// Четвёртое (обе горят) в список обязательных не входит специально.
   bool get isCalibrated =>
-      version == currentVersion &&
+      version >= minSupportedVersion &&
+      version <= currentVersion &&
       !background.isEmpty &&
       !whiteOn.isEmpty &&
       !redOn.isEmpty;
@@ -351,6 +568,7 @@ class LampBaseline {
     'background': background.toJson(),
     'white_on': whiteOn.toJson(),
     'red_on': redOn.toJson(),
+    if (bothOn != null) 'both_on': bothOn!.toJson(),
   };
 
   /// Старый формат (без `version`) читается как «не калибровано»: совместимости
@@ -362,6 +580,9 @@ class LampBaseline {
       background: CalibrationState.fromJson(json['background']),
       whiteOn: CalibrationState.fromJson(json['white_on']),
       redOn: CalibrationState.fromJson(json['red_on']),
+      bothOn: json['both_on'] == null
+          ? null
+          : CalibrationState.fromJson(json['both_on']),
       capturedAtMs: (json['captured_at_ms'] as num?)?.toInt() ?? 0,
       exposureTimeNs: (json['exposure_ns'] as num?)?.toInt(),
       sensorSensitivity: (json['sensitivity'] as num?)?.toDouble(),
@@ -372,5 +593,6 @@ class LampBaseline {
   String toString() =>
       'LampBaseline(v$version, bg=${background.frameCount}, '
       'whiteOn=${whiteOn.frameCount}, redOn=${redOn.frameCount}, '
+      'bothOn=${bothOn?.frameCount ?? '-'}, '
       'exp=${exposureTimeNs ?? '?'}/${sensorSensitivity?.toStringAsFixed(0) ?? '?'})';
 }

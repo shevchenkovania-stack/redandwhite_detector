@@ -6,7 +6,18 @@ import '../models/frame_features.dart';
 
 /// Одна строка CSV диагностики.
 ///
-/// Формат v5 (69 колонок). Колонки 0–64 — формат v4 без изменений, колонки
+/// Формат v6 (91 колонка). Колонки 0–68 — формат v5 без изменений, 69–86
+/// добавляют геометрию света, которую требует спецификация v6 §2: по восемь
+/// признаков каждой зоны (`white_median_v, white_median_s, white_bright_frac,
+/// white_core_area, white_core_intensity, white_core_regions,
+/// white_core_center_frac, white_center_contrast` и те же для красной) и по
+/// одной доле красного оттенка (`white_hue_red, red_hue_red`). Колонки 87–90 —
+/// то, чем v6 решает и что в v5 было только словом: уверенность каждой лампы
+/// (`white_conf`, `red_conf`) и подозрение на отражение соседней лампы
+/// (`white_suspicion`, `red_suspicion`). Без этих колонок запись не отвечает на
+/// вопрос «почему событие не подтвердилось», а v6 §13 требует именно его.
+///
+/// Формат v5 (69 колонок): колонки 0–64 — формат v4 без изменений, колонки
 /// 65–68 добавляют HSV-доли, которыми решает режим «по цвету»: `white_cool_frac,
 /// white_warm_frac, red_cool_frac, red_warm_frac`. Без них запись с телефона не
 /// воспроизводит HSV-решение и сверить его с разметкой было нечем.
@@ -42,7 +53,8 @@ import '../models/frame_features.dart';
 /// больше не участвуют, но без них нельзя сравнить старый и новый алгоритм на
 /// ОДНОЙ записи — а другого способа сравнить их на стенде нет.
 ///
-/// Старые файлы читаются по числу колонок: 41–64 — v3, 27–40 — v2 (яркостных
+/// Старые файлы читаются по числу колонок: 69–90 — v5, 41–68 — v3…v4
+/// (кольца и состояние живого отсчёта по их правилам), 27–40 — v2 (яркостных
 /// признаков в нём нет, они считаются нулём), 10–26 — формат v1
 /// (`brightFrac`/`sat`/`redDom`/`coreEdgeDiff`, если 10, или прежние шесть),
 /// кольца и решение по ним считаются нулём; 6–9 — прежние колонки рамок.
@@ -78,6 +90,10 @@ class FeatureCsvRow {
     this.whiteBelowOff,
     this.redBelowOff,
     this.reference,
+    this.whiteConfidence,
+    this.redConfidence,
+    this.whiteSuspicion,
+    this.redSuspicion,
   });
 
   static const String header =
@@ -94,10 +110,17 @@ class FeatureCsvRow {
       'red_core_samples,red_ring_samples,white_core_floor,white_ring_floor,'
       'red_core_floor,red_ring_floor,white_core_sigma,white_ring_sigma,'
       'red_core_sigma,red_ring_sigma,warmup_left,common_run,reset_seq,reset_reason,'
-      'white_cool_frac,white_warm_frac,red_cool_frac,red_warm_frac';
+      'white_cool_frac,white_warm_frac,red_cool_frac,red_warm_frac,'
+      'white_median_v,white_median_s,white_bright_frac,white_core_area,'
+      'white_core_intensity,white_core_regions,white_core_center_frac,'
+      'white_center_contrast,red_median_v,red_median_s,red_bright_frac,'
+      'red_core_area,red_core_intensity,red_core_regions,red_core_center_frac,'
+      'red_center_contrast,white_hue_red,red_hue_red,'
+      'white_conf,red_conf,white_suspicion,red_suspicion';
 
-  /// Число колонок формата v5: короче строка — записана старой сборкой.
-  static const int currentColumnCount = 69;
+  /// Число колонок формата v6: короче строка — записана старой сборкой.
+  static const int currentColumnCount = 91;
+  static const int columnsV5 = 69;
   static const int columnsV4 = 65;
   static const int columnsV3 = 41;
 
@@ -155,6 +178,14 @@ class FeatureCsvRow {
   final bool? whiteBelowOff;
   final bool? redBelowOff;
   final LiveReferenceDiagnostics? reference;
+
+  /// Уверенность каждой лампы 0..1 и подозрение, что подъём — отражение
+  /// соседней (v6 §9.7, §13). Null — режим, который этих чисел не считает
+  /// (прежние эталоны и живой отсчёт), а не «ноль».
+  final double? whiteConfidence;
+  final double? redConfidence;
+  final double? whiteSuspicion;
+  final double? redSuspicion;
 
   String toCsvLine() => <Object>[
     timestampMs,
@@ -229,6 +260,32 @@ class FeatureCsvRow {
     _frac(white.warmFrac),
     _frac(red.coolFrac),
     _frac(red.warmFrac),
+    // Геометрия света v6 §2 — в том же порядке, в каком её перечисляет
+    // `V6Feature`, и обязательно обеими зонами: решение v6 смотрит на чужую
+    // рамку не меньше, чем на свою.
+    _lum(white.medianV),
+    _lum(white.medianS),
+    _frac(white.brightFrac),
+    _frac(white.coreAreaFrac),
+    _lum(white.coreIntensity),
+    _frac(white.coreRegions),
+    _frac(white.coreCenterFrac),
+    _frac(white.centerContrast),
+    _lum(red.medianV),
+    _lum(red.medianS),
+    _frac(red.brightFrac),
+    _frac(red.coreAreaFrac),
+    _lum(red.coreIntensity),
+    _frac(red.coreRegions),
+    _frac(red.coreCenterFrac),
+    _frac(red.centerContrast),
+    _frac(white.hueRedFrac),
+    _frac(red.hueRedFrac),
+    // Чем решает кадр: две уверенности и два подозрения.
+    _frac(whiteConfidence),
+    _frac(redConfidence),
+    _frac(whiteSuspicion),
+    _frac(redSuspicion),
   ].join(',');
 
   static String _frac(double? v) => v?.toStringAsFixed(5) ?? '';
@@ -253,17 +310,18 @@ class FeatureCsvRow {
     if (c.length < 6) {
       throw FormatException('Строка CSV должна содержать не меньше 6 полей: "$line"');
     }
-    final bool v5 = c.length >= currentColumnCount;
-    final bool v4 = !v5 && c.length >= columnsV4;
-    final bool v3 = !v5 && !v4 && c.length >= columnsV3;
+    final bool v6 = c.length >= FeatureCsvRow.currentColumnCount;
+    final bool v5 = !v6 && c.length >= FeatureCsvRow.columnsV5;
+    final bool v4 = !v6 && !v5 && c.length >= columnsV4;
+    final bool v3 = !v6 && !v5 && !v4 && c.length >= columnsV3;
     // Индексы 0–26 у всех современных форматов совпадают, поэтому всё, что
     // записано до `sensitivity`, читается одним условием `modern`.
-    final bool v2 = !v5 && !v4 && !v3 && c.length >= columnsV2;
-    final bool modern = v5 || v4 || v3 || v2;
+    final bool v2 = !v6 && !v5 && !v4 && !v3 && c.length >= columnsV2;
+    final bool modern = v6 || v5 || v4 || v3 || v2;
     // Всё, что появилось в v4 (состояние живого отсчёта, колонки 41–64), есть и
-    // в v5: здесь обязано быть `v5 || v4`, иначе строка нового формата
-    // распарсилась бы как старая и молча потеряла весь разбор решений.
-    final bool hasV4 = v5 || v4;
+    // в v5, и в v6: здесь обязано быть `v6 || v5 || v4`, иначе строка нового
+    // формата распарсилась бы как старая и молча потеряла весь разбор решений.
+    final bool hasV4 = v6 || v5 || v4;
     final bool legacy = !modern && c.length >= 10;
     final bool v0 = !modern && !legacy && c.length >= 9;
     double d(int i) => double.parse(c[i]);
@@ -303,6 +361,17 @@ class FeatureCsvRow {
         clippedRatio: val(29),
         coolFrac: opt(65),
         warmFrac: opt(66),
+        // Геометрия v6: колонки 69–76 белой зоны и 77–84 красной. В старой
+        // строке их нет, и `opt` честно отдаёт 0 — признак не измерялся, а не
+        // «измерялся и был нулём»; решение по такой калибровке не строится.
+        medianV: opt(69),
+        medianS: opt(70),
+        brightFrac: opt(71),
+        coreAreaFrac: opt(72),
+        coreIntensity: opt(73),
+        coreRegions: opt(74),
+        coreCenterFrac: opt(75),
+        centerContrast: opt(76),
       ),
       red: FrameFeatures(
         meanY: legacy ? d(4) : d(2),
@@ -314,6 +383,14 @@ class FeatureCsvRow {
         clippedRatio: val(32),
         coolFrac: opt(67),
         warmFrac: opt(68),
+        medianV: opt(77),
+        medianS: opt(78),
+        brightFrac: opt(79),
+        coreAreaFrac: opt(80),
+        coreIntensity: opt(81),
+        coreRegions: opt(82),
+        coreCenterFrac: opt(83),
+        centerContrast: opt(84),
       ),
       state: legacy ? c[7] : c[3],
       whiteRing: ring(9, 10, 33, 34, 35, 36),
@@ -361,6 +438,12 @@ class FeatureCsvRow {
               resetReason: c[64],
             )
           : null,
+      // v6 §13: ЧЕМ кадр решил. В старой записи этих колонок нет — null, то есть
+      // «режим этих чисел не считал», а не «уверенность была нулевой».
+      whiteConfidence: v6 && c[87].isNotEmpty ? double.parse(c[87]) : null,
+      redConfidence: v6 && c[88].isNotEmpty ? double.parse(c[88]) : null,
+      whiteSuspicion: v6 && c[89].isNotEmpty ? double.parse(c[89]) : null,
+      redSuspicion: v6 && c[90].isNotEmpty ? double.parse(c[90]) : null,
     );
   }
 }

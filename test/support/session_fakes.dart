@@ -180,12 +180,17 @@ LampBaseline calibratedBaseline({
   const Scene scene = Scene();
   final LampDetector detector = LampDetector(config);
   int index = 0;
-  for (final CalibrationStep step in CalibrationStep.values) {
+  for (final CalibrationStep step in CalibrationStep.mandatory) {
     for (int k = 0; k < config.calibrationFrames; k++, index++) {
       final LampFrame frame = switch (step) {
         CalibrationStep.background => scene.off(index: index),
         CalibrationStep.whiteOn => scene.both(white: scene.whiteOn, index: index),
         CalibrationStep.redOn => scene.both(red: scene.redOn, index: index),
+        CalibrationStep.bothOn => scene.both(
+          white: scene.whiteOn,
+          red: scene.redOn,
+          index: index,
+        ),
       };
       detector.addCalibrationFrame(
         lit(frame, exposureNs: exposureNs, gain: gain),

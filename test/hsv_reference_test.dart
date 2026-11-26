@@ -116,7 +116,7 @@ void main() {
   group('HSV-отбор пикселя', () {
     test('белое/оранжевое/дерево/стена раскладываются по признакам', () {
       // Отбор включается только в режиме HSV: в двух прежних эти доли не читаются,
-      // и платить за нихhot-циклом нельзя.
+      // и платить за них hot-циклом нельзя.
       final LampConfig config = const LampConfig(
         hsvReference: true,
         liveReference: false,

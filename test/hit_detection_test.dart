@@ -146,19 +146,19 @@ void main() {
       expect(events.single.color, HitColor.red);
     });
 
-    test('11. Обе лампы горят одновременно: ДВА независимых события', () {
+    test('11. Обе лампы горят одновременно: ОДНА корзина, событие одно', () {
       final Harness h = Harness();
       final List<HitEvent> events = h.feedAll(
         h.scene.sequence(5, white: scene.whiteOn, red: scene.redOn, startIndex: 90),
       );
 
-      // Белая и красная — независимые лампы: одновременная вспышка это две
-      // вспышки, а не одна «неоднозначная».
-      expect(events, hasLength(2));
-      expect(events.map((HitEvent e) => e.color).toSet(), <HitColor>{
-        HitColor.white,
-        HitColor.red,
-      });
+      // Правило одной корзины (`LampDetector._oneBasket`) — слово заказчика
+      // 25.11.2026, подтверждено 26.11.2026: двух одновременно горящих ламп в
+      // производстве не бывает, поэтому «и туда, и сюда» — ошибка счёта, а не
+      // случай. Событие одно, имя у него по более сильному отклику.
+      expect(events, hasLength(1));
+      expect(events.single.color, HitColor.white);
+      expect(h.machine.state, LampSessionState.whiteOn);
       // Флаг неоднозначности остался только как диагностика.
       expect(h.ambiguousFrames, 5);
     });

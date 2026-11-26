@@ -7,6 +7,7 @@ import 'hsv_reference.dart';
 import 'lamp_calibration.dart';
 import 'live_reference.dart';
 import 'response_model.dart';
+import 'v6_profile.dart';
 
 /// Результат оценки одного кадра детектором.
 ///
@@ -36,6 +37,12 @@ class LampEvaluation {
     this.redNet = 0,
     this.whiteDarkMs = 0,
     this.redDarkMs = 0,
+    this.whiteConfidence,
+    this.redConfidence,
+    this.whiteSuspicion,
+    this.redSuspicion,
+    this.unknown = false,
+    this.unknownReason = '',
   });
 
   final DateTime timestamp;
@@ -89,6 +96,23 @@ class LampEvaluation {
   /// должны быть короче него, паузы между ударами — длиннее.
   final int whiteDarkMs;
   final int redDarkMs;
+
+  /// Уверенность 0..1 и подозрение на отражение 0..1 по профилям калибровки
+  /// (v6 §5, §9.7) — ЧЕМ этот кадр обязан своему решению. Null, когда решать
+  /// было нечем: профилей нет (калибровка снята сборкой, которая их не писала)
+  /// или способ счёта их не использует. Именно null, а не 0: ноль читался бы
+  /// как «кадр точно не похож на включение», и offline-разбор путал бы
+  /// «не измерено» с «измерено и отвергнуто».
+  final double? whiteConfidence;
+  final double? redConfidence;
+  final double? whiteSuspicion;
+  final double? redSuspicion;
+
+  /// Кадр недоказан: подъём своего цвета был, но ни одна лампа им не
+  /// подтверждена. [unknownReason] — почему именно отвергнуто (v6 §5 требует в
+  /// таком случае НЕ подтверждать лампу, а не угадать её).
+  final bool unknown;
+  final String unknownReason;
 }
 
 /// Гистерезис одной лампы: подтверждение включения/выключения.
@@ -235,7 +259,8 @@ class LampDetector {
   LampDetector(this._config)
     : _calibration = LampCalibration(_config),
       _live = LiveReference(_config),
-      _hsv = HsvReference(_config);
+      _hsv = HsvReference(_config),
+      _decider = ProfileDecider(_config);
 
   /// Пороги можно менять на лету (подбор по записанным CSV).
   LampConfig get config => _config;
@@ -254,6 +279,7 @@ class LampDetector {
     _calibration.config = value;
     _live.config = value;
     _hsv.config = value;
+    _decider.config = value;
     _applyHsvSignature();
     if (modeChanged) {
       resetTracking();
@@ -265,14 +291,19 @@ class LampDetector {
   final LampCalibration _calibration;
   final LiveReference _live;
   final HsvReference _hsv;
+  final ProfileDecider _decider;
   final _LampTracker _white = _LampTracker();
   final _LampTracker _red = _LampTracker();
 
   LampBaseline? _baseline;
   LampResponseModel? _model;
+  LampProfiles _profiles = LampProfiles.none;
   int _ambiguousFrames = 0;
   int _unexplainedFrames = 0;
   int _doubleBasketFrames = 0;
+  int _refusedFrames = 0;
+  int _reflectionRefusals = 0;
+  int _unknownFrames = 0;
 
   LampBaseline? get baseline => _baseline;
 
@@ -296,6 +327,14 @@ class LampDetector {
   bool get isCalibrated =>
       _config.hsvReference ? (_baseline?.isCalibrated ?? false) : modelValid;
 
+  /// Снят ли шаг 4 («обе горят») — профиль BOTH_ON спецификации v6 §7.
+  ///
+  /// False здесь не отказ и не ошибка калибровки: на стенде одновременное
+  /// включение может быть невозможно. Экран обязан показывать это как
+  /// «не снято», а не как «снято пусто» — иначе ✓ на четвёртой кнопке
+  /// выглядел бы обещанием того, чего детектор не измерял.
+  bool get hasBothOnProfile => _baseline?.bothOn != null;
+
   /// Есть чем решать: живой отсчёт работает сразу, HSV и режим эталонов —
   /// только после калибровки. Слово заказчика 25.11.2026: «будем только с
   /// калибровкой работать», и за ним число, а не настроение: на разметке
@@ -315,6 +354,24 @@ class LampDetector {
   /// плохих рамках и на засветке чужой лампы, и именно по нему видно, что
   /// удвоение счёта ловится, а не проходит.
   int get doubleBasketFrames => _doubleBasketFrames;
+
+  /// Сколько кадров профиль отверг подъём, который измеренный путь хотел
+  /// подтвердить. Это цена решения по профилям: столько событий автомат не
+  /// выдал, и по этому числу на записи видно, отказ он или потеря.
+  int get refusedFrames => _refusedFrames;
+
+  /// Из них — отвергнутых как отражение соседней лампы (v6 §5: «не подтверждать
+  /// соседнюю лампу»). Растёт на засветке, стоит нулю на нормальном стенде.
+  int get reflectionRefusals => _reflectionRefusals;
+
+  /// Сколько кадров остались недоказанными: подъём был, доказать лампу нечем.
+  int get unknownFrames => _unknownFrames;
+
+  /// Профили, из которых сейчас решается кадр — для диагностики и тестов.
+  LampProfiles get profiles => _profiles;
+
+  /// Решает ли кадр по профилям реально: флаг включён и сравнивать есть чем.
+  bool get profilesDecide => _config.v6ProfileDecision && _profiles.canDecide;
 
   /// Правило именования вспышек, выученное калибровкой. Null — решает прежнее
   /// правило перевеса ([LampConfig.hsvGate]).
@@ -352,10 +409,37 @@ class LampDetector {
     return 'имя выучено: ${best.describe}';
   }
 
+  /// Отчёт на вопрос «чем кадр решает профиль» — одна строка в том же смысле,
+  /// что и [hsvNaming]: числом и с причиной, а не словом «готово». Без него
+  /// «профилей нет», «профили есть, но решение выключено» и «решаем, отказов
+  /// ноль» выглядели бы на экране одинаково.
+  String get profileDecision {
+    if (!_config.hsvReference) {
+      return '';
+    }
+    final LampBaseline? base = _baseline;
+    if (base == null || !base.isCalibrated) {
+      return 'калибровки нет — по профилям решать нечем';
+    }
+    if (!_profiles.canDecide) {
+      return 'решения по профилям нет: не хватает состояний '
+          '(${_profiles.describe()}) — пересними шаги 2 и 3';
+    }
+    if (!_config.v6ProfileDecision) {
+      return 'профили пишутся только в диагностику, решает измеренный HSV-путь';
+    }
+    return 'профили ${_profiles.describe()}, '
+        'уверенность ≥ ${(_config.v6MinConfidence * 100).toStringAsFixed(0)}%, '
+        'отражение ≥ ${(_config.v6ReflectionVeto * 100).toStringAsFixed(0)}%, '
+        'отказов $_refusedFrames (из них отражение $_reflectionRefusals), '
+        'недоказанных кадров $_unknownFrames';
+  }
+
   /// Восстановление калибровки из настроек.
   void setBaseline(LampBaseline baseline) {
     _baseline = baseline;
     _model = LampResponseModel(baseline);
+    _profiles = LampProfiles.from(baseline);
     _applyHsvSignature();
     resetTracking();
   }
@@ -364,6 +448,7 @@ class LampDetector {
   void clearBaseline() {
     _baseline = null;
     _model = null;
+    _profiles = LampProfiles.none;
     _applyHsvSignature();
     resetTracking();
   }
@@ -397,6 +482,9 @@ class LampDetector {
     _ambiguousFrames = 0;
     _unexplainedFrames = 0;
     _doubleBasketFrames = 0;
+    _refusedFrames = 0;
+    _reflectionRefusals = 0;
+    _unknownFrames = 0;
   }
 
   /// Одна вспышка — одна корзина.
@@ -788,7 +876,75 @@ class LampDetector {
     // любой офлайн-разбор файла, снятого до калибровки, падал бы вместо чисел.
     final LiveReading reading = _hsv.step(frame);
 
-    final bool ambiguous = reading.whiteAboveOn && reading.redAboveOn;
+    // Прослойка профилей v6 §5. Числа считаются ВСЕГДА, когда их чем считать,
+    // — даже с выключенным отказом: иначе на одной записи нельзя было бы
+    // сравнить «как решает измеренный путь» с «как решают профили», и честный
+    // A/B требовал бы двух прогонов по одному стенду.
+    final bool canProfile = _profiles.canDecide;
+    final ProfileVerdict whiteVerdict = canProfile
+        ? _decider.verdict(
+            x: frame.white.toVector(),
+            off: _profiles.whiteOff,
+            on: _profiles.whiteOn,
+            spill: _profiles.whiteRoiRedSpill,
+          )
+        : ProfileVerdict.unavailable;
+    final ProfileVerdict redVerdict = canProfile
+        ? _decider.verdict(
+            x: frame.red.toVector(),
+            off: _profiles.redOff,
+            on: _profiles.redOn,
+            spill: _profiles.redRoiWhiteSpill,
+          )
+        : ProfileVerdict.unavailable;
+
+    // Право у этих чисел ровно одно — ОТКАЗАТЬ. Имени они не дают никакого:
+    // лампу по-прежнему находит измеренный HSV-путь (60 ошибок на разметке
+    // заказчика, журнал 46), профиль лишь решает, подтверждать подъём или
+    // счесть кадр недоказанным. Отказ касается только rising edge: гашение,
+    // состояние «уже горит» и одна корзина [_oneBasket] остаются на измеренных
+    // числах, иначе профиль, снятый на одном свете, дробил бы одно горение.
+    final bool veto = _config.v6ProfileDecision && canProfile;
+    final ({bool reflection, String reason})? whiteRefusal =
+        veto && reading.whiteAboveOn && !_white.lit
+        ? _refusal(whiteVerdict, redVerdict)
+        : null;
+    final ({bool reflection, String reason})? redRefusal =
+        veto && reading.redAboveOn && !_red.lit
+        ? _refusal(redVerdict, whiteVerdict)
+        : null;
+    final bool whiteRefused = whiteRefusal != null;
+    final bool redRefused = redRefusal != null;
+    if (whiteRefused || redRefused) {
+      _refusedFrames++;
+      if (whiteRefusal?.reflection ?? false) {
+        _reflectionRefusals++;
+      }
+      if (redRefusal?.reflection ?? false) {
+        _reflectionRefusals++;
+      }
+    }
+
+    final bool whiteCandidate = reading.whiteAboveOn && !whiteRefused;
+    final bool redCandidate = reading.redAboveOn && !redRefused;
+
+    // Кадр недоказан (v6 UNKNOWN), только если подъём был и всем отвергнут:
+    // молчание по погасшим лампам — не недоказанность, а спокойный кадр.
+    final bool unknown =
+        (reading.whiteAboveOn || reading.redAboveOn) &&
+        !whiteCandidate &&
+        !redCandidate;
+    if (unknown) {
+      _unknownFrames++;
+    }
+    final String unknownReason = unknown
+        ? <String>[
+            if (whiteRefusal != null) 'белая: ${whiteRefusal.reason}',
+            if (redRefusal != null) 'красная: ${redRefusal.reason}',
+          ].join('; ')
+        : '';
+
+    final bool ambiguous = whiteCandidate && redCandidate;
     HitColor? winner;
     if (ambiguous) {
       _ambiguousFrames++;
@@ -802,9 +958,8 @@ class LampDetector {
     // При неоднозначности проигравший канал не получает «выше ON»: раньше
     // победитель только писался в диагностику, а оба трекера шли независимо.
     final bool whiteAbove =
-        reading.whiteAboveOn && (!ambiguous || winner == HitColor.white);
-    final bool redAbove =
-        reading.redAboveOn && (!ambiguous || winner == HitColor.red);
+        whiteCandidate && (!ambiguous || winner == HitColor.white);
+    final bool redAbove = redCandidate && (!ambiguous || winner == HitColor.red);
 
     final ({bool becameOn, bool becameOff}) whiteStep = _white.step(
       aboveOn: whiteAbove,
@@ -871,7 +1026,55 @@ class LampDetector {
       redOnCandidateAt: _red.onCandidate,
       whiteDarkMs: _white.darkMs,
       redDarkMs: _red.darkMs,
+      whiteConfidence: whiteVerdict.available ? whiteVerdict.confidence : null,
+      redConfidence: redVerdict.available ? redVerdict.confidence : null,
+      whiteSuspicion: whiteVerdict.available ? whiteVerdict.suspicion : null,
+      redSuspicion: redVerdict.available ? redVerdict.suspicion : null,
+      unknown: unknown,
+      unknownReason: unknownReason,
     );
+  }
+
+  /// Отвергает ли профиль этот подъём и если да — почему. Null значит
+  /// «возражений нет», а не «уверенность высокая»: возражений может не быть и
+  /// у совершенно недоказанного кадра, и это число ничего не обещает.
+  ///
+  /// Два самостоятельных отказа, оба из спецификации v6:
+  ///
+  ///  * уверенность ниже [LampConfig.v6MinConfidence] — кадр не похо ни на
+  ///    выключенную, ни на снятую включённой лампу своей рамки (§8: сходство с
+  ///    ON-профилем обязательно, одного отличия от темноты мало);
+  ///  * [ProfileVerdict.suspicion] не ниже [LampConfig.v6ReflectionVeto] И
+  ///    соседняя лампа выглядит на своё включение убедительнее — то есть подъём
+  ///    этой рамки объясняется светом соседней (§5: «do not confirm the other
+  ///    lamp»). Условие парное намеренно: отказывать рамке, когда и соседняя
+  ///    непохожа, нечем, — это был бы отказ без причины.
+  ({bool reflection, String reason})? _refusal(
+    ProfileVerdict own,
+    ProfileVerdict other,
+  ) {
+    if (!own.available) {
+      return (reflection: false, reason: 'профилей не хватает');
+    }
+    if (own.confidence < _config.v6MinConfidence) {
+      return (
+        reflection: false,
+        reason: 'кадр не похож на включение своей лампы '
+            '(уверенность ${(own.confidence * 100).toStringAsFixed(0)}% '
+            'при нужных ${(_config.v6MinConfidence * 100).toStringAsFixed(0)}%)',
+      );
+    }
+    if (own.suspicion >= _config.v6ReflectionVeto &&
+        other.available &&
+        other.confidence > own.confidence) {
+      return (
+        reflection: true,
+        reason: 'похоже на отражение соседней лампы '
+            '(подозрение ${(own.suspicion * 100).toStringAsFixed(0)}%, '
+            'у соседней уверенность выше)',
+      );
+    }
+    return null;
   }
 
   /// Уровень не бывает нулевым (минимум — [LampConfig.referenceMinRise]), но

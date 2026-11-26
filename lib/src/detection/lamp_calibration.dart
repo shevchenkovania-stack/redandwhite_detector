@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import '../models/feature_profile.dart';
 import '../models/frame_features.dart';
 import '../models/lamp_config.dart';
 import 'exposure_guard.dart';
@@ -13,6 +14,12 @@ import 'response_model.dart';
 /// лампы выключены, затем горит белая, затем горит красная. Только так детектор
 /// получает два эталона и может отличить одну лампу от другой по форме
 /// изменения кадра, а не по цвету пикселя.
+///
+/// Четвёртый шаг, «обе лампы горят», — по желанию (спецификация v6 §7 прямо
+/// разрешает его не требовать): на стенде одновременное включение может быть
+/// невозможно. Он не предлагается мастером сам и не входит в «готовность»
+/// калибровки — только отдельная кнопка, которая добавляет к уже собранной
+/// модели профиль BOTH_ON.
 enum CalibrationStep {
   background('фон', 'Держите обе лампы выключенными', 'bg', 'ФОН'),
   whiteOn('белая горит', 'Зажгите белую лампу и держите', 'white_on', 'БЕЛАЯ'),
@@ -21,9 +28,27 @@ enum CalibrationStep {
     'Белую погасите, зажгите красную и держите',
     'red_on',
     'КРАСНАЯ',
+  ),
+  bothOn(
+    'обе горят',
+    'Зажгите обе лампы и держите — шаг необязательный',
+    'both_on',
+    'ОБЕ',
   );
 
   const CalibrationStep(this.label, this.prompt, this.csvTag, this.button);
+
+  /// Шаги, без которых калибровка не калибровка: фон и по одному состоянию на
+  /// каждую лампу. «Обе горят» в этот список не входит специально — его нет на
+  /// половине стендов, и требовать его означало бы не считать там вовсе.
+  static const List<CalibrationStep> mandatory = <CalibrationStep>[
+    background,
+    whiteOn,
+    redOn,
+  ];
+
+  /// Снимается по желанию оператора. Мастер набора сюда сам не ведёт.
+  bool get isOptional => this == bothOn;
 
   /// Следующий по порядку шаг или null, если этот последний. Порядок — только
   /// подсказка: кнопки снимаются в любом, а этот getter знает, куда вести
@@ -67,7 +92,10 @@ enum CalibrationStep {
   /// Номер шага с 1 — так его видит человек.
   int get number => index + 1;
 
-  bool get isFinal => index == CalibrationStep.values.length - 1;
+  /// Последний обязательный шаг. После него мастер сам не ведёт дальше: шагу
+  /// «обе горят» место только по кнопке, иначе оператор стоял бы у панели с
+  /// просьбой включить то, чего на его стенде не бывает.
+  bool get isFinal => this == redOn;
 
   static int get count => values.length;
 }
@@ -84,7 +112,7 @@ class CalibrationProgress {
   final int needed;
   final CalibrationStep step;
 
-  int get totalSteps => CalibrationStep.count;
+  int get totalSteps => CalibrationStep.mandatory.length;
   bool get isComplete => collected >= needed;
   int get remaining => (needed - collected).clamp(0, needed);
 
@@ -125,6 +153,7 @@ class CalibrationReport {
     this.whiteAmplitudeNoise,
     this.redAmplitudeNoise,
     this.baseline,
+    this.hasBothOnProfile = false,
   });
 
   final CalibrationStep step;
@@ -143,8 +172,12 @@ class CalibrationReport {
   final double? whiteAmplitudeNoise;
   final double? redAmplitudeNoise;
 
-  /// Готовая калибровка — только на последнем шаге.
+  /// Готовая калибровка — только на последнем обязательном шаге и на шаге 4.
   final LampBaseline? baseline;
+
+  /// Снят ли профиль BOTH_ON: по нему отчёт шага «красная» кончается словом
+  /// «готово» без напоминания про четвёртую кнопку.
+  final bool hasBothOnProfile;
 
   /// Строка в панель состояния: чем шаг кончился, числом, а не обещанием.
   String describe() {
@@ -160,15 +193,23 @@ class CalibrationReport {
             '${((crosstalk ?? 0) * 100).toStringAsFixed(0)}%, шум амплитуды '
             'W ${((whiteAmplitudeNoise ?? 0) * 100).toStringAsFixed(1)}% / '
             'R ${((redAmplitudeNoise ?? 0) * 100).toStringAsFixed(1)}%',
+      CalibrationStep.bothOn =>
+        'Обе горят: профиль BOTH_ON снят ($frameCount кадров) — он нужен '
+            'решению v6, чтобы отличать своё включение от двойной засветки',
     };
     // Дальше обязана идти одна короткая команда: что жечь и что нажать.
     // Длинный текст оператор у экрана не читает, он держит лампу рукой.
+    final String optionalHint = hasBothOnProfile
+        ? ''
+        : '. По желанию: жми «${CalibrationStep.bothOn.key}», когда '
+              'сможешь держать обе';
     final String nextStep = switch (step) {
       CalibrationStep.background =>
         '. Дальше: включи белую и жми «${CalibrationStep.whiteOn.key}»',
       CalibrationStep.whiteOn =>
         '. Дальше: гаси белую, включай красную и жми «${CalibrationStep.redOn.key}»',
-      CalibrationStep.redOn => '. Готово, можно считать',
+      CalibrationStep.redOn => '. Готово, можно считать$optionalHint',
+      CalibrationStep.bothOn => '. Готово, можно считать',
     };
     return '$head$nextStep';
   }
@@ -217,7 +258,11 @@ class LampCalibration {
   List<CalibrationStep> get completedSteps =>
       CalibrationStep.values.where(_states.containsKey).toList(growable: false);
 
-  bool get isComplete => _states.length == CalibrationStep.count;
+  /// Все ОБЯЗАТЕЛЬНЫЕ состояния набраны. Четвёртое («обе горят») здесь не
+  /// проверяется специально: оно не снято на большинстве стендов, и требовать
+  /// его — значит не допустить калибровку там, где она полна.
+  bool get isComplete =>
+      CalibrationStep.mandatory.every(_states.containsKey);
 
   CalibrationProgress get progress => CalibrationProgress(
     collected: _frames.length,
@@ -273,6 +318,13 @@ class LampCalibration {
   /// сильнее. Именно эту асимметрию и проверяет `lampGateAsymmetry`; без неё
   /// яркостный порог ловил бы каждый дрог экспозиции как «лампа зажглась».
   bool _lit(LampFrame frame, CalibrationStep step, CalibrationState bg) {
+    if (step == CalibrationStep.bothOn) {
+      // Горят обе, поэтому прежняя асимметрия «своя поднялась сильнее чужой»
+      // здесь была бы запрещена сама собой: чужая поднялась ровно так же.
+      // Проверяется только то, что каждая своя рамка дала свой подъём.
+      return _aboveGate(frame, bg, white: true) &&
+          _aboveGate(frame, bg, white: false);
+    }
     final bool white = step == CalibrationStep.whiteOn;
     final double own = _rise(
       white ? frame.white : frame.red,
@@ -286,6 +338,25 @@ class LampCalibration {
       white ? frame.redRing : frame.whiteRing,
       white ? bg.redRing : bg.whiteRing,
     );
+    return own >= _gate(bg, white: white) && own >= other * lampGateAsymmetry;
+  }
+
+  /// Подъём областей одной рамки над порогом шума фона.
+  bool _aboveGate(LampFrame frame, CalibrationState bg, {required bool white}) {
+    final double own = _rise(
+      white ? frame.white : frame.red,
+      white ? bg.white : bg.red,
+      white ? frame.whiteRing : frame.redRing,
+      white ? bg.whiteRing : bg.redRing,
+    );
+    return own >= _gate(bg, white: white);
+  }
+
+  /// Порог «лампа зажглась» для этой рамки: не меньше [lampGateSigmas] σ самого
+  /// шумного признака её областей, но и не меньше [lampGateMinLuma] уровней
+  /// яркости — иначе на спокойной сцене лампу «увидит» от одного дрога
+  /// автоэкспозиции.
+  static double _gate(CalibrationState bg, {required bool white}) {
     // Шум своей области: и ядра, и кольца, если кольцо мерилось.
     final FrameFeatures sigma = white ? bg.whiteSigma : bg.redSigma;
     final FrameFeatures? ringSigma = white
@@ -295,8 +366,7 @@ class LampCalibration {
     if (ringSigma != null) {
       gate = math.max(gate, math.max(ringSigma.meanY, ringSigma.p90Luma));
     }
-    return own >= math.max(lampGateMinLuma, lampGateSigmas * gate) &&
-        own >= other * lampGateAsymmetry;
+    return math.max(lampGateMinLuma, lampGateSigmas * gate);
   }
 
   /// Наибольший ПОДЪЁМ яркости среди областей одной рамки (уровни 0..255).
@@ -365,6 +435,13 @@ class LampCalibration {
     _states[CalibrationStep.background] ??= baseline.background;
     _states[CalibrationStep.whiteOn] ??= baseline.whiteOn;
     _states[CalibrationStep.redOn] ??= baseline.redOn;
+    // Четвёртое состояние подставляется только если оно действительно снято:
+    // пустое состояние вместо null решение по профилям прочитало бы как
+    // «обе лампы горели по нулям».
+    final CalibrationState? both = baseline.bothOn;
+    if (both != null) {
+      _states[CalibrationStep.bothOn] ??= both;
+    }
     // Подставленные состояния сняты при экспозиции из baseline: сверка
     // начинается с неё, иначе переснятый шаг сошёлся бы с прежним молча, хотя
     // свет между ними уже разный.
@@ -474,13 +551,16 @@ class LampCalibration {
           : null,
     );
 
-    // Модель сборная: её можно отвергнуть только когда есть все три состояния,
-    // в каком бы порядке они ни были сняты. Прежний «проверять лишь на
-    // последнем шаге» правил порядок и не давал переснять один шаг по кнопке:
+    // Модель сборная: её можно отвергнуть только когда есть все обязательные
+    // состояния, в каком бы порядке они ни были сняты. Прежний «проверять лишь
+    // на последнем шаге» правил порядок и не давал переснять один шаг по кнопке:
     // снятая красная висела бы непринятой, пока оператор не пройдёт снова всё.
-    if (_states.length < CalibrationStep.count) {
-      if (!_step.isFinal) {
-        _step = CalibrationStep.values[_step.index + 1];
+    if (!isComplete) {
+      final CalibrationStep? following = _step.next;
+      // На необязательный шаг мастер не сворачивает сам: до него доходит только
+      // по кнопке, когда оператор может держать две лампы.
+      if (following != null && !following.isOptional) {
+        _step = following;
       }
       return report;
     }
@@ -502,6 +582,10 @@ class LampCalibration {
       background: _states[CalibrationStep.background]!,
       whiteOn: _states[CalibrationStep.whiteOn]!,
       redOn: _states[CalibrationStep.redOn]!,
+      // Null, если четвёртый шаг не снимался: это не ошибка калибровки, а
+      // отсутствие профиля BOTH_ON, и решение по профилям обязано видеть именно
+      // отсутствие.
+      bothOn: _states[CalibrationStep.bothOn],
       capturedAtMs: DateTime.now().millisecondsSinceEpoch,
       exposureTimeNs: shot.ns,
       sensorSensitivity: shot.gain,
@@ -580,6 +664,7 @@ class LampCalibration {
       whiteAmplitudeNoise: model.whiteAmplitudeNoise,
       redAmplitudeNoise: model.redAmplitudeNoise,
       baseline: baseline,
+      hasBothOnProfile: baseline.bothOn != null,
     );
   }
 
@@ -672,6 +757,15 @@ class LampCalibration {
       redRing: redRing == null ? null : _mean(redRing),
       whiteRingSigma: whiteRing == null ? null : _std(whiteRing),
       redRingSigma: redRing == null ? null : _std(redRing),
+      // Профиль собирается по СЫРЫМ кадрам шага, а не по среднему: v6 §8
+      // требует распределение, и среднее с σ его не заменяет — σ знает,
+      // насколько кадры разошлись, но не знает, где именно лежит середина.
+      whiteProfile: FeatureProfile.fromFrames(
+        frames.map((LampFrame f) => f.white).toList(growable: false),
+      ),
+      redProfile: FeatureProfile.fromFrames(
+        frames.map((LampFrame f) => f.red).toList(growable: false),
+      ),
       frameCount: frames.length,
     );
     // Шум проверяется по всем признакам вектора, а не по двум «рабочим»:

@@ -171,9 +171,13 @@ class Harness {
 
   /// Калибровка в три состояния, как на стенде: фон → держат белую → держат
   /// красную. Возвращает число скормленных кадров.
+  ///
+  /// Перебираются ОБЯЗАТЕЛЬНЫЕ шаги: четвёртый («обе горят») снят быть может, но
+  /// не обязан, и тесты, которые его молча требовали бы, проверяли бы не
+  /// решение, а порядок кнопок.
   int calibrate() {
     int i = 0;
-    for (final CalibrationStep step in CalibrationStep.values) {
+    for (final CalibrationStep step in CalibrationStep.mandatory) {
       for (int k = 0; k < config.calibrationFrames; k++, i++) {
         detector.addCalibrationFrame(calibrationFrame(step, index: i));
       }
@@ -187,6 +191,14 @@ class Harness {
         CalibrationStep.background => scene.off(index: index),
         CalibrationStep.whiteOn => scene.both(white: scene.whiteOn, index: index),
         CalibrationStep.redOn => scene.both(red: scene.redOn, index: index),
+        // Шаг 4: обе лампы горят одновременно — ровно то, что оператор держит
+        // на кнопке «4 ОБЕ».
+        CalibrationStep.bothOn =>
+          scene.both(
+            white: scene.whiteOn,
+            red: scene.redOn,
+            index: index,
+          ),
       };
 
   /// Скормить кадр, вернуть порождённые события.

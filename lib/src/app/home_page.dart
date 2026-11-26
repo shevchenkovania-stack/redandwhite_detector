@@ -39,31 +39,31 @@ class _HomePageState extends State<HomePage> {
   /// оператор обязан видеть разом все варианты и какой из них включён, иначе
   /// переключатель превращается в угадывание.
   ///
-  /// Живого (яркостного) способа здесь больше нет: на 16 записях стенда
-  /// (108 событий) HSV даёт 54 ошибки против 73…85 у живого отсчёта
-  /// (ЖУРНАЛ §11.12, `tools/hsv_decide.py matrix`). Остались два, и оба
-  /// требуют те же три состояния калибровки: цветовому они дают имя вспышки
-  /// (журнал 46), режиму эталонов — сами эталоны.
-  /// Сам режим в перечислении остаётся — старые сохранённые настройки с ним
-  /// встречаются, и [_menuModes] обязан показать включённый способ, даже когда
-  /// он выпал из выбора: иначе прогон выглядит как будто выбран верхний пункт,
-  /// а переключить его вслепую нельзя.
+  /// Спецификация v6 §MODES требует ровно двух способов, и оба цветовые:
+  /// `HSV_CALIBRATION` (кадр сверяется с профилями распределений) и `HSV`
+  /// (того не делает — ровно измеренное дерево v5, 60 ошибок на разметке
+  /// заказчика, журнал 46). Яркостного способа и «живого» здесь больше нет:
+  /// эталоны и живой отсчёт помечены прекращёнными, но в перечислении остаются
+  /// — старые сохранённые настройки с ними встречаются, и [_menuModes] обязан
+  /// показать включённый способ, даже когда он выпал из выбора: иначе прогон
+  /// выглядит как будто выбран верхний пункт, а переключить его вслепую
+  /// нельзя.
   static const List<({LampCountMode mode, String label, IconData icon})>
   _countModes = <({LampCountMode mode, String label, IconData icon})>[
     (
-      mode: LampCountMode.hsv,
-      label: 'по цвету HSV + калибровка',
+      mode: LampCountMode.hsvCalibration,
+      label: 'HSV + профили калибровки',
       icon: Icons.palette_outlined,
     ),
     (
-      mode: LampCountMode.etalon,
-      label: 'по яркости (калибровка)',
-      icon: Icons.straighten,
+      mode: LampCountMode.hsv,
+      label: 'HSV (без сверки с профилями)',
+      icon: Icons.filter_b_and_w_outlined,
     ),
   ];
 
   /// Пункты меню способа счёта: выбор плюс текущий режим, если он в выбор не
-  /// входит (переключённый на «живой» сохранённой старой настройкой).
+  /// входит (переключённый на прекращённый сохранённой старой настройкой).
   static List<({LampCountMode mode, String label, IconData icon})> _menuModes(
     LampCountMode current,
   ) => <({LampCountMode mode, String label, IconData icon})>[
@@ -71,8 +71,14 @@ class _HomePageState extends State<HomePage> {
     if (current == LampCountMode.live)
       (
         mode: LampCountMode.live,
-        label: 'живой (без калибровки)',
+        label: 'живой (прекращён, без калибровки)',
         icon: Icons.wifi_tethering,
+      ),
+    if (current == LampCountMode.etalon)
+      (
+        mode: LampCountMode.etalon,
+        label: 'по яркости (прекращён)',
+        icon: Icons.straighten,
       ),
   ];
 
@@ -290,13 +296,20 @@ class _HomePageState extends State<HomePage> {
     setState(() => _message = 'Калибровка сброшена. ${session.readiness.why}');
   }
 
-  /// Что считает прогон — метка в каждой строке лога.
+  /// Что считает прогон — метка в каждой строке лога. Имя короткое и своё у
+  /// каждого режима: по логу обязаны быть различимы `hsv` (без профилей) и
+  /// `hsv+prof` (с ними), иначе два прогона разных способов не разделить.
   String get _modeTag {
     final DetectionSession? s = _session;
     if (s == null) {
-      return 'ref=?';
+      return 'mode=?';
     }
-    return 'ref=${s.config.countMode.name}';
+    return 'mode=${switch (s.config.countMode) {
+      LampCountMode.hsv => 'hsv',
+      LampCountMode.hsvCalibration => 'hsv+prof',
+      LampCountMode.etalon => 'etalon',
+      LampCountMode.live => 'live',
+    }}';
   }
 
   /// Компактная строка чисел прогона в logcat (тег LAMPDBG), примерно 5 раз/с.
@@ -331,7 +344,7 @@ class _HomePageState extends State<HomePage> {
     // съеден чужой рамкой или краем кадра и решать по нему нельзя.
     final FrameFeatures? whiteRing = f.whiteRing;
     final FrameFeatures? redRing = f.redRing;
-    if (s.config.countMode == LampCountMode.hsv) {
+    if (s.config.hsvReference) {
       // HSV-прогон: `cf`/`wr` — доли «белых» и «красных» пикселей в колпаке;
       // решают не они сами, а их подъём `aW`/`aR` над «полом». `p90` — яркость
       // зоны (по ней видно стоп на потолке сенсора), `onW`/`onR` — порог этого
@@ -352,6 +365,16 @@ class _HomePageState extends State<HomePage> {
         '| lit W=${e?.whiteLit ?? false} R=${e?.redLit ?? false} '
         'amb=${s.diagnostics.snapshot.ambiguousFrames} '
         'both=${s.doubleBasketFrames} '
+        // v6 §13: ЧЕМ решил кадр. `cw`/`cr` — уверенность по профилям, `sw`/`sr`
+        // — подозрение на отражение, `rej` — сколько подъёмов отвергнуто и из
+        // них как отражение, `unk` — сколько кадров остались недоказанными и
+        // почему. Прочерк значит «не измерялось» (калибровка без профилей либо
+        // режим HSV), а не «ноль»: на стенде эти две болезни лечатся
+        // противоположно.
+        '| prof cw=${_pct(e?.whiteConfidence)} cr=${_pct(e?.redConfidence)} '
+        'sw=${_pct(e?.whiteSuspicion)} sr=${_pct(e?.redSuspicion)} '
+        'rej=${s.refusedFrames}/${s.reflectionRefusals} '
+        'unk=${s.unknownFrames} ${_unknownTag(e)} '
         '| p90 w=${f.white.p90Luma.toStringAsFixed(0)} '
         'r=${f.red.p90Luma.toStringAsFixed(0)} '
         'dark W=${e?.whiteDarkMs ?? 0}ms R=${e?.redDarkMs ?? 0}ms '
@@ -416,6 +439,16 @@ class _HomePageState extends State<HomePage> {
       '| hits W=${s.whiteHits} R=${s.redHits}',
     );
   }
+
+  /// Уверенность и подозрение в логе — проценты либо прочерк: «не измерялось»
+  /// обязано читаться иначе, чем «измерено и отвергнуто» (v6 §13).
+  static String _pct(double? v) =>
+      v == null ? '-' : (v * 100).toStringAsFixed(0);
+
+  /// Почему кадр остался недоказанным; пусто, когда он доказан или таких
+  /// кадров ещё не было.
+  static String _unknownTag(LampEvaluation? e) =>
+      e == null || !e.unknown ? '' : '(${e.unknownReason})';
 
   Future<void> _sheet(String title, Widget child) => showModalBottomSheet<void>(
     context: context,
@@ -780,9 +813,11 @@ class _CalibrationSteps extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final LampStatus s = session.status;
-    final List<Widget> buttons = CalibrationStep.values
-        .map((CalibrationStep step) => _button(step, s))
-        .toList(growable: false);
+    final List<Widget> buttons = <Widget>[
+      for (final CalibrationStep step in CalibrationStep.mandatory)
+        _button(step, s),
+    ];
+    final Widget optional = _button(CalibrationStep.bothOn, s);
     return Padding(
       padding: vertical
           ? const EdgeInsets.fromLTRB(6, 0, 6, 4)
@@ -790,10 +825,23 @@ class _CalibrationSteps extends StatelessWidget {
       child: Column(
         children: <Widget>[
           vertical
-              ? Column(children: <Widget>[for (final Widget b in buttons) b])
-              : Row(
+              ? Column(
                   children: <Widget>[
-                    for (final Widget b in buttons) Expanded(child: b),
+                    ...buttons,
+                    // В правой панели ландшафта места достаточно, а подпись
+                    // «по желанию» там всё равно нужна: без неё четвёртая
+                    // кнопка читается как обязательная.
+                    _optionalRow(optional),
+                  ],
+                )
+              : Column(
+                  children: <Widget>[
+                    Row(
+                      children: <Widget>[
+                        for (final Widget b in buttons) Expanded(child: b),
+                      ],
+                    ),
+                    _optionalRow(optional),
                   ],
                 ),
           Padding(
@@ -817,13 +865,39 @@ class _CalibrationSteps extends StatelessWidget {
     );
   }
 
+  /// Кнопка необязательного шага 4 — всегда отдельной строкой и с подписью.
+  ///
+  /// Втиснуть её в тот же ряд, где стоят «1 ФОН / 2 БЕЛАЯ / 3 КРАСНАЯ», нельзя
+  /// по двум причинам: подписи «3 КРАСНАЯ» вчетвером в ширину экрана уже не
+  /// помещаются, и человек стал бы считать шаг обязательным четвёртым
+  /// нажатием — а на стенде, где обе лампы вместе не горят, он бы его и ждал.
+  Widget _optionalRow(Widget button) => Padding(
+    padding: const EdgeInsets.only(top: 2),
+    child: Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: <Widget>[
+        button,
+        const SizedBox(width: 6),
+        const Text(
+          'по желанию',
+          style: TextStyle(fontSize: 11, color: Colors.white54),
+        ),
+      ],
+    ),
+  );
+
   Widget _button(CalibrationStep step, LampStatus s) {
     final CalibrationProgress p = s.calibration;
     final bool collecting = s.calibrating && p.step == step;
     // Успешная калибровка состояния стирает (они превратились в модель), поэтому
     // «всё снято» выглядит как рабочий baseline без недобранных шагов.
     final bool allShot = s.isCalibrated && s.completedSteps.isEmpty;
-    final bool shot = allShot || s.completedSteps.contains(step);
+    // Для необязательного шага «снято» обязано означать ровно одно: состояние
+    // измерено. `allShot` к нему применять нельзя — после обычных трёх шагов оно
+    // true, а галочка на «4 ОБЕ» обещала бы профиль BOTH_ON, которого нет.
+    final bool shot = step.isOptional
+        ? s.hasBothOnProfile || s.completedSteps.contains(step)
+        : allShot || s.completedSteps.contains(step);
     // Отвергнутый шаг сессия оставляет тем, на котором всё и сломалось:
     // переснимать нужно ровно его, и кнопка должна об этом сказать.
     final bool refused =
@@ -911,6 +985,7 @@ class _CollectionOverlayState extends State<_CollectionOverlay> {
       CalibrationStep.background => 'ДЕРЖИ ОБЕ ПОГАШЕНЫ',
       CalibrationStep.whiteOn => 'ДЕРЖИ БЕЛУЮ',
       CalibrationStep.redOn => 'ДЕРЖИ КРАСНУЮ · БЕЛУЮ ПОГАСИ',
+      CalibrationStep.bothOn => 'ДЕРЖИ ОБЕ ГОРЯЩИМИ',
     };
     final String big;
     final String small;

@@ -1,3 +1,5 @@
+import 'frame_features.dart';
+
 /// Все настраиваемые числа детектора в одном месте.
 ///
 /// В логике извлечения признаков, оценки и автомата не должно быть ни одного
@@ -57,6 +59,22 @@ class LampConfig {
     this.hsvClipCross = 0.20,
     this.hsvSignatureNaming = true,
     this.hsvSignatureMinSigmas = 2.0,
+    // Признаки геометрии света спецификации v6 §2. Считаются всегда: решением
+    // они станут в следующем шаге, но профиль калибровки обязан быть набран
+    // теми же числами, которыми решение будет проверяться.
+    this.v6Spatial = true,
+    this.v6BrightValueMin = 200,
+    this.v6CoreValueMin = 235,
+    this.v6HueSatMin = 64,
+    this.v6CenterSpan = 0.5,
+    this.hueBins = 16,
+    this.v6MinSigma = 0.02,
+    this.v6DScale = 1.0,
+    this.v6ReflectionWeight = 0.8,
+    this.v6CoreFeatures = LampConfig.defaultV6CoreFeatures,
+    this.v6ProfileDecision = true,
+    this.v6MinConfidence = 0.35,
+    this.v6ReflectionVeto = 0.65,
   });
 
   /// Доля измеренного отклика, при которой лампа считается включённой.
@@ -381,6 +399,130 @@ class LampConfig {
   /// [templateMinSeparation]: отклик обязан быть вдвое больше шума шага.
   final double hsvSignatureMinSigmas;
 
+  /// Считать ли признаки геометрии света (медианы V/S, ядро, связные области,
+  /// центр против остальной ROI, распределение оттенка) — блок v6 §2.
+  ///
+  /// Выключено возвращает прежний облик кадра: поля вектора остаются нулями, а
+  /// решение по профилям на нули не опирается (см. `docs/АЛГОРИТМ_ВЕРСИИ.md`).
+  /// Включено по умолчанию, потому что калибровка обязана набирать те же числа,
+  /// по которым потом решает: профиль, снятый без ядра, проверяать ядром
+  /// нельзя.
+  final bool v6Spatial;
+
+  /// Яркость (V, 0..255), с которой пиксель считается ярким — знаменатель
+  /// [FrameFeatures.brightFrac]. 200 ≈ 0.78·255: выше порога, на котором
+  /// белая лампа уже светит, и ниже потолка сенсора.
+  final double v6BrightValueMin;
+
+  /// Яркость пикселя, с которой он попадает в ЯДРО источника
+  /// ([FrameFeatures.coreAreaFrac], [FrameFeatures.coreIntensity],
+  /// [FrameFeatures.coreRegions], [FrameFeatures.coreCenterFrac]).
+  /// 235 ≈ 0.92·255 — это верхняя часть гистограммы яркости той же зоны, по
+  /// которой [clipLuma] меряет пересвет: ядро обязано быть ярче тела лампы и
+  /// не обязано быть на самом потолке, иначе оно исчезало бы в каждом
+  /// пересвеченном кадре.
+  final double v6CoreValueMin;
+
+  /// Насыщенность (0..255), с которой пиксель считается цветным и попадает в
+  /// гистограмму оттенка. 64 ≈ 0.25·255 — тот же порог обесцвеченности, что у
+  /// [hsvCoolSatMax], взятый с другой стороны: оттенок имеет смысл мерять только
+  /// там, где цвет есть.
+  final double v6HueSatMin;
+
+  /// Доля стороны рамки, занимающая центральное окно поверхности
+  /// ([FrameFeatures.coreCenterFrac], [FrameFeatures.centerContrast]). 0.5 —
+  /// четверть площади ROI в середине: при меньшем окне ядро лампы на плохой
+  /// рамке целиком оказывается «вне центра», при большем окно сливается с
+  /// остальной областью и признак перестаёт что-либо различать.
+  final double v6CenterSpan;
+
+  /// Число корзин гистограммы оттенка. 16 по 22.5° — красное («вокруг нуля»,
+  /// v6 §4 требует именно корзин из-за перехода шкалы) занимает корзины 0 и 15,
+  /// и они суммируются отдельно; дальше число только размывает рисунок.
+  final int hueBins;
+
+  /// Все признаки вектора — профиль по умолчанию считает их все.
+  ///
+  /// Список не «сокращает данные», а выбирает, чем доказывать: на стенде имеет
+  /// смысл оставить только геометрию света (`coreAreaFrac`, `coreCenterFrac`,
+  /// `centerContrast`), чтобы проверить, решает ли она одна.
+  static const List<V6Feature> defaultV6CoreFeatures = V6Feature.values;
+
+  /// Пол разброса признака в ДОЛЯХ от его же уровня (v6 §8).
+  ///
+  /// На идеально ровной синтетике и на лампе, снятой без дрожащего света, IQR
+  /// равен нулю, и первое же дрожание признака стало бы бесконечным
+  /// расстоянием до профиля. Пол привязан к уровню, а не к абсолютному числу,
+  /// потому что вектор смешан по шкалам: `medianV` лежит в 0..255, а
+  /// `coreAreaFrac` — в 0..1.
+  final double v6MinSigma;
+
+  /// Нижний знаменатель симметричных мер «ближе к ON, чем к OFF» и «ближе к
+  /// spill, чем к ON».
+  ///
+  /// Обе меры — отношение разности двух расстояний к их сумме; когда кадр
+  /// одинаково близок к обоим эталонам (сцена не двигалась вовсе), сумма
+  /// стремится к нулю и отношение теряет смысл. Знаменатель не меньше этого
+  /// числа означает: заведомо слабый отклик не превращается в уверенное «0» или
+  /// «1» делением двух шумов. Расстояния измеряются в σ собственного разброса,
+  /// поэтому 1.0 здесь — «одно среднее отклонение».
+  final double v6DScale;
+
+  /// Во сколько раз полное (1.0) подозрение на отражение гасит уверенность
+  /// лампы (v6 §5, §9.7).
+  ///
+  /// Кадр, который одинаково похож на своё включение и на засветку от соседней
+  /// лампы, спецификация требует НЕ подтверждать, но число обязано оставаться
+  /// сравниваемым между двумя лампами, поэтому гашение — до 20 %, а не до нуля:
+  /// при 0 уверенность пропала бы и у настоящей лампы, которую профиль тоже
+  /// «подозревает».
+  final double v6ReflectionWeight;
+
+  /// Признаки, которыми решение сравнивает кадр с профилем.
+  ///
+  /// По умолчанию — весь вектор. Числом можно оставить только геометрию света:
+  /// именно это на стенде и проверяется первым, потому что спецификация v6 §2
+  /// требует различать «своё включение» и «отражение соседней» по РИСУНКУ,
+  /// а не по яркости, и должно быть видно, что даёт именно рисунок.
+  final List<V6Feature> v6CoreFeatures;
+
+  /// Слово профилям калибровки: разрешено ли им ОТКАЗАТЬ кадру подтвердить
+  /// лампу (v6 §5, §9.7).
+  ///
+  /// Право дано только отказу, а не имени: событие по-прежнему находит
+  /// измеренный HSV-путь (60 ошибок на разметке заказчика, журнал 46), а
+  /// профили могут убрать кадр, похожий на отражение соседней лампы или
+  /// непохожий ни на одно включение. Один флаг поэтому делает честный A/B на
+  /// ОДНОЙ записи: выключено — дерево совпадает с v5, включено — отличия
+  /// видны по колонкам `*_conf`/`*_suspicion` и по счётчику отказов.
+  ///
+  /// Это же число — различие двух режимов спецификации v6 §MODES: [countMode]
+  /// показывает `hsv` при выключенном и `hsvCalibration` при включённом, а
+  /// [withCountMode] ставит его по выбору режима. Отдельного флага на режим
+  /// поэтому нет: два названия одного числа однажды разошлись бы, и UI врал
+  /// бы о том, как считать кадр.
+  final bool v6ProfileDecision;
+
+  /// Ниже какой уверенности (0..1) кадр не подтверждает лампу, а считается
+  /// UNKNOWN: «в рамке что-то изменилось, но на включение это не похоже»
+  /// (v6 §11 требует именно такого состояния, а не молчаливого пропуска).
+  ///
+  /// 0.35, а не половина: уверенность `0.5` означает «кадр одинаково далёк от
+  /// темноты и от включения», то есть ровно то, на что переходный кадр руки
+  /// или половина волны вспышки и тянет. Отказывать им — значит потерять
+  /// настоящие удары, а этого правило приёмки не прощает.
+  final double v6MinConfidence;
+
+  /// При каком подозрении на отражение (0..1) кадр отказывается подтверждать
+  /// лампу, если соседняя объясняет его лучше (v6 §5: «reject if spatial
+  /// pattern indicates reflection»).
+  ///
+  /// 0.65 — выше середины с запасом: ровно на середине (`0.5`) ON и spill
+  /// неразличимы, и отказываться там означало бы терять половину настоящих
+  /// включений. Отказ срабатывает только вместе с тем, что соседняя лампа
+  /// объясняет кадр лучше, — то есть когда называть есть чем.
+  final double v6ReflectionVeto;
+
   /// Копия с одним-двумя изменёнными числами. Менять настройку стенда имеет
   /// смысл по одному фактору за раз, иначе непонятно, что именно улучшило или
   /// сломало результат. Перечислять здесь обязано все поля: молча сброшенное
@@ -427,6 +569,19 @@ class LampConfig {
     double? hsvClipCross,
     bool? hsvSignatureNaming,
     double? hsvSignatureMinSigmas,
+    bool? v6Spatial,
+    double? v6BrightValueMin,
+    double? v6CoreValueMin,
+    double? v6HueSatMin,
+    double? v6CenterSpan,
+    int? hueBins,
+    double? v6MinSigma,
+    double? v6DScale,
+    double? v6ReflectionWeight,
+    List<V6Feature>? v6CoreFeatures,
+    bool? v6ProfileDecision,
+    double? v6MinConfidence,
+    double? v6ReflectionVeto,
   }) {
     return LampConfig(
       hitFraction: hitFraction ?? this.hitFraction,
@@ -476,6 +631,19 @@ class LampConfig {
       hsvSignatureNaming: hsvSignatureNaming ?? this.hsvSignatureNaming,
       hsvSignatureMinSigmas:
           hsvSignatureMinSigmas ?? this.hsvSignatureMinSigmas,
+      v6Spatial: v6Spatial ?? this.v6Spatial,
+      v6BrightValueMin: v6BrightValueMin ?? this.v6BrightValueMin,
+      v6CoreValueMin: v6CoreValueMin ?? this.v6CoreValueMin,
+      v6HueSatMin: v6HueSatMin ?? this.v6HueSatMin,
+      v6CenterSpan: v6CenterSpan ?? this.v6CenterSpan,
+      hueBins: hueBins ?? this.hueBins,
+      v6MinSigma: v6MinSigma ?? this.v6MinSigma,
+      v6DScale: v6DScale ?? this.v6DScale,
+      v6ReflectionWeight: v6ReflectionWeight ?? this.v6ReflectionWeight,
+      v6CoreFeatures: v6CoreFeatures ?? this.v6CoreFeatures,
+      v6ProfileDecision: v6ProfileDecision ?? this.v6ProfileDecision,
+      v6MinConfidence: v6MinConfidence ?? this.v6MinConfidence,
+      v6ReflectionVeto: v6ReflectionVeto ?? this.v6ReflectionVeto,
     );
   }
 
@@ -521,6 +689,21 @@ class LampConfig {
     'hsvClipCross': hsvClipCross,
     'hsvSignatureNaming': hsvSignatureNaming,
     'hsvSignatureMinSigmas': hsvSignatureMinSigmas,
+    'v6Spatial': v6Spatial,
+    'v6BrightValueMin': v6BrightValueMin,
+    'v6CoreValueMin': v6CoreValueMin,
+    'v6HueSatMin': v6HueSatMin,
+    'v6CenterSpan': v6CenterSpan,
+    'hueBins': hueBins,
+    'v6MinSigma': v6MinSigma,
+    'v6DScale': v6DScale,
+    'v6ReflectionWeight': v6ReflectionWeight,
+    'v6CoreFeatures': <Object?>[
+      for (final V6Feature f in v6CoreFeatures) f.name,
+    ],
+    'v6ProfileDecision': v6ProfileDecision,
+    'v6MinConfidence': v6MinConfidence,
+    'v6ReflectionVeto': v6ReflectionVeto,
   };
 
   /// Сохранённые конфиги могут содержать уже удалённые ключи (`brightY`,
@@ -533,6 +716,28 @@ class LampConfig {
         (json[key] as num?)?.toDouble() ?? fallback;
     int i(String key, int fallback) => (json[key] as num?)?.toInt() ?? fallback;
     bool b(String key, bool fallback) => json[key] as bool? ?? fallback;
+    // Список признаков: имена, а не индексы — порядок enum может измениться,
+    // а сохранённый конфиг обязан означать одно и то же. Пустой или непонятный
+    // список — полный вектор: выключать решение до нуля признаков нельзя.
+    List<V6Feature> features(String key) {
+      final Object? raw = json[key];
+      if (raw is! List) {
+        return def.v6CoreFeatures;
+      }
+      final List<V6Feature> out = <V6Feature>[];
+      for (final Object? name in raw) {
+        if (name is! String) {
+          continue;
+        }
+        for (final V6Feature f in V6Feature.values) {
+          if (f.name == name) {
+            out.add(f);
+            break;
+          }
+        }
+      }
+      return out.isEmpty ? def.v6CoreFeatures : out;
+    }
 
     return LampConfig(
       hitFraction: d('hitFraction', def.hitFraction),
@@ -594,48 +799,85 @@ class LampConfig {
         'hsvSignatureMinSigmas',
         def.hsvSignatureMinSigmas,
       ),
+      v6Spatial: b('v6Spatial', def.v6Spatial),
+      v6BrightValueMin: d('v6BrightValueMin', def.v6BrightValueMin),
+      v6CoreValueMin: d('v6CoreValueMin', def.v6CoreValueMin),
+      v6HueSatMin: d('v6HueSatMin', def.v6HueSatMin),
+      v6CenterSpan: d('v6CenterSpan', def.v6CenterSpan),
+      hueBins: i('hueBins', def.hueBins),
+      v6MinSigma: d('v6MinSigma', def.v6MinSigma),
+      v6DScale: d('v6DScale', def.v6DScale),
+      v6ReflectionWeight: d('v6ReflectionWeight', def.v6ReflectionWeight),
+      v6CoreFeatures: features('v6CoreFeatures'),
+      v6ProfileDecision: b('v6ProfileDecision', def.v6ProfileDecision),
+      v6MinConfidence: d('v6MinConfidence', def.v6MinConfidence),
+      v6ReflectionVeto: d('v6ReflectionVeto', def.v6ReflectionVeto),
     );
   }
 
-  /// Способ счёта, собранный из двух флагов в одно число.
+  /// Способ счёта, собранный из флагов в одно число.
   ///
   /// Флаги при этом обязан связывать запрет совпадения: [withCountMode]
   /// выставляет их ровно одним, а не «ещё одним вариантом true». Иначе
   /// `hsvReference` и `liveReference` одновременно включили бы в детекторе
   /// старшинство одного из них, а UI показывал бы оба.
+  ///
+  /// Два цветовых режима различаются ровно одним числом — [v6ProfileDecision],
+  /// и это не совпадение: по спецификации v6 отличие `HSV` от
+  /// `HSV_CALIBRATION` ровно в том, сверяется ли кадр с профилями калибровки
+  /// («Similarity to calibrated … profile, when calibration is enabled»). Одно
+  /// число на два режима поэтому честнее второго флага: оно не может оказаться
+  /// включённым там, где его не видно.
   LampCountMode get countMode => hsvReference
-      ? LampCountMode.hsv
+      ? (v6ProfileDecision
+            ? LampCountMode.hsvCalibration
+            : LampCountMode.hsv)
       : liveReference
       ? LampCountMode.live
       : LampCountMode.etalon;
 
   /// Копия конфига, переключённая на способ счёта [mode]. Единственный
-  /// разрешённый способ менять эти два флага.
+  /// разрешённый способ менять эти флаги.
   LampConfig withCountMode(LampCountMode mode) => copyWith(
     liveReference: mode == LampCountMode.live,
-    hsvReference: mode == LampCountMode.hsv,
+    hsvReference:
+        mode == LampCountMode.hsv || mode == LampCountMode.hsvCalibration,
+    v6ProfileDecision: mode == LampCountMode.hsvCalibration,
   );
 }
 
-/// Три способа решить, какая лампа вспыхнула. Выбор — за оператором стенда,
-/// потому что замеры дают каждому своё: эталоны требуют калибровку и молчат при
-/// смене сцены, живой отсчёт не различает цвета (белая лампа, перелившая
-/// красную рамку, для него тоже вспышка красной), HSV-отсчёт не различает
-/// яркости и потому стоит на доле цветных пикселей.
+/// Способы решить, какая лампа вспыхнула. Спецификация v6 §MODES требует ровно
+/// двух — [hsv] и [hsvCalibration]; [etalon] и [live] помечены прекращёнными и
+/// из меню убраны, но в перечислении остаются: сохранённые старые настройки с
+/// ними встречаются, и прогон обязан показать включённый способ, даже когда он
+/// выпал из выбора (иначе экран выглядит как будто выбран верхний пункт, а
+/// переключить его вслепую нельзя).
 ///
-/// Рабочим с 25.11.2026 считается только [hsv], и он обязан идти с калибровкой:
-/// по замерам на ручной разметке координат это 60 ошибок против 100 без
-/// выученного имени (журнал 46). [live] в перечислении остался молча — старые
-/// сохранённые настройки с ним встречаются, но в меню его больше нет.
+/// Рабочим с 25.11.2026 считается только цветовой счёт, и он обязан идти с
+/// калибровкой: по замерам на ручной разметке координат это 60 ошибок против
+/// 100 без выученного имени (журнал 46). Оба цветовых режима калибровки требуют
+/// одинаково — различаются они лишь тем, что в [hsvCalibration] кадр сверяется
+/// с профилями распределений.
 enum LampCountMode {
-  /// Доля измеренного отклика, набранного на калибровке (фон → белая →
-  /// красная).
+  /// v6 §MODES, режим 1: HSV-отсчёт с вето по перевесу своего подъёма над
+  /// чужим ([LampConfig.hsvGate]) и именем вспышки, выученным у калибровки.
+  /// Профили распределений на решение НЕ влияют — именно это делает режим
+  /// деревом, совпадающим с измеренной v5, и по нему сверяют, чего стоят
+  /// профили ([hsvCalibration]).
+  hsv,
+
+  /// v6 §MODES, режим 2: тот же HSV-отсчёт плюс сравнение кадра с профилями
+  /// OFF/ON/spill обеих ламп (v6 §8): уверенность, подозрение на отражение и
+  /// недоказанный кадр. Право у профилей одно — ОТКАЗАТЬ; имя вспышки
+  /// по-прежнему даёт измеренный путь, а не профиль.
+  hsvCalibration,
+
+  /// ПРЕКРАЩЁН (v6 §MODES: «no additional detection modes»). Доля измеренного
+  /// отклика, набранного на калибровке (фон → белая → красная).
   etalon,
 
-  /// Подъём яркости своей рамки над «полом» последних кадров.
+  /// ПРЕКРАЩЁН (v6 §MODES: «no additional detection modes»). Подъём яркости
+  /// своей рамки над «полом» последних кадров; чужую лампу, перелившую рамку,
+  /// не различает вовсе.
   live,
-
-  /// Подъём доли пикселей СВОЕГО цвета над «полом» последних кадров; имя
-  /// вспышки берётся у тех же трёх состояний калибровки.
-  hsv,
 }

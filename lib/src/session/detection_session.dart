@@ -87,6 +87,7 @@ class LampStatus {
     this.settling = false,
     this.exposureLocked = true,
     this.overexposed = false,
+    this.hasBothOnProfile = false,
   });
 
   static const LampStatus initial = LampStatus(
@@ -155,6 +156,11 @@ class LampStatus {
   /// Последняя рамка стоит на клиппинге (Y ≥ [DetectionSession.clipLuma]):
   /// цвета и яркости в таких пикселях нет, канал слепой.
   final bool overexposed;
+
+  /// Снят ли необязательный шаг 4 («обе горят», профиль BOTH_ON в v6 §7). По
+  /// нему кнопка ставит ✓ только когда состояние действительно измерено, а не
+  /// когда «просто калибровка уже готова».
+  final bool hasBothOnProfile;
 
   String get whiteStatus => whiteLit ? 'ON' : 'OFF';
   String get redStatus => redLit ? 'ON' : 'OFF';
@@ -388,6 +394,7 @@ class DetectionSession extends ChangeNotifier {
         CalibrationStep.background => 'Держи обе лампы погашенными',
         CalibrationStep.whiteOn => 'Держи белую горящей',
         CalibrationStep.redOn => 'Держи красную горящей',
+        CalibrationStep.bothOn => 'Держи обе лампы горящими',
       };
     }
     if (_isFullyShot) {
@@ -403,6 +410,8 @@ class DetectionSession extends ChangeNotifier {
         _whiteStillLit
             ? 'Гаси белую — потом жми «3 КРАСНАЯ»'
             : 'Гаси белую, включай красную и жми «3 КРАСНАЯ»',
+      CalibrationStep.bothOn =>
+        'Включи обе и жми «${CalibrationStep.bothOn.key}» (шаг по желанию)',
     };
   }
 
@@ -452,6 +461,19 @@ class DetectionSession extends ChangeNotifier {
   /// число больше нуля видно в `LAMPDBG both=` и проверяется на прогоне.
   int get doubleBasketFrames => _detector.doubleBasketFrames;
 
+  /// Сколько кадров профиль отверг подъём, который хотел подтвердить
+  /// измеренный путь; из них — отвергнутых как отражение соседней лампы; и
+  /// сколько кадров остались недоказанными. Печатаются в `LAMPDBG` как `rej=`
+  /// и `unk=`: по ним на прогоне видно, что отказ отражения работает, а не
+  /// молча съедает счёт — ровно то, чем принимается v6 §5.
+  int get refusedFrames => _detector.refusedFrames;
+  int get reflectionRefusals => _detector.reflectionRefusals;
+  int get unknownFrames => _detector.unknownFrames;
+
+  /// Чем кадр решает по профилям — одна строка с числами и причиной. Пусто в
+  /// другом способе счёта.
+  String get profileDecision => _detector.profileDecision;
+
   /// Диагностика окон живого отсчёта для периодического LAMPDBG.
   String get liveDebugTag => _detector.liveDebugTag;
 
@@ -477,7 +499,7 @@ class DetectionSession extends ChangeNotifier {
       // чья она (журнал 46).
       return (
         ready: false,
-        why: _config.countMode == LampCountMode.hsv
+        why: _config.hsvReference
             ? 'HSV-счёт ждёт калибровку: «1 ФОН» → «2 БЕЛАЯ» → «3 КРАСНАЯ»'
             : 'Нет калибровки — начни с «1 ФОН»',
       );
@@ -552,6 +574,7 @@ class DetectionSession extends ChangeNotifier {
     settling: settling,
     exposureLocked: exposureLocked,
     overexposed: _overexposed,
+    hasBothOnProfile: _detector.hasBothOnProfile,
   );
 
   /// Загружает сохранённые ROI, baseline и пороги. Вызывать до [start].
@@ -825,7 +848,7 @@ class DetectionSession extends ChangeNotifier {
     } else {
       final LampBaseline? use =
           baseline ??
-          (_config.countMode == LampCountMode.hsv ? _detector.baseline : null);
+          (_config.hsvReference ? _detector.baseline : null);
       if (use != null) {
         detector.setBaseline(use);
       }
@@ -853,6 +876,19 @@ class DetectionSession extends ChangeNotifier {
     csvContent,
     base: _config,
     mode: _config.countMode,
+    baseline: _detector.baseline,
+  );
+
+  /// Та же запись, решённая ОБОИМИ режимами v6 подряд — `hsv` (прежнее
+  /// измеренное дерево) и `hsvCalibration` (с сверкой по профилям).
+  ///
+  /// Нужна ровно для приёмки v6 §7: профили имеют право отнять события, и до
+  /// того как это станет рабочим поведением, разница обязана быть померена на
+  /// ОДНОЙ записи, а не на двух разных стендах. Калибровка берётся у сессии —
+  /// та же, которой считали вживую.
+  RunAb analyzeRecordingAb(String csvContent) => RunAnalyzer.analyzeBothModes(
+    csvContent,
+    base: _config,
     baseline: _detector.baseline,
   );
 
@@ -1012,11 +1048,14 @@ class DetectionSession extends ChangeNotifier {
     _notify(force: true);
   }
 
-  /// Способ счёта: `etalon` — по калибровке (снять кнопками фон → белая →
-  /// красная, без этого счёт не стартует), `live` — по яркости, `hsv` — по доле
-  /// цветных пикселей. Живому калибровка не нужна; HSV с 25.11.2026 нужна
-  /// ровно так же, как режиму эталонов: по трём состояниям называется имя
-  /// вспышки (слово заказчика «будем только с калибровкой работать», журнал 46).
+  /// Способ счёта. Спецификация v6 §MODES требует ровно двух: `hsv` (цветовой
+  /// счёт, профили калибровки на решение не влияют) и `hsvCalibration` (тот же
+  /// счёт плюс сверка кадра с профилями OFF/ON/spill). Оба обязаны идти с
+  /// калибровкой ровно так же, как режим эталонов: по трём состояниям
+  /// называется имя вспышки (слово заказчика «будем только с калибровкой
+  /// работать», журнал 46). `etalon` и `live` в перечислении остались только
+  /// ради сохранённых старых настроек — наружу их больше нет (v6 §MODES: «no
+  /// additional detection modes»).
   ///
   /// Гистерезис и окно «пола» сбрасываются при любом переключении: у способов
   /// разные единицы (доля отклика, яркость, доля цвета), и окно, набранное в
@@ -1035,8 +1074,13 @@ class DetectionSession extends ChangeNotifier {
       LampCountMode.live =>
         'Счёт живой: калибровка не нужна, держи лампы погашенными пару секунд',
       LampCountMode.hsv =>
-        'Счёт по цвету: сними три шага калибровки — по ним называется, какая '
-            'лампа вспыхнула; до «3 КРАСНАЯ» удары не считаются',
+        'HSV: сними три шага калибровки — по ним называется, какая лампа '
+            'вспыхнула; профилями кадр НЕ сверяется, это ровно измеренное '
+            'дерево v5',
+      LampCountMode.hsvCalibration =>
+        'HSV + калибровка: тот же счёт плюс сверка кадра с профилями '
+            'OFF/ON/spill — уверенность, отказ отражению и недоказанный кадр; '
+            'до «3 КРАСНАЯ» удары не считаются',
     }, isError: false);
   }
 
@@ -1285,6 +1329,13 @@ class DetectionSession extends ChangeNotifier {
               if (naming.isNotEmpty) {
                 _stepResult = '$_stepResult · $naming';
               }
+              // Профили v6 §8 — то, чем кадр теперь отказывает отражению. По
+              // слову «готово» этого не видно: строка говорит, набраны ли
+              // распределения и сколько отказов они уже дали.
+              final String profiles = _detector.profileDecision;
+              if (profiles.isNotEmpty) {
+                _stepResult = '$_stepResult · $profiles';
+              }
             }
             _report(_stepResult, isError: false);
             _calibrationCompleter?.complete(report);
@@ -1375,6 +1426,13 @@ class DetectionSession extends ChangeNotifier {
             whiteBelowOff: liveReading?.whiteBelowOff,
             redBelowOff: liveReading?.redBelowOff,
             reference: reference,
+            // Чем кадр решили по профилям калибровки (v6 §13). Null здесь
+            // означает «не считалось» (калибровка без профилей, другой способ
+            // счёта), а не «уверенность нулевая».
+            whiteConfidence: evaluation?.whiteConfidence,
+            redConfidence: evaluation?.redConfidence,
+            whiteSuspicion: evaluation?.whiteSuspicion,
+            redSuspicion: evaluation?.redSuspicion,
           ),
         ),
       );
