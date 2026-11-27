@@ -4,30 +4,56 @@ import 'package:flutter/gestures.dart' show DragStartBehavior;
 import 'package:flutter/material.dart';
 import 'package:lamp_detection/lamp_detection.dart';
 
-/// Перетаскиваемые ROI поверх превью.
+/// Перетаскивание ROI поверх превью — вид и поведение первого стендового
+/// варианта: рамка, подпись и кружок со стрелками `open_in_full` в углу.
 ///
 /// Координаты нормализованы (0..1) относительно области превью, поэтому ROI
-/// переживают смену разрешения и поворота. Рамку можно схватить не только
-/// внутри прямоугольника, но и в 24 логических пикселях вокруг него — зона
-/// захвата не залезает на соседнюю рамку и не выходит за край превью. Первый
-/// delta считается от точки касания, поэтому рамка догоняет палец сразу, а не
-/// после «мёртвых» 18 пикселей. Второй жест (за кружок на углу) меняет
-/// размер. Отпускание пальца фиксирует ROI в настройки.
+/// переживают смену разрешения и поворота. Брать можно не только по видимому
+/// прямоугольнику: вокруг каждой зоны есть невидимое поле захвата [_grab], но
+/// оно не залезает ни на соседнюю рамку, ни за край кадра — иначе пальцем по
+/// лампе попадаешь ручкой размера соседней.
+///
+/// Тело рамки ведёт переезд, кружок в углу — размер, двойной тап увеличивает,
+/// долгое нажатие уменьшает. Первый `delta` считается от точки касания
+/// (`DragStartBehavior.down`), поэтому рамка догоняет палец сразу, а не после
+/// «мёртвых» 18 пунктов.
+///
+/// [syncSize] — замок размера: вторая рамка получает ровно тот же размер
+/// вокруг СВОЕГО центра, положения при этом не связываются.
+///
+/// Любая правка проходит через [RoiLayout.separated]: пересечения зон не
+/// бывает — касание краями законно, наезд нет, иначе одна и та же пиксельная
+/// строка засчитывалась бы обеим лампам.
+///
+/// [onActiveChanged] говорит, когда палец ведёт рамку: анализ кадра стоит
+/// десятки миллисекунд на том же потоке, где живёт жест, и на время наводки
+/// сессия перестаёт считать кадры. [onCommit] — конец наводки.
 class RoiEditor extends StatelessWidget {
   const RoiEditor({
     super.key,
     required this.layout,
     required this.onChanged,
     this.onCommit,
+    this.onActiveChanged,
+    this.syncSize = false,
   });
 
   final RoiLayout layout;
   final ValueChanged<RoiLayout> onChanged;
+
+  /// Конец наводки: сохранить и (в сессии) один раз сбросить то, что набрано
+  /// по ПРЕЖНИМ пикселям.
   final VoidCallback? onCommit;
+
+  /// `true` — палец ведёт рамку, `false` — отпустил.
+  final ValueChanged<bool>? onActiveChanged;
+
+  /// Замок размера: обе зоны всегда одного размера.
+  final bool syncSize;
 
   static const double _handleSize = 26;
 
-  /// Поле вокруг кружка ручки: зона касания 44 логических пикселя.
+  /// Поле вокруг кружка ручки: зона касания 44 логических пункта.
   static const double _handlePad = 9;
 
   /// Невидимая зона захвата вокруг рамки.
@@ -70,18 +96,40 @@ class RoiEditor extends StatelessWidget {
     required bool isWhite,
     required LampRoi other,
   }) {
-    void apply(LampRoi next) =>
-        onChanged(isWhite ? layout.withWhite(next) : layout.withRed(next));
+    /// Новый набор после правки рамки: сначала замок (вторая рамка принимает
+    /// этот размер вокруг своего центра), потом разведение — пересечения в
+    /// наборе не остаётся.
+    void apply(LampRoi next) {
+      onChanged(
+        layout.separated(
+          next,
+          nextIsWhite: isWhite,
+          other: syncSize ? other.withSize(next.width, next.height) : null,
+        ),
+      );
+    }
 
-    /// Сохраняет рамку на диск. Без этого кадрирование живёт только до
-    /// перезапуска приложения и после него рамки возвращаются к старым.
-    void commit() => onCommit?.call();
+    /// Начало и конец жеста. Кадры на время наводки не считаются, иначе
+    /// анализ втискивается между двумя событиями пальца и рамки едут рывками.
+    void start() => onActiveChanged?.call(true);
+
+    void commit() {
+      onActiveChanged?.call(false);
+      onCommit?.call();
+    }
 
     void move(DragUpdateDetails details) {
-      apply(roi.moved(details.delta.dx / size.width, details.delta.dy / size.height));
+      start();
+      apply(
+        roi.moved(
+          details.delta.dx / size.width,
+          details.delta.dy / size.height,
+        ),
+      );
     }
 
     void resize(DragUpdateDetails details) {
+      start();
       apply(
         roi.resized(
           roi.width + details.delta.dx / size.width,
@@ -93,13 +141,17 @@ class RoiEditor extends StatelessWidget {
     final EdgeInsets grab = _grabInsets(roi, other, size);
     final double boxW = roi.width * size.width;
     final double boxH = roi.height * size.height;
-    // Кружок ручки ставим в центр угла рамки: половина зоны касания приходит
-    // на рамку, половина — в пустоту рядом. Иначе на маленькой рамке угол
-    // почти целиком оказался бы ручкой размера.
-    final double handleRight =
-        math.max(0.0, grab.right - (_handleSize + 2 * _handlePad) / 2);
-    final double handleBottom =
-        math.max(0.0, grab.bottom - (_handleSize + 2 * _handlePad) / 2);
+    // Кружок ручки ставим в центр угла: половина зоны касания приходит на
+    // рамку, половина — в пустоту рядом. Шанс на маленькой рамке выше попасть
+    // ручкой размера, чем потерять её.
+    final double handleRight = math.max(
+      0.0,
+      grab.right - (_handleSize + 2 * _handlePad) / 2,
+    );
+    final double handleBottom = math.max(
+      0.0,
+      grab.bottom - (_handleSize + 2 * _handlePad) / 2,
+    );
 
     return Positioned(
       left: roi.left * size.width - grab.left,
@@ -114,14 +166,14 @@ class RoiEditor extends StatelessWidget {
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
               // Первый delta считается от точки касания, а не от момента,
-              // когда жест признали драгом: рамка не отстаёт на «мёртвые»
-              // 18 пикселей, а догоняет палец сразу.
+              // когда жест признан драгом: рамка не стоит «мёртвые» 18
+              // пунктов, а догоняет палец сразу.
               dragStartBehavior: DragStartBehavior.down,
               onPanUpdate: move,
               onPanEnd: (_) => commit(),
               onTapUp: (_) => commit(),
-              // Размер вокруг центра: двойной тап — увеличить, долгое нажатие —
-              // уменьшить. Точнее уголка пальцем, когда лампа мелкая.
+              // Размер вверх рукой: двойной тап — увеличить, долгое нажатие —
+              // уменьшить. Точнее рукой, чем маленьким уголком лампы.
               onDoubleTap: () {
                 apply(roi.scaledAboutCenter(1.3));
                 commit();
@@ -133,8 +185,8 @@ class RoiEditor extends StatelessWidget {
               child: const SizedBox.expand(),
             ),
           ),
-          // 2. Видимая рамка — ровно на месте ROI. IgnorePointer, чтобы она не
-          // отнимала палец у слоя перетаскивания.
+          // 2. Видимая рамка — ровно на месте ROI. IgnorePointer, чтобы она
+          // не отнимала палец у слоя перетаскивания.
           Positioned(
             left: grab.left,
             top: grab.top,
@@ -152,16 +204,20 @@ class RoiEditor extends StatelessWidget {
                     color: Colors.black54,
                     child: Text(
                       label,
-                      style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.bold),
+                      style: TextStyle(
+                        color: color,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                   ),
                 ),
               ),
             ),
           ),
-          // 3. Ручка размера: зона касания 44 логических пикселя вместо 26 и
-          // половина её лежит в пустоте за углом рамки. Раньше ручка висела
-          // снаружи и обрезалась ClipRRect — теперь она внутри превью всегда.
+          // 3. Кнопка размера: зона касания 44 логических пункта вместо 26 и
+          // половина её лежит в пустоте за углом рамки. Ручка видима и
+          // оставалась бы поверх превю — поэтому она внутри рамки целиком.
           Positioned(
             right: handleRight,
             bottom: handleBottom,
@@ -181,7 +237,11 @@ class RoiEditor extends StatelessWidget {
                       shape: BoxShape.circle,
                     ),
                     child: const Center(
-                      child: Icon(Icons.open_in_full, size: 14, color: Colors.white),
+                      child: Icon(
+                        Icons.open_in_full,
+                        size: 14,
+                        color: Colors.white,
+                      ),
                     ),
                   ),
                 ),
@@ -193,7 +253,7 @@ class RoiEditor extends StatelessWidget {
     );
   }
 
-  /// Ширина невидимой зоны захвата с каждой стороны. Она не больше [_grab],
+  /// Граница невидимой зоны захвата с каждой стороны. Она не больше [_grab],
   /// не залезает на вторую рамку (иначе пальцем рядом с соседней лампой
   /// двигалась бы не та рамка) и не выходит за край превью (иначе ручка
   /// размера обрезалась бы ClipRRect).
@@ -203,7 +263,10 @@ class RoiEditor extends StatelessWidget {
     return EdgeInsets.only(
       left: side(roi.left * size.width, (roi.left - other.right) * size.width),
       top: side(roi.top * size.height, (roi.top - other.bottom) * size.height),
-      right: side((1 - roi.right) * size.width, (other.left - roi.right) * size.width),
+      right: side(
+        (1 - roi.right) * size.width,
+        (other.left - roi.right) * size.width,
+      ),
       bottom: side(
         (1 - roi.bottom) * size.height,
         (other.top - roi.bottom) * size.height,

@@ -54,6 +54,11 @@ final class LampProfiles {
   /// Шаг 4, опциональный: обе лампы горят. Null — шаг не снимался, и это
   /// законно (v6 §7: «Do not require this step if simultaneous activation is
   /// impossible»), поэтому отсутствие профиля не отказ, а просто отсутствие.
+  ///
+  /// В само решение они пока не входят: `ProfileDecider.verdict` сравнивает
+  /// OFF, ON и spill, а spill снят шагами 2 и 3 (чужая рамка того же кадра).
+  /// Здесь эти два профиля — записанный ответ на вопрос «измерена ли двойная
+  /// засветка» (журнал §52).
   final FeatureProfile? bothOnWhite;
   final FeatureProfile? bothOnRed;
 

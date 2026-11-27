@@ -15,11 +15,11 @@ import 'response_model.dart';
 /// получает два эталона и может отличить одну лампу от другой по форме
 /// изменения кадра, а не по цвету пикселя.
 ///
-/// Четвёртый шаг, «обе лампы горят», — по желанию (спецификация v6 §7 прямо
-/// разрешает его не требовать): на стенде одновременное включение может быть
-/// невозможно. Он не предлагается мастером сам и не входит в «готовность»
-/// калибровки — только отдельная кнопка, которая добавляет к уже собранной
-/// модели профиль BOTH_ON.
+/// Четвёртый шаг, «обе лампы горят», снимается только по его собственной кнопке
+/// (спецификация v6 §7 прямо разрешает его не требовать): на стенде
+/// одновременное включение может быть невозможно. Мастер набора сюда сам не
+/// ведёт и в «готовность» калибровки шаг не входит — он лишь добавляет к уже
+/// собранной модели профиль BOTH_ON.
 enum CalibrationStep {
   background('фон', 'Держите обе лампы выключенными', 'bg', 'ФОН'),
   whiteOn('белая горит', 'Зажгите белую лампу и держите', 'white_on', 'БЕЛАЯ'),
@@ -47,7 +47,7 @@ enum CalibrationStep {
     redOn,
   ];
 
-  /// Снимается по желанию оператора. Мастер набора сюда сам не ведёт.
+  /// Снимается только своей кнопкой. Мастер набора сюда сам не ведёт.
   bool get isOptional => this == bothOn;
 
   /// Следующий по порядку шаг или null, если этот последний. Порядок — только
@@ -153,7 +153,6 @@ class CalibrationReport {
     this.whiteAmplitudeNoise,
     this.redAmplitudeNoise,
     this.baseline,
-    this.hasBothOnProfile = false,
   });
 
   final CalibrationStep step;
@@ -175,10 +174,6 @@ class CalibrationReport {
   /// Готовая калибровка — только на последнем обязательном шаге и на шаге 4.
   final LampBaseline? baseline;
 
-  /// Снят ли профиль BOTH_ON: по нему отчёт шага «красная» кончается словом
-  /// «готово» без напоминания про четвёртую кнопку.
-  final bool hasBothOnProfile;
-
   /// Строка в панель состояния: чем шаг кончился, числом, а не обещанием.
   String describe() {
     final String head = switch (step) {
@@ -194,21 +189,20 @@ class CalibrationReport {
             'W ${((whiteAmplitudeNoise ?? 0) * 100).toStringAsFixed(1)}% / '
             'R ${((redAmplitudeNoise ?? 0) * 100).toStringAsFixed(1)}%',
       CalibrationStep.bothOn =>
-        'Обе горят: профиль BOTH_ON снят ($frameCount кадров) — он нужен '
-            'решению v6, чтобы отличать своё включение от двойной засветки',
+        'Обе горят: профиль BOTH_ON снят ($frameCount кадров) — по нему видно, '
+            'измерена ли двойная засветка; само решение v6 пока сравнивает '
+            'OFF/ON/spill из шагов 1–3',
     };
     // Дальше обязана идти одна короткая команда: что жечь и что нажать.
     // Длинный текст оператор у экрана не читает, он держит лампу рукой.
-    final String optionalHint = hasBothOnProfile
-        ? ''
-        : '. По желанию: жми «${CalibrationStep.bothOn.key}», когда '
-              'сможешь держать обе';
+    // Четвёртый шаг сюда не приглашается: на счёт он не влияет, а лишний
+    // шаг у человека, который и так стоит у лампы с двумя кнопками.
     final String nextStep = switch (step) {
       CalibrationStep.background =>
         '. Дальше: включи белую и жми «${CalibrationStep.whiteOn.key}»',
       CalibrationStep.whiteOn =>
         '. Дальше: гаси белую, включай красную и жми «${CalibrationStep.redOn.key}»',
-      CalibrationStep.redOn => '. Готово, можно считать$optionalHint',
+      CalibrationStep.redOn => '. Готово, можно считать',
       CalibrationStep.bothOn => '. Готово, можно считать',
     };
     return '$head$nextStep';
@@ -261,8 +255,7 @@ class LampCalibration {
   /// Все ОБЯЗАТЕЛЬНЫЕ состояния набраны. Четвёртое («обе горят») здесь не
   /// проверяется специально: оно не снято на большинстве стендов, и требовать
   /// его — значит не допустить калибровку там, где она полна.
-  bool get isComplete =>
-      CalibrationStep.mandatory.every(_states.containsKey);
+  bool get isComplete => CalibrationStep.mandatory.every(_states.containsKey);
 
   CalibrationProgress get progress => CalibrationProgress(
     collected: _frames.length,
@@ -664,7 +657,6 @@ class LampCalibration {
       whiteAmplitudeNoise: model.whiteAmplitudeNoise,
       redAmplitudeNoise: model.redAmplitudeNoise,
       baseline: baseline,
-      hasBothOnProfile: baseline.bothOn != null,
     );
   }
 

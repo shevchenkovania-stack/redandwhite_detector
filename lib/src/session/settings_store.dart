@@ -8,8 +8,8 @@ import '../models/roi.dart';
 
 /// Сохранение ROI, калибровки и порогов в `shared_preferences`.
 ///
-/// Всё лежит в трёх JSON-строках, чтобы не плодить ключи и не зависеть от
-/// типа значений.
+/// Всё лежит в трёх JSON-строках и одном флаге: ключей специально мало, чтобы
+/// не зависеть от типа значений и не плодить мусор при смене формата.
 class SettingsStore {
   SettingsStore(this._prefs);
 
@@ -17,6 +17,7 @@ class SettingsStore {
   static const String _baselineKey = 'lamp_detection.baseline';
   static const String _configKey = 'lamp_detection.config';
   static const String _sessionKey = 'lamp_detection.session_id';
+  static const String _roiSyncKey = 'lamp_detection.roi_sync_size';
 
   final SharedPreferences _prefs;
 
@@ -29,13 +30,22 @@ class SettingsStore {
       return null;
     }
     try {
-      return RoiLayout.fromJson((jsonDecode(raw) as Map).cast<String, Object?>());
+      return RoiLayout.fromJson(
+        (jsonDecode(raw) as Map).cast<String, Object?>(),
+      );
     } on Object {
       return null;
     }
   }
 
-  Future<void> writeRoi(RoiLayout roi) => _prefs.setString(_roiKey, jsonEncode(roi.toJson()));
+  Future<void> writeRoi(RoiLayout roi) =>
+      _prefs.setString(_roiKey, jsonEncode(roi.toJson()));
+
+  /// Замок размера рамок: `true` — размер один на обе зоны. Это настройка
+  /// наводки, а не детектора, поэтому живёт здесь, а не в `LampConfig`.
+  bool readRoiSyncSize() => _prefs.getBool(_roiSyncKey) ?? false;
+
+  Future<void> writeRoiSyncSize(bool sync) => _prefs.setBool(_roiSyncKey, sync);
 
   LampBaseline? readBaseline() {
     final String? raw = _prefs.getString(_baselineKey);
@@ -43,7 +53,9 @@ class SettingsStore {
       return null;
     }
     try {
-      return LampBaseline.fromJson((jsonDecode(raw) as Map).cast<String, Object?>());
+      return LampBaseline.fromJson(
+        (jsonDecode(raw) as Map).cast<String, Object?>(),
+      );
     } on Object {
       return null;
     }
@@ -60,7 +72,9 @@ class SettingsStore {
       return null;
     }
     try {
-      return LampConfig.fromJson((jsonDecode(raw) as Map).cast<String, Object?>());
+      return LampConfig.fromJson(
+        (jsonDecode(raw) as Map).cast<String, Object?>(),
+      );
     } on Object {
       return null;
     }
@@ -71,5 +85,6 @@ class SettingsStore {
 
   String? readSessionId() => _prefs.getString(_sessionKey);
 
-  Future<void> writeSessionId(String sessionId) => _prefs.setString(_sessionKey, sessionId);
+  Future<void> writeSessionId(String sessionId) =>
+      _prefs.setString(_sessionKey, sessionId);
 }

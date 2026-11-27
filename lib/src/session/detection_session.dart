@@ -424,7 +424,7 @@ class DetectionSession extends ChangeNotifier {
             ? 'Гаси белую — потом жми «3 КРАСНАЯ»'
             : 'Гаси белую, включай красную и жми «3 КРАСНАЯ»',
       CalibrationStep.bothOn =>
-        'Включи обе и жми «${CalibrationStep.bothOn.key}» (шаг по желанию)',
+        'Включи обе и жми «${CalibrationStep.bothOn.key}»',
     };
   }
 
@@ -773,7 +773,7 @@ class DetectionSession extends ChangeNotifier {
       'Чем считали: $_modeShort',
       '  калибровка: ${isCalibrated ? 'есть' : 'НЕТ'}'
           '${shot == null ? '' : ', версия ${shot.version} '
-                  '(профили распределений — с версии 4)'}',
+                    '(профили распределений — с версии 4)'}',
       '  снятые шаги: ${_detector.completedCalibrationSteps.map((CalibrationStep s) => s.label).join(', ')}',
       '  шаг «обе горят»: ${_detector.hasBothOnProfile ? 'снят' : 'не снят'}',
       '',
@@ -1023,8 +1023,7 @@ class DetectionSession extends ChangeNotifier {
       detector.setBaseline(baseline ?? _calibrateFrom(rows));
     } else {
       final LampBaseline? use =
-          baseline ??
-          (_config.hsvReference ? _detector.baseline : null);
+          baseline ?? (_config.hsvReference ? _detector.baseline : null);
       if (use != null) {
         detector.setBaseline(use);
       }
@@ -1129,20 +1128,56 @@ class DetectionSession extends ChangeNotifier {
     final bool moved = !_sameRoi(_roi, layout);
     _roi = layout;
     if (moved) {
-      _dropCalibrationOnRoiMove();
-    }
-    if (persist) {
-      unawaited(settings.writeRoi(layout));
+      if (persist) {
+        // Программная смена рамок (не палец): запись и сразу же сброс,
+        // ровно как было до наводки «на лету».
+        unawaited(settings.writeRoi(layout));
+        _dropCalibrationOnRoiMove();
+      } else {
+        // Перетаскивание. Сброс отложен до отпускания пальца: событий за
+        // время наводки всё равно не будет (кадры в это время не считаются,
+        // см. [setRoiAiming]), а на каждый палец-апдейт их приходят десятки —
+        // прежний сброс глушил и панель, и поток именно ими.
+        _roiResetPending = true;
+      }
     }
     _notify(force: true);
+  }
+
+  /// Палец ведёт рамку (`true`) или отпустил (`false`).
+  ///
+  /// Пока идёт наводка, кадры НЕ анализируются. Причина не в бережности:
+  /// анализ одного кадра — десятки миллисекунд на том же потоке, где живёт
+  /// жест, и каждый обработанный кадр втискивается между двумя событиями
+  /// пальца, из-за чего рамки едут рывками. Считать в момент, когда зоны
+  /// поменяли место, всё равно нечем: набор по ним будет сброшен.
+  void setRoiAiming(bool aiming) {
+    _roiAiming = aiming;
+  }
+
+  bool _roiAiming = false;
+
+  /// Есть ли незакрытый сброс после наводки рамок.
+  bool _roiResetPending = false;
+
+  /// Конец наводки: сохранить рамки и ровно один раз сбросить то, что набрано
+  /// по ПРЕЖНИМ пикселям. Ручная программа (`updateRoi(persist: true)`) этим
+  /// не пользуется — там нет «конца жеста».
+  Future<void> commitRoi() async {
+    await settings.writeRoi(_roi);
+    if (!_roiResetPending) {
+      return;
+    }
+    _roiResetPending = false;
+    _dropCalibrationOnRoiMove();
   }
 
   /// Рамки изменились — значит все собранные измерения считались по другим
   /// пикселям: и фон, и эталон, и «пол» живого отсчёта. Оставлять их нельзя:
   /// прогон продолжится по калибровке, снятой с чужого места в кадре (тот же
   /// дефект, что §6.11 журнала), а кнопка пересъёма подставила бы её же числа
-  /// как ранее снятые. Сброс срабатывает один раз на перетаскивание — дальше
-  /// данных для сброса уже нет.
+  /// как ранее снятые. При наводке пальцем сброс происходит ОДИН раз, на
+  /// отпускании ([commitRoi]), а не на каждый кадр жеста.
   void _dropCalibrationOnRoiMove() {
     final bool hasCalibration =
         _calibrating ||
@@ -1406,6 +1441,13 @@ class DetectionSession extends ChangeNotifier {
       }
     }
     _lastFrame = frame;
+    if (_roiAiming) {
+      // Кадр уходит в никуда намеренно: пока палец ведёт рамку, считать нечем,
+      // зато у жеста остаётся весь поток. Потеря честная — она видна в
+      // диагностике, а не прячется.
+      diagnostics.onFrameDropped();
+      return;
+    }
     if (_busy) {
       diagnostics.onFrameDropped();
       return;
@@ -1422,6 +1464,14 @@ class DetectionSession extends ChangeNotifier {
 
   void _processFrame(RawLampFrame frame) {
     diagnostics.beginAnalysis();
+
+    if (_roiResetPending) {
+      // Рамки сдвинули, а «палец отпущен» до нас не дошло (экран закрыт
+      // посреди жеста). Считать кадр по прежним измерениям нельзя, поэтому
+      // сброс догоняется здесь, а не ждёт следующего коммита.
+      _roiResetPending = false;
+      _dropCalibrationOnRoiMove();
+    }
 
     final LampFrame lampFrame = _extractor.extract(frame, _roi, source.mapping);
     // Шаг, к которому относится этот кадр: после завершения шага он уже

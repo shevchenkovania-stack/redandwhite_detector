@@ -30,6 +30,11 @@ class _HomePageState extends State<HomePage> {
   final Map<String, String> _statuses = <String, String>{};
   final List<String> _errors = <String>[];
   String _message = 'Запуск…';
+
+  /// Замок размера рамок: `true` — размер один на обе зоны. Это настройка
+  /// наводки, а не детектора, поэтому живёт на экране и в `SettingsStore`,
+  /// а не в `LampConfig`.
+  bool _roiSync = false;
   StreamSubscription<HitEvent>? _hitsSub;
   StreamSubscription<String>? _errorsSub;
   bool _staleLogged = false;
@@ -125,6 +130,7 @@ class _HomePageState extends State<HomePage> {
         mailer: mailer,
       );
       await session.loadSettings().timeout(_bringUpTimeout);
+      _roiSync = session.settings.readRoiSyncSize();
       session.addListener(_onSessionChanged);
       _hitsSub = session.hits.listen(_onHit);
       _errorsSub = session.errors.listen(
@@ -320,6 +326,20 @@ class _HomePageState extends State<HomePage> {
     final DetectionSession session = _session!;
     session.resetCalibration();
     setState(() => _message = 'Калибровка сброшена. ${session.readiness.why}');
+  }
+
+  /// Свести рамки вплотную — как можно ближе, но без пересечения.
+  ///
+  /// Кнопка нужна именно потому, что пальцем такой зазор не выставить: лампы
+  /// на стенде стоят впритык, и при наводке рамка либо наезжает на соседнюю
+  /// (тогда одна и та же строка пикселей засчитывается обеим лампам), либо
+  /// отползает слишком далеко. Зазор закрывается по одной оси, вторая не
+  /// трогается, а пара ставится вокруг середины между центрами — лампы не
+  /// уезжают со своих мест. Перекос кадра ниже: если по выбранной оси обе
+  /// рамки в кадр не влазятся, ось берётся другая.
+  void _makeRoiAdjacent(DetectionSession session) {
+    session.updateRoi(session.roi.adjacent(), persist: true);
+    setState(() => _message = 'Рамки сведены вплотную');
   }
 
   /// Что считает прогон — метка в каждой строке лога. Имя короткое и своё у
@@ -576,10 +596,14 @@ class _HomePageState extends State<HomePage> {
       appBar: landscape
           ? null
           : AppBar(
+              // Панель сжата нарочно: каждое её поколение отнимает высоту у
+              // кадра, а рамки правятся именно по кадру.
+              toolbarHeight: 44,
               title: Text(
                 session == null
                     ? 'Lamp detection'
                     : 'Lamp detection · ${_shortSession(session.sessionId)}',
+                style: const TextStyle(fontSize: 16),
               ),
               actions: <Widget>[menu],
             ),
@@ -619,7 +643,7 @@ class _HomePageState extends State<HomePage> {
                           vertical: landscape,
                         );
                   final Widget stage = Padding(
-                    padding: EdgeInsets.all(landscape ? 0 : 8),
+                    padding: EdgeInsets.all(landscape ? 0 : 4),
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(8),
                       child: _AspectStage(
@@ -630,10 +654,14 @@ class _HomePageState extends State<HomePage> {
                             session.source.buildPreview(),
                             RoiEditor(
                               layout: session.roi,
+                              syncSize: _roiSync,
                               onChanged: (RoiLayout layout) =>
                                   session.updateRoi(layout),
+                              // Время наводки — не время счёта: кадры
+                              // пропускаются, и весь поток отдаётся пальцу.
+                              onActiveChanged: session.setRoiAiming,
                               onCommit: () {
-                                unawaited(session.saveRoi());
+                                unawaited(session.commitRoi());
                                 setState(() => _message = 'ROI сохранены');
                               },
                             ),
@@ -643,6 +671,36 @@ class _HomePageState extends State<HomePage> {
                             // не имеют — рамки правятся прямо во время набора.
                             // Кнопки шагов живут над превью, в _CalibrationSteps.
                             _CollectionOverlay(session: session),
+                            // Уголок наводки в кадре: замок размера и сведение
+                            // рамок вплотную. Оба живут здесь, а не в меню,
+                            // потому что решать их надо, глядя на лампы.
+                            Align(
+                              alignment: Alignment.topRight,
+                              child: Padding(
+                                padding: const EdgeInsets.all(6),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: <Widget>[
+                                    _RoiAdjacentButton(
+                                      onTap: () => _makeRoiAdjacent(session),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    _RoiSyncButton(
+                                      sync: _roiSync,
+                                      onToggle: () {
+                                        final bool next = !_roiSync;
+                                        setState(() => _roiSync = next);
+                                        unawaited(
+                                          session.settings.writeRoiSyncSize(
+                                            next,
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
                           ],
                         ),
                       ),
@@ -659,17 +717,17 @@ class _HomePageState extends State<HomePage> {
                   final Widget note = Padding(
                     padding: EdgeInsets.fromLTRB(
                       landscape ? 4 : 16,
-                      4,
+                      2,
                       landscape ? 4 : 16,
-                      landscape ? 2 : 12,
+                      landscape ? 2 : 6,
                     ),
                     child: Text(
                       _message,
                       textAlign: TextAlign.center,
-                      maxLines: landscape ? 1 : 3,
+                      maxLines: landscape ? 1 : 2,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        fontSize: landscape ? 10 : 12,
+                        fontSize: landscape ? 10 : 11,
                         color: Colors.grey,
                       ),
                     ),
@@ -790,7 +848,7 @@ class _PrimaryControls extends StatelessWidget {
       );
     }
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 2),
       child: Row(
         children: <Widget>[
           Expanded(
@@ -800,9 +858,20 @@ class _PrimaryControls extends StatelessWidget {
                 backgroundColor: status.running
                     ? Colors.redAccent
                     : Colors.teal,
+                // 40 вместо стандартных 56: всё, что отдала кнопка, досталось
+                // кадру.
+                minimumSize: const Size(0, 40),
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
               ),
-              icon: Icon(status.running ? Icons.stop : Icons.play_arrow),
-              label: Text(status.running ? 'Стоп' : 'Пуск'),
+              icon: Icon(
+                status.running ? Icons.stop : Icons.play_arrow,
+                size: 20,
+              ),
+              label: Text(
+                status.running ? 'Стоп' : 'Пуск',
+                style: const TextStyle(fontSize: 15),
+              ),
             ),
           ),
         ],
@@ -811,7 +880,13 @@ class _PrimaryControls extends StatelessWidget {
   }
 }
 
-/// Три кнопки калибровки — по одной на шаг: «1 ФОН», «2 БЕЛАЯ», «3 КРАСНАЯ».
+/// Калибровочные шаги — по кнопке на шаг: «1 ФОН», «2 БЕЛАЯ», «3 КРАСНАЯ», а
+/// рядом четвёртая, «4 ОБЕ», — она приглушена и объяснена подсказкой:
+/// обязательных шагов три.
+///
+/// Никакой подписи «по желанию» рядом нет (слово заказчика 27.11.2026): лишний
+/// текст у видоискателя читают хуже, чем молчит кнопка, а его смысл и так несут
+/// приглушённый цвет и подсказка.
 ///
 /// Никакой очереди, никаких таймеров и никакого «набирай сейчас»: кнопка
 /// запускает набор ровно своего шага в тот момент, когда человек видит в
@@ -847,38 +922,40 @@ class _CalibrationSteps extends StatelessWidget {
     return Padding(
       padding: vertical
           ? const EdgeInsets.fromLTRB(6, 0, 6, 4)
-          : const EdgeInsets.fromLTRB(12, 0, 12, 6),
+          : const EdgeInsets.fromLTRB(8, 0, 8, 4),
       child: Column(
         children: <Widget>[
           vertical
               ? Column(
                   children: <Widget>[
                     ...buttons,
-                    // В правой панели ландшафта места достаточно, а подпись
-                    // «по желанию» там всё равно нужна: без неё четвёртая
-                    // кнопка читается как обязательная.
-                    _optionalRow(optional),
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: _optional(optional),
+                    ),
                   ],
                 )
-              : Column(
+              : Row(
+                  // Один ряд вместо двух. Слово заказчика 27.11.2026 —
+                  // «расширь экран видимости, покомпактнее UI-элементы»:
+                  // вторая строка кнопок стоила кадру примерно 60 пунктов
+                  // высоты, а рамки правятся именно по кадру.
+                  // Необязательность четвёртого шага теперь говорит сам шаг:
+                  // приглушённый цвет и подсказка, а не подпись рядом.
                   children: <Widget>[
-                    Row(
-                      children: <Widget>[
-                        for (final Widget b in buttons) Expanded(child: b),
-                      ],
-                    ),
-                    _optionalRow(optional),
+                    for (final Widget b in buttons) Expanded(child: b),
+                    Expanded(child: _optional(optional)),
                   ],
                 ),
           Padding(
-            padding: const EdgeInsets.only(top: 4),
+            padding: const EdgeInsets.only(top: 2),
             child: Text(
               s.calibrationError.isNotEmpty
                   ? s.calibrationError
                   : s.calibrationHint,
               textAlign: TextAlign.center,
               style: TextStyle(
-                fontSize: vertical ? 11 : 13,
+                fontSize: vertical ? 10 : 12,
                 fontWeight: FontWeight.bold,
                 color: s.calibrationError.isNotEmpty
                     ? Colors.redAccent
@@ -891,24 +968,21 @@ class _CalibrationSteps extends StatelessWidget {
     );
   }
 
-  /// Кнопка необязательного шага 4 — всегда отдельной строкой и с подписью.
+  /// Необязательность четвёртого шага говорит сама: кнопка приглушена, а
+  /// подсказка объясняет, чем этот шаг отличается от трёх первых.
   ///
-  /// Втиснуть её в тот же ряд, где стоят «1 ФОН / 2 БЕЛАЯ / 3 КРАСНАЯ», нельзя
-  /// по двум причинам: подписи «3 КРАСНАЯ» вчетвером в ширину экрана уже не
-  /// помещаются, и человек стал бы считать шаг обязательным четвёртым
-  /// нажатием — а на стенде, где обе лампы вместе не горят, он бы его и ждал.
-  Widget _optionalRow(Widget button) => Padding(
-    padding: const EdgeInsets.only(top: 2),
-    child: Row(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: <Widget>[
-        button,
-        const SizedBox(width: 6),
-        const Text(
-          'по желанию',
-          style: TextStyle(fontSize: 11, color: Colors.white54),
-        ),
-      ],
+  /// Подсказка обязана говорить правду про сегодняшний код: профиль spill,
+  /// на котором решается отражение, берётся из шагов 2 и 3 (чужая рамка того
+  /// же кадра), а `both_on` даёт ровно четвёртое состояние сцены — по нему в
+  /// отчёте видно, ИЗМЕРЕНА ли двойная засветка, и больше ничего
+  /// (`ProfileDecider.verdict` его пока не читает, журнал §52).
+  Widget _optional(Widget button) => Opacity(
+    opacity: 0.72,
+    child: Tooltip(
+      message:
+          'Шаг 4: снимает состояние «обе горят» в профиль BOTH_ON. На счёт '
+          'он не влияет — отражение решается по шагам 1–3',
+      child: button,
     ),
   );
 
@@ -943,16 +1017,21 @@ class _CalibrationSteps extends StatelessWidget {
         // их во время набора незачем.
         onPressed: s.running && !collecting ? () => onStep(step) : null,
         style: FilledButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 10),
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 7),
           minimumSize: Size.zero,
           tapTargetSize: MaterialTapTargetSize.shrinkWrap,
         ),
-        icon: Icon(mark.$1, color: mark.$2, size: 18),
-        label: Text(
-          collecting ? '${p.collected}/${p.needed}' : step.key,
-          maxLines: 1,
-          overflow: TextOverflow.clip,
-          style: const TextStyle(fontSize: 12),
+        icon: Icon(mark.$1, color: mark.$2, size: 15),
+        label: FittedBox(
+          // Вчетвером в один ряд подпись «3 КРАСНАЯ» влезает уже не при любом
+          // системном шрифте: scaleDown уменьшает её вместо переполнения,
+          // а не режет текст.
+          fit: BoxFit.scaleDown,
+          child: Text(
+            collecting ? '${p.collected}/${p.needed}' : step.key,
+            maxLines: 1,
+            style: const TextStyle(fontSize: 11),
+          ),
         ),
       ),
     );
@@ -1093,6 +1172,99 @@ class _CollectionOverlayState extends State<_CollectionOverlay> {
   }
 }
 
+/// Переключатель замка размера. Под замком размер у обеих зон один: потянул
+/// ручку одной — вторая подстраивается синхронно, оставаясь на своей лампе.
+/// Снят — каждая правит свой размер: на стенде колпаки разные, и общий размер
+/// означал бы, что под одну лампу подгоняешь вторую.
+///
+/// Положение рамок замок НЕ связывает — только размер. Разводить обе лампы
+/// одним центром было бы правкой одной рамки по другой.
+class _RoiSyncButton extends StatelessWidget {
+  const _RoiSyncButton({required this.sync, required this.onToggle});
+
+  final bool sync;
+  final VoidCallback onToggle;
+
+  @override
+  Widget build(BuildContext context) => _CornerChip(
+    icon: sync ? Icons.lock : Icons.lock_open,
+    label: sync ? 'размер общий' : 'размер свободный',
+    active: sync,
+    tooltip: sync
+        ? 'Замок включён: размер один на обе рамки'
+        : 'Замок снят: размер у каждой рамки свой',
+    onTap: onToggle,
+  );
+}
+
+/// Свести рамки вплотную. Пальцем зазор в доли процента не выставить, а он
+/// именно и нужен: лампы стоят рядом, и наехавшая рамка начинает считать
+/// вспышки соседней лампы. Кнопка закрывает зазор по одной оси до касания
+/// краями, оставляя каждой лампе её место.
+class _RoiAdjacentButton extends StatelessWidget {
+  const _RoiAdjacentButton({required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => _CornerChip(
+    icon: Icons.compress,
+    label: 'вплотную',
+    active: false,
+    tooltip: 'Свести рамки как можно ближе, но без пересечения',
+    onTap: onTap,
+  );
+}
+
+/// Чип в углу кадра: тёмная подложка, иконка и короткая подпись. Включённый
+/// чип подсвечивается бирюзой — состояние замка должно читаться одним взглядом,
+/// а не по подписи.
+class _CornerChip extends StatelessWidget {
+  const _CornerChip({
+    required this.icon,
+    required this.label,
+    required this.active,
+    required this.tooltip,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool active;
+  final String tooltip;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final Color accent = active ? Colors.tealAccent : Colors.white70;
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(20),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+          decoration: BoxDecoration(
+            color: const Color(0xC0000000),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: active ? Colors.tealAccent : Colors.white38,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Icon(icon, size: 16, color: accent),
+              const SizedBox(width: 5),
+              Text(label, style: TextStyle(fontSize: 11, color: accent)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _StatusRow extends StatelessWidget {
   const _StatusRow({
     required this.session,
@@ -1124,15 +1296,15 @@ class _StatusRow extends StatelessWidget {
     );
     final Widget reset = IconButton(
       onPressed: onReset,
-      icon: Icon(Icons.restart_alt, size: dense ? 22 : 24),
+      icon: Icon(Icons.restart_alt, size: dense ? 20 : 22),
       tooltip: 'Сбросить счётчики',
       color: Colors.grey,
       visualDensity: VisualDensity.compact,
       padding: EdgeInsets.zero,
-      constraints: const BoxConstraints(minWidth: 40, minHeight: 36),
+      constraints: const BoxConstraints(minWidth: 36, minHeight: 28),
     );
     return Padding(
-      padding: EdgeInsets.symmetric(horizontal: 12, vertical: dense ? 0 : 4),
+      padding: EdgeInsets.symmetric(horizontal: 12, vertical: dense ? 0 : 2),
       child: dense
           ? Center(
               // scaleDown, а не голая колонка: когда в панели ещё и шаги
@@ -1159,14 +1331,14 @@ class _StatusRow extends StatelessWidget {
       Text(
         '$value',
         style: TextStyle(
-          fontSize: dense ? 20 : 32,
+          fontSize: dense ? 18 : 24,
           fontWeight: FontWeight.bold,
           color: lit ? color : Colors.grey,
         ),
       ),
       Text(
         label,
-        style: TextStyle(fontSize: dense ? 10 : 12, color: Colors.grey),
+        style: TextStyle(fontSize: dense ? 9 : 11, color: Colors.grey),
       ),
     ],
   );

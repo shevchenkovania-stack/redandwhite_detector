@@ -137,6 +137,11 @@ void main() {
         ),
       );
 
+      // Палец отпущен: именно тогда и происходит единственный на
+      // перетаскивание сброс (во время наводки он был бы на каждый
+      // палец-апдейт).
+      await rig.session.commitRoi();
+
       // Эталон считался по другим пикселям — значит, решения по нему нет.
       expect(rig.session.baseline, isNull);
       expect(rig.session.isCalibrated, isFalse);
